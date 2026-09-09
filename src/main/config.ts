@@ -288,6 +288,8 @@ const configSchema = z.object({
   }),
   ui: z.object({
     chatBrowser: z.enum(CHAT_BROWSERS).optional().default('chrome'),
+    managedBrowser: z.boolean().optional().default(false),
+    browserHeadless: z.boolean().optional().default(false),
     developerMode: z.boolean().optional(),
     finishTool: z.boolean().optional(),
     planBackend: z.enum(['chatgpt', 'api']).optional(),
@@ -476,7 +478,7 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     capabilities: firstLaunchCapabilities(platform, release),
     readOnly: false,
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false },
+    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, managedBrowser: false, browserHeadless: false },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...FIRST_LAUNCH_MULTI_AGENT },

@@ -43,6 +43,8 @@ const NOTICES_PER_KIND = 3;
 
 /** Owners, keyed by the process id `exec_command` handed back as `session_id`. */
 const owners = new Map<number, string | null>();
+/** Launch reservations are cancellable, but never authorize write_stdin. */
+const pendingOwners = new Map<number, string | null>();
 
 /** When each owned session was last started or polled, keyed the same way. */
 const attendedAt = new Map<number, number>();
@@ -59,9 +61,10 @@ const attendedAt = new Map<number, number>();
  */
 const announcedUnattended = new Set<number>();
 
-function processIdsOwnedBy(sessionId: string): Set<number> {
+export function execProcessIdsOwnedBy(sessionId: string): Set<number> {
   const processIds = new Set<number>();
   for (const [processId, owner] of owners) if (owner === sessionId) processIds.add(processId);
+  for (const [processId, owner] of pendingOwners) if (owner === sessionId) processIds.add(processId);
   return processIds;
 }
 
@@ -86,8 +89,14 @@ export function provenSession(requestId: string | null, sessionId: string | null
 /** Records the durable session that opened a still-running exec process. */
 export function noteExecOwner(processId: number | null, sessionId: string | null): void {
   if (processId === null) return;
+  pendingOwners.delete(processId);
   owners.set(processId, sessionId);
   attendedAt.set(processId, Date.now());
+}
+
+/** Records a cancellable launch without granting process-write authority. */
+export function reserveExecOwner(processId: number, sessionId: string | null): void {
+  pendingOwners.set(processId, sessionId);
 }
 
 /**
@@ -108,6 +117,7 @@ export function noteExecAttended(processId: number | null): void {
 export function forgetExecOwner(processId: number | null): void {
   if (processId === null) return;
   owners.delete(processId);
+  pendingOwners.delete(processId);
   attendedAt.delete(processId);
   announcedUnattended.delete(processId);
 }
@@ -120,7 +130,7 @@ export function execOwner(processId: number): string | null {
 /** One caller-scoped projection used by reminders, admission and runtime status. */
 export function backgroundExecObligations(sessionId: string | null | undefined): BackgroundExecState {
   if (!sessionId) return { running: [], exitedUnread: [] };
-  return unifiedExecManager.backgroundState(processIdsOwnedBy(sessionId));
+  return unifiedExecManager.backgroundState(execProcessIdsOwnedBy(sessionId));
 }
 
 /** Owned sessions still running past the threshold that have not been announced yet. */

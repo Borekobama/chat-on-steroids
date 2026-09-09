@@ -14,6 +14,8 @@ import { unifiedExecManager } from './codex/manager.js';
 import { initSecretsPath } from './secrets.js';
 import { pluginManager } from './plugins/manager.js';
 import { setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
+import { configureManagedBrowser } from './browser.js';
+import { extensionDir } from './extension-path.js';
 import { flushSessions, initSessionStore, pruneSessions } from './session/store.js';
 import {
   flushRecorder,
@@ -75,6 +77,7 @@ import {
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
+import { startControlService, stopControlService } from './control-service.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -297,6 +300,7 @@ void app.whenReady().then(async () => {
   initSecretsPath(userData);
   initSessionStore(userData);
   initDurableStore(userData);
+  configureManagedBrowser({ userDataDir: userData, extensionPath: extensionDir() });
   await restoreChatModels();
   if (windowActivation.isDisabled()) return;
   await loadConfig();
@@ -412,6 +416,8 @@ void app.whenReady().then(async () => {
       app.quit();
     }
   );
+  try { await startControlService(userData); }
+  catch (error) { logError(`control service failed to start: ${error instanceof Error ? error.message : String(error)}`); }
   windowActivation.enable();
   if (!isBackgroundLaunch(process.argv)) windowActivation.request();
   // macOS `activate` can fire on first launch, so do not wire it at module load where it could
@@ -492,7 +498,7 @@ app.on('will-quit', (event) => {
       // The budget has to clear the drains it contains, or it would silently defeat them:
       // the bridge force-closes wedged localhost sockets at 15s and the MCP endpoint forces
       // its own drain at 30s. This is the outer bound on both, not a competing one.
-      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge()] },
+      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge(), stopControlService()] },
       // Phase 2: only after request handlers are done may their owned child processes go.
       {
         name: 'process cleanup',

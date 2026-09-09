@@ -614,7 +614,7 @@ function json(res: http.ServerResponse, status: number, body: unknown, origin: s
   };
   if (origin) {
     headers['access-control-allow-origin'] = origin;
-    headers['access-control-allow-headers'] = 'authorization, content-type';
+    headers['access-control-allow-headers'] = 'authorization, content-type, x-cos-managed-profile';
     headers['access-control-allow-methods'] = 'GET, POST, OPTIONS';
   }
   res.writeHead(status, headers);
@@ -687,6 +687,7 @@ function noteExtensionVersion(req: http.IncomingMessage): void {
 }
 
 async function authorised(req: http.IncomingMessage): Promise<boolean> {
+  if (getConfig().ui.managedBrowser === true && req.headers['x-cos-managed-profile'] !== '1') return false;
   const header = req.headers.authorization;
   if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false;
   const token = await getSecret('bridgeToken');
@@ -1260,7 +1261,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!origin) return json(res, 403, { error: 'forbidden_origin' }, null);
     res.writeHead(204, {
       'access-control-allow-origin': origin,
-      'access-control-allow-headers': 'authorization, content-type, x-extension-version, x-extension-protocol',
+      'access-control-allow-headers': 'authorization, content-type, x-extension-version, x-extension-protocol, x-cos-managed-profile',
       'access-control-allow-methods': 'GET, POST, OPTIONS',
       // Chrome asks for this before letting an extension reach a loopback address.
       'access-control-allow-private-network': 'true',
@@ -1314,6 +1315,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(res, 400, { error: 'bad_request' }, origin);
     }
     const reconnect = Boolean(body && typeof body === 'object' && !Array.isArray(body) && (body as Record<string, unknown>)['reconnect'] === true);
+    const managed = Boolean(body && typeof body === 'object' && !Array.isArray(body) && (body as Record<string, unknown>)['managed'] === true);
+    if (getConfig().ui.managedBrowser === true && !managed) return json(res, 409, { error: 'managed_browser_required' }, origin);
     if ((await browserDisconnected()) && !reconnect) {
       return json(res, 409, { error: 'browser_disconnected' }, origin);
     }

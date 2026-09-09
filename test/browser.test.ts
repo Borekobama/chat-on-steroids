@@ -79,6 +79,16 @@ describe('browser-backed ChatGPT commands', () => {
     result.truncated = false; result.stdout = '';
     expect(await isPreferredBrowserRunning(platform, undefined, 'chrome', probe)).toBeNull();
   });
+  it('ignores personal Chrome when probing managed profile', async () => {
+    const probe = vi.fn(async () => ({
+      stdout: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --profile-directory=Default\n' +
+        '/Applications/Chromium.app/Contents/MacOS/Chromium --user-data-dir=/tmp/cos/profile --load-extension=/tmp/cos/extension --headless=new\n',
+      stderr: '', exitCode: 0, timedOut: false, truncated: false, durationMs: 1
+    }));
+    expect(await isPreferredBrowserRunning('darwin', undefined, 'chrome', probe, '/tmp/cos/profile', '/tmp/cos/extension')).toBe(true);
+    probe.mockResolvedValue({ stdout: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --profile-directory=Default\n', stderr: '', exitCode: 0, timedOut: false, truncated: false, durationMs: 1 });
+    expect(await isPreferredBrowserRunning('darwin', undefined, 'chrome', probe, '/tmp/cos/profile')).toBe(false);
+  });
   it('cold background startup gives Chrome one owned tab in a minimized startup window', async () => {
     const calls: string[] = [];
     const launch = vi.fn();
@@ -94,6 +104,27 @@ describe('browser-backed ChatGPT commands', () => {
       }
     });
     expect(calls).toEqual([`$ErrorActionPreference='Stop'; Start-Process -FilePath '${browser}' -ArgumentList '"--disable-renderer-backgrounding" "--disable-background-timer-throttling" "--window-size=800,600" "https://chatgpt.com/?cos-model-catalog=owned"' -WorkingDirectory '${path.win32.dirname(browser)}' -WindowStyle Minimized`]);
+    expect(launch).not.toHaveBeenCalled();
+  });
+  it('launches managed browser with isolated profile, extension and modern headless mode', async () => {
+    const browser = '/Applications/Chromium.app/Contents/MacOS/Chromium';
+    const launch = vi.fn(async () => ({ pid: 123 }));
+    await openInPreferredBrowser('https://chatgpt.com/?cos-input=managed', {
+      platform: 'darwin', browser: 'chrome', usable: candidate => candidate === browser, launch,
+      managedProfile: '/tmp/cos-managed/profile', extensionPath: '/tmp/cos-managed/extension', headless: true
+    });
+    expect(launch).toHaveBeenCalledExactlyOnceWith(browser, [
+      '--user-data-dir=/tmp/cos-managed/profile', '--profile-directory=Default',
+      '--load-extension=/tmp/cos-managed/extension', '--headless=new', 'https://chatgpt.com/?cos-input=managed&cos-managed-profile=1'
+    ], '/Applications/Chromium.app/Contents/MacOS');
+  });
+  it('refuses branded Chrome for managed extension loading', async () => {
+    const browser = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    const launch = vi.fn(async () => ({ pid: 123 }));
+    await expect(openInPreferredBrowser('https://chatgpt.com/', {
+      platform: 'darwin', browser: 'chrome', usable: candidate => candidate === browser, launch,
+      managedProfile: '/tmp/cos-managed/profile', extensionPath: '/tmp/cos-managed/extension'
+    })).rejects.toThrow('Chrome 137+');
     expect(launch).not.toHaveBeenCalled();
   });
   it.runIf(process.platform === 'win32')('keeps executable, cwd and quoted URL literal through PowerShell without launching a browser', async () => {

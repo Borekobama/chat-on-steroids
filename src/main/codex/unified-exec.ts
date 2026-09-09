@@ -641,10 +641,15 @@ export interface BackgroundExecState {
 export class UnifiedExecProcessManager {
   private readonly processes = new Map<number, ProcessEntry>();
   private readonly reservedProcessIds = new Set<number>();
+  private readonly revokedProcessIds = new Set<number>();
   private readonly maxWriteStdinYieldTimeMs: number;
 
   constructor(maxWriteStdinYieldTimeMs: number) {
     this.maxWriteStdinYieldTimeMs = Math.max(maxWriteStdinYieldTimeMs, MIN_EMPTY_YIELD_TIME_MS);
+  }
+
+  hasProcessOrReservation(processId: number): boolean {
+    return this.reservedProcessIds.has(processId) || this.processes.has(processId);
   }
 
   /** `rand::rng().random_range(1_000..100_000)`, retried against the reservations. */
@@ -652,6 +657,7 @@ export class UnifiedExecProcessManager {
     for (;;) {
       const processId = 1_000 + Math.floor(Math.random() * (100_000 - 1_000));
       if (this.reservedProcessIds.has(processId)) continue;
+      this.revokedProcessIds.delete(processId);
       this.reservedProcessIds.add(processId);
       return processId;
     }
@@ -659,6 +665,7 @@ export class UnifiedExecProcessManager {
 
   releaseProcessId(processId: number): void {
     this.reservedProcessIds.delete(processId);
+    this.revokedProcessIds.delete(processId);
     this.processes.delete(processId);
   }
 
@@ -687,6 +694,11 @@ export class UnifiedExecProcessManager {
       throw error instanceof UnifiedExecError
         ? error
         : UnifiedExecError.createProcess(error instanceof Error ? error.message : String(error));
+    }
+    if (this.revokedProcessIds.has(request.processId)) {
+      await process.terminate();
+      this.releaseProcessId(request.processId);
+      throw UnifiedExecError.processFailed('process launch was cancelled');
     }
 
     const start = Date.now();
@@ -898,7 +910,11 @@ export class UnifiedExecProcessManager {
 
   async terminateProcess(processId: number): Promise<boolean> {
     const entry = this.processes.get(processId);
-    if (!entry) return false;
+    if (!entry) {
+      if (!this.reservedProcessIds.has(processId)) return false;
+      this.revokedProcessIds.add(processId);
+      return true;
+    }
     if (!entry.process.hasExited()) await entry.process.terminate();
     const current = this.processes.get(processId);
     if (current && current.process === entry.process) {

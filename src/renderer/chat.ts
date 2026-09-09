@@ -2677,7 +2677,7 @@ function applyAutoCompactHint(config: Config): void {
  * every other switch that decides what ChatGPT can reach, and saves from there.
  */
 const CHAT_INPUTS = [
-  'chatBrowser',
+  'chatBrowser', 'managedBrowser', 'browserHeadless',
   'goalIncludeToolCalls',
   'planBackend',
   'finishTool', 'finishAction', 'finishLeadMinutes', 'workerModel', 'workerReasoning', 'backgroundChats', 'browserOnly', 'autoRefreshPlugins',

@@ -446,6 +446,8 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
     },
     ui: {
       chatBrowser: $<HTMLSelectElement>('chatBrowser').value as ChatBrowser,
+      managedBrowser: $<HTMLInputElement>('managedBrowser').checked,
+      browserHeadless: $<HTMLInputElement>('browserHeadless').checked,
       finishTool: $<HTMLInputElement>('finishTool').checked,
       planBackend: $<HTMLSelectElement>('planBackend').value as 'chatgpt' | 'api',
       finishAction: $<HTMLSelectElement>('finishAction').value as 'notify' | 'goal',
@@ -942,6 +944,8 @@ function apply(next: AppState): void {
   );
   applyValue($<HTMLInputElement>('binaryPath'), config.tunnel.binaryPath, previousState?.config.tunnel.binaryPath);
   applyValue($<HTMLSelectElement>('chatBrowser'), config.ui.chatBrowser ?? 'chrome', previousState?.config.ui.chatBrowser ?? 'chrome');
+  applyChecked($<HTMLInputElement>('managedBrowser'), config.ui.managedBrowser === true, previousState?.config.ui.managedBrowser);
+  applyChecked($<HTMLInputElement>('browserHeadless'), config.ui.browserHeadless === true, previousState?.config.ui.browserHeadless);
   $<HTMLSelectElement>('planBackend').value = config.ui.planBackend ?? 'chatgpt';
   applyChecked($<HTMLInputElement>('finishTool'), config.ui.finishTool === true, previousState?.config.ui.finishTool);
   applyValue($<HTMLSelectElement>('finishAction'), config.ui.finishAction ?? 'notify', previousState?.config.ui.finishAction);

@@ -982,6 +982,9 @@ async function call(path, init = {}, retried = false) {
   }
   const { timeoutMs = REQUEST_TIMEOUT_MS, ...rest } = init;
   try {
+    let managed = false;
+    try { managed = (await chrome.storage.local.get('cosManagedProfile')).cosManagedProfile === true; }
+    catch { /* Older test/host shims may not expose profile-local storage. */ }
     const response = await fetchBounded(
       `http://127.0.0.1:${found.port}${path}`,
       {
@@ -990,6 +993,7 @@ async function call(path, init = {}, retried = false) {
         headers: {
           ...(init.body ? { 'content-type': 'application/json' } : {}),
           ...versionHeaders(),
+          ...(managed ? { 'x-cos-managed-profile': '1' } : {}),
           authorization: `Bearer ${token}`
         }
       },
@@ -1027,6 +1031,20 @@ async function call(path, init = {}, retried = false) {
     forgetPort();
     return { ok: false, status: 0, error: detail };
   }
+}
+
+async function managedProfileMode() {
+  try {
+    const stored = await chrome.storage.local.get('cosManagedProfile');
+    if (stored.cosManagedProfile === true) return true;
+    const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+    const managed = tabs.some(tab => {
+      try { return new URL(tab.pendingUrl || tab.url || '').searchParams.get('cos-managed-profile') === '1'; }
+      catch { return false; }
+    });
+    if (managed) await chrome.storage.local.set({ cosManagedProfile: true });
+    return managed;
+  } catch { return false; }
 }
 
 /**
@@ -1081,7 +1099,7 @@ async function pairOnce(intent = connectionEpoch, reconnect = false) {
       method: 'POST',
       cache: 'no-store',
       headers: { 'content-type': 'application/json', ...versionHeaders() },
-      body: JSON.stringify(reconnect ? { reconnect: true } : {})
+      body: JSON.stringify({ ...(reconnect ? { reconnect: true } : {}), ...(await managedProfileMode() ? { managed: true } : {}) })
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || typeof data.token !== 'string') {

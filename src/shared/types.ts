@@ -143,6 +143,10 @@ export interface UiPrefs {
   privacyScreenshots: boolean;
   /** Browser for app-originated launches; connected source tabs retain placement ownership. */
   chatBrowser?: ChatBrowser;
+  /** Use an isolated CoS-owned browser profile for integration tasks. */
+  managedBrowser?: boolean;
+  /** Launch the managed browser in modern headless mode. */
+  browserHeadless?: boolean;
   /** Explicit choice, never inherited from the OS: the window looks how you left it. */
   theme: 'light' | 'dark';
 }

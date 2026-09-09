@@ -58,6 +58,7 @@ import {
   MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION,
   noteExecAttended,
   noteExecOwner,
+  reserveExecOwner,
   provenConversation,
   provenSession
 } from '../codex/ownership.js';
@@ -800,8 +801,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             // separate registry. Clear any stale row at the allocation boundary so a recycled
             // id cannot briefly authorize its previous chat before this call publishes the new owner.
             forgetExecOwner(processId);
+            reserveExecOwner(processId, owner);
 
-            const output = await unifiedExecManager.execCommand({
+            let output;
+            try { output = await unifiedExecManager.execCommand({
               command,
               shellType: shell.shellType,
               hookCommand: commandDetail,
@@ -813,7 +816,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               displayCwd: dir.virtual,
               env: execChildEnvironment(),
               tty: input.tty ?? DEFAULT_TTY
-            });
+            }); } catch (error) { forgetExecOwner(processId); throw error; }
             // Which durable local session may later write to this process id. The frontend
             // conversation is replaceable during Compact & Resume; the local session is not.
             if (output.processId === null) {
@@ -1053,15 +1056,19 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
   if (reg.sessionToolsExposed) registerSessionSearchReadTool(reg);
   if (reg.ctx.exposedFinishTool ?? getConfig().ui.finishTool === true) {
     reg.register('session_finish', {
-      description: 'For Astra only. Use this tool only when a user prompt explicitly requests it. Signal that you are approaching task completion; receive queued user instructions before any finish action. While HELD, follow attached instructions and call again before finishing. Each call waits at most 25 seconds.',
-      inputSchema: z.object({ summary: z.string().min(1).max(1000) }),
+      description: 'For Astra only. Use only when a user prompt explicitly requests it. A task_id/status form records Codex-launched CoS task completion immediately. A summary form receives queued user instructions and can hold the turn for at most 25 seconds.',
+      inputSchema: z.union([
+        z.object({ summary: z.string().min(1).max(1000) }),
+        z.object({ task_id: z.string().uuid(), status: z.enum(['succeeded', 'failed']) })
+      ]),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
-    }, async ({ summary }) => {
+    }, async (input) => {
+      if ('task_id' in input) return { content: [{ type: 'text' as const, text: `RECORDED: ${input.task_id} ${input.status}. End this turn with matching COS_TASK_RESULT marker.` }] };
       if (!getConfig().ui.finishTool) return { content: [{ type: 'text' as const, text: 'RELEASED: The user disabled finish hold. You may write your final answer.' }] };
       const caller = currentCaller();
       if (!caller.sessionId || !caller.conversationId) return fail('Exact session identity is required');
       if (goalWorkerChat(caller.conversationId)) return fail('Session finish hold is not applicable to workers or decision helpers. Workers report with agents action=finish; decision helpers answer normally.');
-      return guard('session_finish', async () => ({ content: [{ type: 'text', text: await announceSessionFinish(caller.sessionId!, summary) }] }));
+      return guard('session_finish', async () => ({ content: [{ type: 'text', text: await announceSessionFinish(caller.sessionId!, input.summary) }] }));
     });
   }
 

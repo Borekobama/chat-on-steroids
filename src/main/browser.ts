@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launchCommand, runCommand, runPowerShell } from './exec.js';
@@ -9,30 +9,52 @@ import { browserWindowBounds } from './browser-window-layout.js';
 type Exists = (candidate: string) => boolean;
 type Launch = typeof launchCommand;
 
+let managedContext: { userDataDir: string; extensionPath: string | null } | null = null;
+export function configureManagedBrowser(context: { userDataDir: string; extensionPath: string | null }): void {
+  managedContext = { ...context };
+}
+export function managedBrowserProfile(): string | null {
+  if (!getConfig().ui.managedBrowser || !managedContext) return null;
+  const profile = path.join(managedContext.userDataDir, 'managed-browser', 'profile');
+  mkdirSync(profile, { recursive: true, mode: 0o700 });
+  return profile;
+}
+
 /** A successful OS handoff is not a live browser. Unknown probes never grant opening authority. */
 export async function isPreferredBrowserRunning(
   platform: NodeJS.Platform = process.platform,
   powershell: typeof runPowerShell = runPowerShell,
   browser: ChatBrowser = getConfig().ui.chatBrowser ?? 'chrome',
-  command: typeof runCommand = runCommand
+  command: typeof runCommand = runCommand,
+  managedProfile = managedBrowserProfile(),
+  managedExtension = managedProfile ? managedContext?.extensionPath ?? null : null
 ): Promise<boolean | null> {
   try {
     if (platform !== 'win32') {
       if (platform !== 'darwin' && platform !== 'linux') return null;
       // comm contains executable names, never arguments or browsing/profile data.
-      const result = await command('ps', ['-A', '-o', 'comm='], os.tmpdir(), 5000);
+      const result = await command('ps', managedProfile ? ['-A', '-o', 'args='] : ['-A', '-o', 'comm='], os.tmpdir(), 5000);
       if (result.timedOut || result.truncated || result.exitCode !== 0 || !result.stdout.trim()) return null;
       const family = browser === 'edge'
         ? /^(?:msedge|microsoft-edge(?:-(?:stable|beta|dev))?|Microsoft Edge(?: Beta| Dev| Canary)?(?: Helper.*)?)$/i
         : browser === 'brave'
           ? /^(?:brave|brave-browser(?:-(?:stable|beta|dev|nightly))?|Brave Browser(?: Beta| Dev| Nightly)?(?: Helper.*)?)$/i
         : /^(?:chrome|google-chrome(?:-(?:stable|beta|unstable))?|chromium(?:-browser)?|Google Chrome(?: Beta| Dev| Canary)?(?: Helper.*)?|Chromium(?: Helper.*)?)$/i;
-      return result.stdout.split('\n').some(name => family.test(path.posix.basename(name.trim())));
+      return result.stdout.split('\n').some(name => {
+        const value = name.trim();
+        const executable = managedProfile ? value.split(/\s--/, 1)[0]! : value;
+        return family.test(path.posix.basename(executable)) && (!managedProfile ||
+          value.includes(`--user-data-dir=${managedProfile}`) && !!managedExtension && value.includes(`--load-extension=${managedExtension}`));
+      });
     }
     // Probe only the selected family; another browser cannot prove its presence or absence.
     // Enumerate names only, never user command lines or profile data. Both names are constants.
     const processName = browser === 'edge' ? 'msedge' : browser === 'brave' ? 'brave' : 'chrome';
-    const result = await powershell(`$ErrorActionPreference='Stop'; if (@(Get-Process | Where-Object ProcessName -eq '${processName}').Count) { 'running' } else { 'absent' }`, os.tmpdir(), 5000);
+    const literal = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+    const script = managedProfile
+      ? `$ErrorActionPreference='Stop'; if (@(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq '${processName}.exe' -and $_.CommandLine.Contains(${literal(`--user-data-dir=${managedProfile}`)}) -and $_.CommandLine.Contains(${literal(`--load-extension=${managedExtension ?? ''}`)}) }).Count) { 'running' } else { 'absent' }`
+      : `$ErrorActionPreference='Stop'; if (@(Get-Process | Where-Object ProcessName -eq '${processName}').Count) { 'running' } else { 'absent' }`;
+    const result = await powershell(script, os.tmpdir(), 5000);
     if (result.timedOut || result.truncated || result.exitCode !== 0) return null;
     return result.stdout.trim() === 'absent' ? false : result.stdout.trim() === 'running' ? true : null;
   } catch { return null; }
@@ -52,6 +74,10 @@ export interface PreferredBrowserOpenOptions {
   launch?: Launch;
   /** Test seam for the Windows minimized startup wrapper. */
   powershell?: typeof runPowerShell;
+  /** Managed-browser test seam; production derives these from persisted settings. */
+  managedProfile?: string;
+  extensionPath?: string;
+  headless?: boolean;
 }
 
 function isExecutableBrowser(candidate: string, platform: NodeJS.Platform): boolean {
@@ -221,15 +247,24 @@ export async function openInPreferredBrowser(
   // These switches only affect a newly started Chrome process; handing a URL to an
   // existing instance cannot change its policy. Memory Saver exclusions alone do not
   // prevent background timer/renderer throttling of long-running orchestration tabs.
+  const profile = options.managedProfile ?? managedBrowserProfile();
+  const targetUrl = profile ? (() => { const target = new URL(url); target.searchParams.set('cos-managed-profile', '1'); return target.toString(); })() : url;
   const args = [
+    ...(profile ? [`--user-data-dir=${profile}`, '--profile-directory=Default'] : []),
+    ...(profile && (options.extensionPath ?? managedContext?.extensionPath) ? [`--load-extension=${options.extensionPath ?? managedContext?.extensionPath}`] : []),
+    ...(profile && (options.headless ?? getConfig().ui.browserHeadless) ? ['--headless=new'] : []),
     ...(platform === 'win32' ? ['--disable-renderer-backgrounding', '--disable-background-timer-throttling'] : []),
     ...(options.backgroundStartup ? [`--window-size=${bounds.width},${bounds.height}`] : []),
-    url
+    targetUrl
   ];
   let lastError: unknown = null;
 
   for (const browser of new Set(preferredBrowserCandidates(platform, env, options.home, selected))) {
     if (!usable(browser)) continue;
+    if (profile && selected === 'chrome' && /(?:google[ /\\-]?chrome|com\.google\.Chrome)/i.test(browser)) {
+      lastError = new Error('Managed mode requires Chromium or Brave because Chrome 137+ disables command-line extension loading');
+      continue;
+    }
     try {
       // A windowless Chrome exits once extensions load unless the profile has a
       // persistent background app. Launch the marked helper itself so its tab
