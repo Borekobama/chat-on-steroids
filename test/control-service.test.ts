@@ -4,7 +4,8 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { initDurableStore } from '../src/main/durable.js';
-import { startControlService, stopControlService } from '../src/main/control-service.js';
+import { deliveredTurnId, startControlService, stopControlService } from '../src/main/control-service.js';
+import type { SessionEvent } from '../src/shared/session.js';
 
 async function request(socketPath: string, method: string, route: string, value?: unknown): Promise<{ status: number; body: any }> {
   const body = value === undefined ? undefined : JSON.stringify(value);
@@ -50,5 +51,13 @@ describe('CoS control service', () => {
     await mkdir(control, { mode: 0o700 });
     await writeFile(path.join(control, 'cos.sock'), 'do not replace');
     await expect(startControlService(root)).rejects.toThrow('ownership/type refused');
+  });
+
+  it('binds delivered inputs when only the assistant event carries the provider turn id', () => {
+    const events = [
+      { kind: 'user_message', seq: 3, inputId: 'input-1', inputDelivery: 'confirmed' },
+      { kind: 'assistant_message', seq: 12, turnId: 'provider-turn', final: true, state: 'final' }
+    ] as SessionEvent[];
+    expect(deliveredTurnId(events, 'input-1')).toEqual({ seq: 3, turnId: 'provider-turn' });
   });
 });

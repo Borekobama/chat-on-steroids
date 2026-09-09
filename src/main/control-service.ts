@@ -57,6 +57,13 @@ function supervisorText(task: Task): string {
   return `${task.brief}\n\nCoS WEB SUPERVISOR TASK\nTask ID: ${task.taskId}\nWorkspace: ${task.canonicalWorkspace}\nKeep this ChatGPT conversation as Supervisor Shunt parent. Use one supervisor-shunt run-role invocation at a time with --parent-host chatgpt_cos. Inspect actual diffs and verify independently. One precise correction is allowed before escalation. Do not use CoS worker chats, Goal, or Loop. Do not launch nested Shunt agents. End with changed files, verification, and unresolved blockers. When acceptance is complete, call session_finish with task_id=${task.taskId} and status=succeeded, then end the same turn final response with [COS_TASK_RESULT task_id=${task.taskId} status=succeeded]. This task form records immediately and does not hold the turn. For terminal failure, use status=failed in both places. If user input is needed, omit both and ask one clear question.`;
 }
 
+export function deliveredTurnId(events: Awaited<ReturnType<typeof readEvents>>, inputId: string): { seq: number; turnId: string } | null {
+  const user = events.find(event => event.kind === 'user_message' && event.inputId === inputId && event.inputDelivery === 'confirmed');
+  if (!user) return null;
+  const turnId = user.turnId ?? events.find(event => event.kind === 'assistant_message' && event.seq > user.seq && event.turnId)?.turnId;
+  return turnId ? { seq: user.seq, turnId } : null;
+}
+
 async function body(req: http.IncomingMessage): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = [];
   for await (const chunk of req) { size += (chunk as Buffer).length; if (size > MAX_BODY) throw new Error('body_too_large'); chunks.push(chunk as Buffer); }
@@ -81,8 +88,8 @@ async function refresh(task: Task): Promise<Task> {
       if (session.conversationId && !task.conversationIds.includes(session.conversationId)) task.conversationIds.push(session.conversationId);
       task.currentTurnId = session.activeTurnId ?? null;
       const events = await readEvents(task.sessionId, { from: task.boundInputSeq ?? 0 });
-      const user = task.boundTurnId ? undefined : events.find(event => event.kind === 'user_message' && event.inputId === activeInputId && event.inputDelivery === 'confirmed');
-      if (user?.turnId) { task.boundInputSeq = user.seq; task.boundTurnId = user.turnId; }
+      const binding = task.boundTurnId ? null : deliveredTurnId(events, activeInputId);
+      if (binding) { task.boundInputSeq = binding.seq; task.boundTurnId = binding.turnId; }
       const turnId = task.boundTurnId;
       const inputSeq = task.boundInputSeq;
       const end = inputSeq !== undefined && turnId ? events.find(event => event.kind === 'turn_end' && event.seq > inputSeq && event.turnId === turnId) : undefined;
