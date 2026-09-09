@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, mkdirSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launchCommand, runCommand, runPowerShell } from './exec.js';
@@ -15,9 +15,19 @@ export function configureManagedBrowser(context: { userDataDir: string; extensio
 }
 export function managedBrowserProfile(): string | null {
   if (!getConfig().ui.managedBrowser || !managedContext) return null;
+  if (getConfig().ui.chatBrowser === 'helium' && process.platform === 'darwin')
+    return path.join(os.homedir(), 'Library', 'Application Support', 'net.imput.helium');
   const profile = path.join(managedContext.userDataDir, 'managed-browser', 'profile');
   mkdirSync(profile, { recursive: true, mode: 0o700 });
   return profile;
+}
+
+function managedProfileDirectory(profile: string, browser: ChatBrowser): string {
+  if (browser !== 'helium') return 'Default';
+  try {
+    const state = JSON.parse(readFileSync(path.join(profile, 'Local State'), 'utf8')) as { profile?: { info_cache?: Record<string, { name?: string }> } };
+    return Object.entries(state.profile?.info_cache ?? {}).find(([, value]) => value.name === 'CoS')?.[0] ?? 'Default';
+  } catch { return 'Default'; }
 }
 
 /** A successful OS handoff is not a live browser. Unknown probes never grant opening authority. */
@@ -37,6 +47,8 @@ export async function isPreferredBrowserRunning(
       if (result.timedOut || result.truncated || result.exitCode !== 0 || !result.stdout.trim()) return null;
       const family = browser === 'edge'
         ? /^(?:msedge|microsoft-edge(?:-(?:stable|beta|dev))?|Microsoft Edge(?: Beta| Dev| Canary)?(?: Helper.*)?)$/i
+        : browser === 'helium'
+          ? /^(?:Helium(?: Helper.*)?)$/i
         : browser === 'brave'
           ? /^(?:brave|brave-browser(?:-(?:stable|beta|dev|nightly))?|Brave Browser(?: Beta| Dev| Nightly)?(?: Helper.*)?)$/i
         : /^(?:chrome|google-chrome(?:-(?:stable|beta|unstable))?|chromium(?:-browser)?|Google Chrome(?: Beta| Dev| Canary)?(?: Helper.*)?|Chromium(?: Helper.*)?)$/i;
@@ -49,7 +61,7 @@ export async function isPreferredBrowserRunning(
     }
     // Probe only the selected family; another browser cannot prove its presence or absence.
     // Enumerate names only, never user command lines or profile data. Both names are constants.
-    const processName = browser === 'edge' ? 'msedge' : browser === 'brave' ? 'brave' : 'chrome';
+    const processName = browser === 'edge' ? 'msedge' : browser === 'brave' ? 'brave' : browser === 'helium' ? 'helium' : 'chrome';
     const literal = (value: string): string => `'${value.replace(/'/g, "''")}'`;
     const script = managedProfile
       ? `$ErrorActionPreference='Stop'; if (@(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq '${processName}.exe' -and $_.CommandLine.Contains(${literal(`--user-data-dir=${managedProfile}`)}) -and $_.CommandLine.Contains(${literal(`--load-extension=${managedExtension ?? ''}`)}) }).Count) { 'running' } else { 'absent' }`
@@ -112,6 +124,8 @@ export function preferredBrowserCandidates(
     const p = path.win32;
     const parts = browser === 'edge'
       ? ['Microsoft', 'Edge', 'Application', 'msedge.exe']
+      : browser === 'helium'
+        ? ['Helium', 'Application', 'helium.exe']
       : browser === 'brave'
         ? ['BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe']
         : ['Google', 'Chrome', 'Application', 'chrome.exe'];
@@ -128,6 +142,8 @@ export function preferredBrowserCandidates(
       ['Microsoft Edge Beta.app', 'Microsoft Edge Beta'],
       ['Microsoft Edge Dev.app', 'Microsoft Edge Dev'],
       ['Microsoft Edge Canary.app', 'Microsoft Edge Canary']
+    ] : browser === 'helium' ? [
+      ['Helium.app', 'Helium']
     ] : browser === 'brave' ? [
       ['Brave Browser.app', 'Brave Browser'],
       ['Brave Browser Beta.app', 'Brave Browser Beta'],
@@ -149,7 +165,7 @@ export function preferredBrowserCandidates(
   if (platform === 'linux') {
     const pathValue = env.PATH ?? '';
     // Search release-channel launchers too: the companion need not be installed in Stable.
-    const names = browser === 'edge' ? ['microsoft-edge', 'microsoft-edge-stable', 'microsoft-edge-beta', 'microsoft-edge-dev'] : browser === 'brave' ? [
+    const names = browser === 'edge' ? ['microsoft-edge', 'microsoft-edge-stable', 'microsoft-edge-beta', 'microsoft-edge-dev'] : browser === 'helium' ? ['helium'] : browser === 'brave' ? [
       'brave-browser',
       'brave-browser-beta',
       'brave-browser-dev',
@@ -242,15 +258,16 @@ export async function openInPreferredBrowser(
   const usable = options.usable ?? ((candidate: string) => isExecutableBrowser(candidate, platform));
   const launch = options.launch ?? launchCommand;
   const selected = options.browser ?? getConfig().ui.chatBrowser ?? 'chrome';
-  const label = selected === 'edge' ? 'Microsoft Edge' : selected === 'brave' ? 'Brave Browser' : 'Google Chrome / Chromium';
+  const label = selected === 'edge' ? 'Microsoft Edge' : selected === 'brave' ? 'Brave Browser' : selected === 'helium' ? 'Helium' : 'Google Chrome / Chromium';
   const bounds = browserWindowBounds();
   // These switches only affect a newly started Chrome process; handing a URL to an
   // existing instance cannot change its policy. Memory Saver exclusions alone do not
   // prevent background timer/renderer throttling of long-running orchestration tabs.
   const profile = options.managedProfile ?? managedBrowserProfile();
+  const profileDirectory = profile ? managedProfileDirectory(profile, selected) : 'Default';
   const targetUrl = profile ? (() => { const target = new URL(url); target.searchParams.set('cos-managed-profile', '1'); return target.toString(); })() : url;
   const args = [
-    ...(profile ? [`--user-data-dir=${profile}`, '--profile-directory=Default'] : []),
+    ...(profile ? [`--user-data-dir=${profile}`, `--profile-directory=${profileDirectory}`] : []),
     ...(profile && (options.extensionPath ?? managedContext?.extensionPath) ? [`--load-extension=${options.extensionPath ?? managedContext?.extensionPath}`] : []),
     ...(profile && (options.headless ?? getConfig().ui.browserHeadless) ? ['--headless=new'] : []),
     ...(platform === 'win32' ? ['--disable-renderer-backgrounding', '--disable-background-timer-throttling'] : []),

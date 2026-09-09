@@ -61,3 +61,10 @@ it('finds Brave installations on each platform without mixing in Chrome or Edge'
   expect(linux).toContain('/snap/bin/brave');
   expect(linux.every(candidate => !/chrome|chromium|edge/.test(candidate))).toBe(true);
 });
+
+it('selects Helium without falling back to Chrome', () => {
+  expect(preferredBrowserCandidates('darwin', {}, '/Users/example', 'helium')).toEqual([
+    '/Applications/Helium.app/Contents/MacOS/Helium',
+    '/Users/example/Applications/Helium.app/Contents/MacOS/Helium'
+  ]);
+});
