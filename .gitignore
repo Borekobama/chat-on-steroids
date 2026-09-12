@@ -10,6 +10,8 @@ build/
 resources/
 
 *.log
+slopo.db
+slopo-report/
 # Local environment and credential files. Never publish real secrets.
 .env
 .env.*

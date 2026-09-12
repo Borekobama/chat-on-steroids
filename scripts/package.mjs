@@ -43,5 +43,6 @@ for (const arch of arches) {
     'never'
   ];
   if (dirOnly) builderArgs.push('--dir');
-  run(node, builderArgs, { ...process.env, COS_PACKAGE_ARCH: arch });
+  run(node, builderArgs, { ...process.env, COS_PACKAGE_ARCH: arch,
+    ...(platform === 'darwin' ? { COS_MAC_DESIGNATED_REQUIREMENT: process.env.COS_MAC_DESIGNATED_REQUIREMENT || 'identifier "com.chatonsteroids.app"' } : {}) });
 }
