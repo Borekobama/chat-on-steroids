@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -6,6 +6,11 @@ import path from 'node:path';
 import { initDurableStore } from '../src/main/durable.js';
 import { cancellationReachedTerminal, deliveredTurnId, refreshControlTaskForTests, startControlService, stopControlService, taskCompletionEvidence, type ControlRefreshHooks, type Task } from '../src/main/control-service.js';
 import type { SessionEvent } from '../src/shared/session.js';
+const blocked = vi.hoisted(() => new Set<string>());
+vi.mock('../src/main/session/blocked-chats.js', () => ({
+  isChatBlocked: (id: string) => blocked.has(id),
+  setChatBlocked: (id: string, next: boolean) => next ? blocked.add(id) : blocked.delete(id)
+}));
 
 async function request(socketPath: string, method: string, route: string, value?: unknown): Promise<{ status: number; body: any }> {
   const body = value === undefined ? undefined : JSON.stringify(value);
@@ -22,7 +27,7 @@ async function request(socketPath: string, method: string, route: string, value?
 }
 
 describe('CoS control service', () => {
-  afterEach(() => stopControlService());
+  afterEach(() => { blocked.clear(); return stopControlService(); });
 
   it.runIf(process.platform === 'darwin')('serves health only on its protected Unix socket', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'cos-control-'));
@@ -121,6 +126,17 @@ describe('CoS control service', () => {
     const cancelling = task({ cancellationRequestedAt: 5 });
     await expect(refreshControlTaskForTests(cancelling, hooks(events, true))).resolves.toMatchObject({ state: 'cancelling' });
     await expect(refreshControlTaskForTests(cancelling, hooks(events, false))).resolves.toMatchObject({ state: 'cancelled', outcome: 'cancelled' });
+  });
+
+  it('releases only cancellation-owned blocks after exact turn termination', async () => {
+    blocked.add('conversation-1');
+    const events = [
+      { kind: 'user_message', seq: 1, inputId: 'input-1', inputDelivery: 'confirmed', turnId: 'exact-turn' },
+      { kind: 'turn_end', seq: 2, turnId: 'exact-turn', outcome: 'stopped' }
+    ] as SessionEvent[];
+    await expect(refreshControlTaskForTests(task({ state: 'cancelled', cancellationRequestedAt: 5,
+      cancellationBlocks: ['conversation-1'] }), hooks(events))).resolves.toMatchObject({ state: 'cancelled', cancellationBlocks: [] });
+    expect(blocked.has('conversation-1')).toBe(false);
   });
 
   it('rebinds followup work only from its new exact input evidence', async () => {

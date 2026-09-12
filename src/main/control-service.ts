@@ -27,6 +27,7 @@ export type Task = {
   inputId: string; sessionId: string | null; conversationIds: string[]; currentTurnId: string | null;
   eventCursor: number; state: TaskState; outcome: string | null; finalText: string | null;
   createdAt: number; updatedAt: number; cancellationRequestedAt?: number;
+  cancellationBlocks?: string[];
   inputIds: string[];
   messages?: Array<{ messageId: string; payloadHash: string; inputId: string; text: string; dueAt: number }>;
   boundInputSeq?: number; boundTurnId?: string;
@@ -53,6 +54,7 @@ let discoveryPath = '';
 let server: http.Server | null = null;
 let tasks: Task[] = [];
 let taskLock = Promise.resolve();
+let cancellationSweep: NodeJS.Timeout | null = null;
 
 const serial = <T>(fn: () => Promise<T>): Promise<T> => {
   const result = taskLock.then(fn, fn);
@@ -74,6 +76,17 @@ function isWithin(parent: string, child: string): boolean {
 }
 async function loadTasks(): Promise<void> { tasks = (await readDurable<Task[]>(STATE)) ?? []; }
 async function saveTasks(): Promise<void> { await writeDurableNow(STATE, tasks); }
+function scheduleCancellationSweep(): void {
+  if (cancellationSweep || !tasks.some(task => task.cancellationBlocks?.length)) return;
+  cancellationSweep = setTimeout(() => {
+    cancellationSweep = null;
+    void serial(async () => {
+      for (const task of tasks.filter(item => item.cancellationBlocks?.length)) await refresh(task);
+      await saveTasks();
+    }).finally(scheduleCancellationSweep);
+  }, 1000);
+  cancellationSweep.unref?.();
+}
 function taskView(task: Task): Omit<Task, 'brief'> { const { brief: _brief, ...view } = task; return view; }
 function supervisorText(task: Task): string {
   return `${task.brief}\n\nCoS WEB SUPERVISOR TASK\nTask ID: ${task.taskId}\nWorkspace: ${task.canonicalWorkspace}\nKeep this ChatGPT conversation as Supervisor Shunt parent. Use one supervisor-shunt run-role invocation at a time with --parent-host chatgpt_cos. Inspect actual diffs and verify independently. One precise correction is allowed before escalation. Do not use CoS worker chats, Goal, or Loop. Do not launch nested Shunt agents. End with changed files, verification, and unresolved blockers. When acceptance is complete, call session_finish with task_id=${task.taskId} and status=succeeded, then end the same turn with the final response. This task form records immediately and does not hold the turn. For terminal failure, use status=failed. If user input is needed, omit session_finish and ask one clear question.`;
@@ -110,7 +123,7 @@ async function body(req: http.IncomingMessage): Promise<unknown> {
 }
 function taskId(pathname: string): string | null { const match = pathname.match(/^\/v1\/tasks\/([^/]+)(?:\/([^/]+))?$/); return match?.[1] && validId(match[1]) ? match[1] : null; }
 async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): Promise<Task> {
-  if (['succeeded', 'failed', 'cancelled'].includes(task.state)) return task;
+  if (['succeeded', 'failed', 'cancelled'].includes(task.state) && !task.cancellationBlocks?.length) return task;
   const alreadyCompleted = task.state === 'succeeded' || task.state === 'failed';
   const activeInputId = task.inputIds.at(-1) ?? task.inputId;
   const row = (await hooks.listInputs()).find(input => input.id === activeInputId);
@@ -158,6 +171,13 @@ async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): P
   }
   const hasOwnedProcess = !!task.sessionId && [...hooks.processIdsOwnedBy(task.sessionId)]
     .some(processId => hooks.hasProcessOrReservation(processId));
+  if (task.cancellationBlocks?.length) {
+    task.cancellationBlocks = task.cancellationBlocks.filter(isChatBlocked);
+    if (exactTerminal && !hasOwnedProcess) {
+      for (const conversationId of task.cancellationBlocks) setChatBlocked(conversationId, false);
+      task.cancellationBlocks = [];
+    }
+  }
   const undeliveredCancelled = !task.boundTurnId && (!row || row.state === 'cancelled' || row.state === 'failed');
   if (!task.cancellationRequestedAt && hasOwnedProcess && ['succeeded', 'failed', 'cancelled'].includes(task.state)) {
     task.state = 'running'; task.outcome = null;
@@ -274,9 +294,12 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
       task.cancellationRequestedAt ??= Date.now(); task.state = 'cancelling'; await saveTasks();
       await Promise.all(task.inputIds.map(inputId => cancelDesktopInput(inputId).catch(() => false)));
       if (task.sessionId && task.currentTurnId) await stopSessionTurn(task.sessionId, task.currentTurnId).catch(() => undefined);
-      for (const conversationId of task.conversationIds) setChatBlocked(conversationId, true);
+      const cancellationBlocks = task.conversationIds.filter(conversationId => !isChatBlocked(conversationId));
+      for (const conversationId of cancellationBlocks) setChatBlocked(conversationId, true);
+      task.cancellationBlocks = [...new Set([...(task.cancellationBlocks ?? []), ...cancellationBlocks])];
       if (task.sessionId) await Promise.all([...execProcessIdsOwnedBy(task.sessionId)].map(processId => unifiedExecManager.terminateProcess(processId)));
       await refresh(task); await saveTasks();
+      scheduleCancellationSweep();
     });
     return json(res, 202, { taskId: task.taskId, state: task.state });
   }
@@ -286,6 +309,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
 export async function startControlService(userDataDir: string): Promise<string> {
   if (process.platform !== 'darwin') return '';
   await loadTasks();
+  scheduleCancellationSweep();
   const requested = process.env.COS_CONTROL_SOCKET;
   socketPath = requested || path.join(userDataDir, 'control', 'cos.sock');
   if (socketPath.length >= 100) throw new Error('control socket path too long');
@@ -313,6 +337,7 @@ export async function startControlService(userDataDir: string): Promise<string> 
   return socketPath;
 }
 export async function stopControlService(): Promise<void> {
+  if (cancellationSweep) clearTimeout(cancellationSweep); cancellationSweep = null;
   if (!server) return; await new Promise<void>(resolve => server!.close(() => resolve())); server = null;
   await fs.rm(socketPath, { force: true }).catch(() => undefined); await fs.rm(discoveryPath, { force: true }).catch(() => undefined);
 }
