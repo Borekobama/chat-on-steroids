@@ -103,6 +103,7 @@ import {
   withExecNotes
 } from '../exec-hints.js';
 import { childEnv } from '../exec.js';
+import { prependPath } from '../env.js';
 import { locateRipgrep } from '../ripgrep.js';
 import { ensureDevToolchain } from '../toolchain.js';
 import {
@@ -222,6 +223,8 @@ function execChildEnvironment(): NodeJS.ProcessEnv {
   // fail to find the very rg binary the app ships. Extend the shared environment only with the
   // dev-toolchain discovery that is specific to this surface.
   const env = childEnv();
+  const codexPath = getConfig().commandSandbox.codexPath;
+  if (nodePath.isAbsolute(codexPath)) prependPath(env, nodePath.dirname(codexPath));
   const added = ensureDevToolchain(env);
   if (added.length > 0 && !toolchainLogged) {
     toolchainLogged = true;
