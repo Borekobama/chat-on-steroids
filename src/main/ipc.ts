@@ -130,6 +130,9 @@ const settingsPatch = z.object({
       .max(128)
       .refine((v) => v === '' || TUNNEL_ID_PATTERN.test(v), 'Expected tunnel_ followed by 32 hex characters'),
     binaryPath: z.string().max(4096)
+  }).superRefine((value, context) => {
+    const ids = [value.tunnelId, value.desktopTunnelId, value.pluginsTunnelId].filter(Boolean);
+    if (new Set(ids).size !== ids.length) context.addIssue({ code: 'custom', message: 'Each connector requires a dedicated tunnel ID' });
   }),
   ui: z.object({
     chatBrowser: z.enum(CHAT_BROWSERS).optional(),

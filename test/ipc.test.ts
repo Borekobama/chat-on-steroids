@@ -545,6 +545,13 @@ describe('settings writes from more than one UI', () => {
     expect(getConfig().tunnel.pluginsTunnelId).toBe('');
   });
 
+  it('rejects one tunnel id shared by multiple connector surfaces', async () => {
+    const base = defaultConfig(); await saveConfig(base);
+    const tunnelId = `tunnel_${'a'.repeat(32)}`;
+    const duplicate = { ...base, tunnel: { ...base.tunnel, tunnelId, pluginsTunnelId: tunnelId } };
+    expect((await save(duplicate, base)).ok).toBe(false);
+  });
+
   it('preserves a newer Plugins tunnel across stale and legacy renderer saves', async () => {
     const base = defaultConfig(); await saveConfig(base);
     const tunnelId = `tunnel_${'b'.repeat(32)}`;
