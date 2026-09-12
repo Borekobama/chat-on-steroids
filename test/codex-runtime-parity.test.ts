@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   UnifiedExecError,
   UnifiedExecProcessManager,
+  applyCommandSandbox,
   applyUnifiedExecEnv,
   execCommandResponseText,
   execCommandStructuredOutput,
@@ -62,6 +63,31 @@ describe('Codex unified exec runtime parity', () => {
   afterEach(async () => {
     await Promise.all(managers.splice(0).map((item) => item.terminateAllProcesses()));
     await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  it('wraps commands in the configured Codex permission profile and fails closed on bad settings', () => {
+    const settings = {
+      enabled: true,
+      codexPath: '/Applications/ChatGPT.app/Contents/Resources/codex',
+      permissionProfile: 'projects-only'
+    };
+    expect(applyCommandSandbox(['/bin/sh', '-c', 'pwd'], '/workspace', settings)).toEqual([
+      settings.codexPath,
+      'sandbox',
+      '--permission-profile',
+      'projects-only',
+      '--cd',
+      '/workspace',
+      '/bin/sh',
+      '-c',
+      'pwd'
+    ]);
+    expect(() => applyCommandSandbox(['/bin/true'], '/workspace', { ...settings, codexPath: 'codex' })).toThrow(
+      'command sandbox Codex path must be absolute'
+    );
+    expect(() =>
+      applyCommandSandbox(['/bin/true'], '/workspace', { ...settings, permissionProfile: '../unsafe' })
+    ).toThrow('command sandbox permission profile is invalid');
   });
 
   /**

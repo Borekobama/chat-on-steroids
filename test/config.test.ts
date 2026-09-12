@@ -25,6 +25,26 @@ afterAll(async () => {
 });
 
 describe('settings migration', () => {
+  it('keeps command sandbox disabled for old configs and preserves explicit settings', async () => {
+    const legacy = defaultConfig();
+    delete (legacy as Partial<typeof legacy>).commandSandbox;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    expect((await loadConfig()).commandSandbox).toEqual({
+      enabled: false,
+      codexPath: '',
+      permissionProfile: 'projects-only'
+    });
+
+    await saveConfig({
+      ...defaultConfig(),
+      commandSandbox: {
+        enabled: true,
+        codexPath: '/Applications/ChatGPT.app/Contents/Resources/codex',
+        permissionProfile: 'projects-only'
+      }
+    });
+    expect((await loadConfig()).commandSandbox.enabled).toBe(true);
+  });
   it('defaults login startup off for fresh and legacy settings independently of auto-connect', async () => {
     expect(defaultConfig().ui.startAtLogin).toBe(false);
     const legacy = defaultConfig();

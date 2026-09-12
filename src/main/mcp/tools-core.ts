@@ -815,7 +815,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               cwd: dir.real,
               displayCwd: dir.virtual,
               env: execChildEnvironment(),
-              tty: input.tty ?? DEFAULT_TTY
+              tty: input.tty ?? DEFAULT_TTY,
+              commandSandbox: getConfig().commandSandbox
             }); } catch (error) { forgetExecOwner(processId); throw error; }
             // Which durable local session may later write to this process id. The frontend
             // conversation is replaceable during Compact & Resume; the local session is not.

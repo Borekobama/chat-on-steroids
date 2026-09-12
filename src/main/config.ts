@@ -22,6 +22,7 @@ import {
   DESKTOP_CAPABILITIES,
   type ArtifactSettings,
   type CompactionSettings,
+  type CommandSandboxSettings,
   type Config,
   type GoalSettings,
   type MultiAgentSettings,
@@ -265,6 +266,11 @@ const capabilitiesSchema = z
  */
 export const MAX_MCP_INSTRUCTIONS_CHARS = 4000;
 const DEFAULT_MCP = { instructions: '' } as const;
+const DEFAULT_COMMAND_SANDBOX: CommandSandboxSettings = {
+  enabled: false,
+  codexPath: '',
+  permissionProfile: 'projects-only'
+};
 
 const configSchema = z.object({
   // A config written by hand — or by a build before `/skills` was reserved — must not be
@@ -276,6 +282,18 @@ const configSchema = z.object({
     .transform(uniqueStoredRoots),
   capabilities: capabilitiesSchema,
   readOnly: z.boolean(),
+  commandSandbox: z
+    .object({
+      enabled: z.boolean().optional().default(DEFAULT_COMMAND_SANDBOX.enabled),
+      codexPath: z.string().max(4096).optional().default(DEFAULT_COMMAND_SANDBOX.codexPath),
+      permissionProfile: z
+        .string()
+        .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/)
+        .optional()
+        .default(DEFAULT_COMMAND_SANDBOX.permissionProfile)
+    })
+    .optional()
+    .default({ ...DEFAULT_COMMAND_SANDBOX }),
   tunnel: z.object({
     kind: z.enum(['openai', 'cloudflared', 'manual']),
     tunnelId: z.string().max(128),
@@ -477,6 +495,7 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     roots: [],
     capabilities: firstLaunchCapabilities(platform, release),
     readOnly: false,
+    commandSandbox: { ...DEFAULT_COMMAND_SANDBOX },
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
     ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, managedBrowser: false, browserHeadless: false },
     sessions: { ...DEFAULT_SESSIONS },

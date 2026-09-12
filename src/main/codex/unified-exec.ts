@@ -19,6 +19,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import path from 'node:path';
 import { HeadTailBuffer } from './head-tail-buffer.js';
 import {
   approxTokenCount,
@@ -45,6 +46,7 @@ import {
 } from './unified-exec-constants.js';
 import { terminateProcessTree } from '../exec.js';
 import { prefixPowershellScriptWithUtf8, type ShellType } from './shell.js';
+import type { CommandSandboxSettings } from '../../shared/types.js';
 
 // --------------------------------------------------------------------------- errors
 
@@ -605,6 +607,28 @@ export interface ExecCommandRequest {
   displayCwd: string;
   env: NodeJS.ProcessEnv;
   tty: boolean;
+  commandSandbox?: CommandSandboxSettings;
+}
+
+export function applyCommandSandbox(
+  command: string[],
+  cwd: string,
+  settings: CommandSandboxSettings | undefined
+): string[] {
+  if (!settings?.enabled) return command;
+  if (!path.isAbsolute(settings.codexPath)) throw new Error('command sandbox Codex path must be absolute');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(settings.permissionProfile)) {
+    throw new Error('command sandbox permission profile is invalid');
+  }
+  return [
+    settings.codexPath,
+    'sandbox',
+    '--permission-profile',
+    settings.permissionProfile,
+    '--cd',
+    cwd,
+    ...command
+  ];
 }
 
 export interface WriteStdinRequest {
@@ -680,8 +704,9 @@ export class UnifiedExecProcessManager {
     try {
       // `UnifiedExecRuntime::run` prefixes every PowerShell script before it reaches the
       // process launcher so pipe-mode output is UTF-8 just like PTY output.
-      const command =
+      const preparedCommand =
         request.shellType === 'powershell' ? prefixPowershellScriptWithUtf8(request.command) : request.command;
+      const command = applyCommandSandbox(preparedCommand, request.cwd, request.commandSandbox);
       process = await UnifiedExecProcess.spawn({
         command,
         shellType: request.shellType,

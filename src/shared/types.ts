@@ -319,11 +319,18 @@ export interface ArtifactSettings {
   maxFileBytes: number;
 }
 
+export interface CommandSandboxSettings {
+  enabled: boolean;
+  codexPath: string;
+  permissionProfile: string;
+}
+
 export interface Config {
   artifacts: ArtifactSettings;
   roots: Root[];
   capabilities: Capabilities;
   readOnly: boolean;
+  commandSandbox: CommandSandboxSettings;
   tunnel: TunnelSettings;
   ui: UiPrefs;
   sessions: SessionSettings;
