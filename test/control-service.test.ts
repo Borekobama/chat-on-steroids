@@ -65,6 +65,8 @@ describe('CoS control service', () => {
     expect(cancellationReachedTerminal(Date.now(), true)).toBe(true);
     expect(cancellationReachedTerminal(Date.now(), true, true)).toBe(false);
     expect(cancellationReachedTerminal(Date.now(), false)).toBe(false);
+    expect(cancellationReachedTerminal(Date.now(), false, false, true)).toBe(true);
+    expect(cancellationReachedTerminal(Date.now(), false, true, true)).toBe(false);
     expect(cancellationReachedTerminal(undefined, true)).toBe(false);
   });
 

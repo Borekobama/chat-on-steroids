@@ -7,6 +7,7 @@ import { inputArgs, listInputs } from './session/input.js';
 import { cancelDesktopInput, sendDesktopInput } from './session/start-input.js';
 import { getSession, readEvents } from './session/store.js';
 import { stopSessionTurn } from './bridge.js';
+import { isChatBlocked, setChatBlocked } from './session/blocked-chats.js';
 import { readDurable, writeDurableNow } from './durable.js';
 import { addProject, getProject, listProjects, projectWorkspace } from './projects.js';
 import { execProcessIdsOwnedBy } from './codex/ownership.js';
@@ -85,8 +86,8 @@ export function deliveredTurnId(events: Awaited<ReturnType<typeof readEvents>>, 
   return turnId ? { seq: user.seq, turnId } : null;
 }
 
-export function cancellationReachedTerminal(cancellationRequestedAt: number | undefined, hasTerminalTurn: boolean, hasOwnedProcess = false): boolean {
-  return cancellationRequestedAt !== undefined && hasTerminalTurn && !hasOwnedProcess;
+export function cancellationReachedTerminal(cancellationRequestedAt: number | undefined, hasTerminalTurn: boolean, hasOwnedProcess = false, isolated = false): boolean {
+  return cancellationRequestedAt !== undefined && (hasTerminalTurn || isolated) && !hasOwnedProcess;
 }
 
 export function taskCompletionEvidence(events: SessionEvent[], taskId: string, inputSeq: number, turnId: string, terminalSeq = Number.POSITIVE_INFINITY): { seq: number; status: 'succeeded' | 'failed' } | null {
@@ -160,7 +161,8 @@ async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): P
   const undeliveredCancelled = !task.boundTurnId && (!row || row.state === 'cancelled' || row.state === 'failed');
   if (!task.cancellationRequestedAt && hasOwnedProcess && ['succeeded', 'failed', 'cancelled'].includes(task.state)) {
     task.state = 'running'; task.outcome = null;
-  } else if (cancellationReachedTerminal(task.cancellationRequestedAt, exactTerminal || undeliveredCancelled, hasOwnedProcess)) {
+  } else if (cancellationReachedTerminal(task.cancellationRequestedAt, exactTerminal || undeliveredCancelled, hasOwnedProcess,
+    task.conversationIds.length > 0 && task.conversationIds.every(isChatBlocked))) {
     task.state = 'cancelled'; task.outcome = 'cancelled';
   } else if (task.cancellationRequestedAt) {
     task.state = 'cancelling'; task.outcome = null;
@@ -272,6 +274,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
       task.cancellationRequestedAt ??= Date.now(); task.state = 'cancelling'; await saveTasks();
       await Promise.all(task.inputIds.map(inputId => cancelDesktopInput(inputId).catch(() => false)));
       if (task.sessionId && task.currentTurnId) await stopSessionTurn(task.sessionId, task.currentTurnId).catch(() => undefined);
+      for (const conversationId of task.conversationIds) setChatBlocked(conversationId, true);
       if (task.sessionId) await Promise.all([...execProcessIdsOwnedBy(task.sessionId)].map(processId => unifiedExecManager.terminateProcess(processId)));
       await refresh(task); await saveTasks();
     });

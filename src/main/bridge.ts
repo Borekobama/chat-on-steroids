@@ -1494,6 +1494,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
               replacements: inputRows.filter(next => next.createdAt > row.createdAt && next.purpose !== 'decision')
                 .map(next => ({ id: next.id, conversationId: next.conversationId })) }))],
         background: getConfig().ui.backgroundChats === true,
+        managedBrowser: getConfig().ui.managedBrowser === true,
         browserOnly: getConfig().ui.browserOnly === true,
         browserWorkArea: currentBrowserWorkArea(),
         browserWindowBounds: browserWindowBounds(),

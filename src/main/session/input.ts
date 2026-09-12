@@ -64,6 +64,7 @@ const entrySchema = inputArgs.extend({
   deliveredSessionId: z.string().min(8).max(64).nullable().optional(),
   messageId: z.string().min(1).max(256).optional(),
   deliveredAt: z.number().optional(),
+  browserRetryAt: z.number().optional(),
   stagesApplied: z.boolean().optional(),
   historyRecorded: z.boolean().optional(),
   completedTurnId: z.string().max(256).optional(),
@@ -226,8 +227,10 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
     // rows are ambiguous and cannot safely be reclassified from today's activity.
     if (row.state === 'queued' && row.mode === 'auto' && !row.finishOwner &&
         (row.transportIntent === 'browser' || (!row.transportIntent && !row.sessionId)) &&
-        Date.now() - Math.max(row.createdAt, row.dueAt) >= 60_000)
-      return { ...row, state: 'failed', error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
+        Date.now() - Math.max(row.browserRetryAt ?? row.createdAt, row.dueAt) >= 60_000) {
+      if (row.browserRetryAt === undefined) return { ...row, browserRetryAt: Date.now() };
+      return { ...row, state: 'failed', error: 'Not sent: the browser did not pick up this message after one automatic retry.' };
+    }
     // Native preparation bounds include the 60s upload and 15s picker hydration.
     // Once Send is authorized, its 30s receipt + 15s fresh-route wait are the entire tail.
     if (row.state === 'browser' && Date.now() - (row.sendAuthorizedAt ?? row.offeredAt ?? row.createdAt) >= (row.sendAuthorizedAt === undefined ? (row.attachments?.length ? 720_000 : row.images?.length ? 120_000 : 60_000) : 45_000))
