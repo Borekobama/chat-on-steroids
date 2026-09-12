@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { inputArgs, listInputs } from './session/input.js';
 import { cancelDesktopInput, sendDesktopInput } from './session/start-input.js';
@@ -51,6 +52,11 @@ const json = (res: http.ServerResponse, status: number, value: unknown) => {
 const error = (res: http.ServerResponse, status: number, code: string, message = code) => json(res, status, { error: code, message });
 function validId(value: unknown): value is string { return typeof value === 'string' && ID.test(value); }
 function hash(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
+function projectsRoot(): string { return path.join(os.homedir(), 'Downloads', 'Projects'); }
+function isWithin(parent: string, child: string): boolean {
+  const base = path.resolve(parent) + path.sep;
+  return child === path.resolve(parent) || child.startsWith(base);
+}
 async function loadTasks(): Promise<void> { tasks = (await readDurable<Task[]>(STATE)) ?? []; }
 async function saveTasks(): Promise<void> { await writeDurableNow(STATE, tasks); }
 function taskView(task: Task): Omit<Task, 'brief'> { const { brief: _brief, ...view } = task; return view; }
@@ -89,7 +95,7 @@ async function body(req: http.IncomingMessage): Promise<unknown> {
 }
 function taskId(pathname: string): string | null { const match = pathname.match(/^\/v1\/tasks\/([^/]+)(?:\/([^/]+))?$/); return match?.[1] && validId(match[1]) ? match[1] : null; }
 async function refresh(task: Task): Promise<Task> {
-  if (task.state === 'cancelled' || (['succeeded', 'failed'].includes(task.state) && task.finalText)) return task;
+  if (['succeeded', 'failed', 'cancelled'].includes(task.state)) return task;
   const alreadyCompleted = task.state === 'succeeded' || task.state === 'failed';
   const activeInputId = task.inputIds.at(-1) ?? task.inputId;
   const row = (await listInputs()).find(input => input.id === activeInputId);
@@ -108,22 +114,16 @@ async function refresh(task: Task): Promise<Task> {
       const events = await readEvents(task.sessionId, { from: task.boundInputSeq ?? 0 });
       const binding = task.boundTurnId ? null : deliveredTurnId(events, activeInputId);
       if (binding) { task.boundInputSeq = binding.seq; task.boundTurnId = binding.turnId; }
-      // A recorder reload can lose the confirmed user-message event while the durable
-      // delivery row still binds this task to the exact session and active provider turn.
-      // Fall back only to that current turn; never accept task-id evidence cross-turn.
-      const turnId = task.boundTurnId ?? task.currentTurnId;
+      // Current provider turn is not proof that this task's exact input started it.
+      // A recorder restart may lose the binding; fail closed instead of accepting stale evidence.
+      const turnId = task.boundTurnId;
       const inputSeq = task.boundInputSeq ?? 0;
       const completion = inputSeq !== undefined && turnId ? taskCompletionEvidence(events, task.taskId, inputSeq, turnId) : null;
       const end = inputSeq !== undefined && turnId ? events.find(event => event.kind === 'turn_end' && event.seq > inputSeq && event.turnId === turnId) : undefined;
       const final = inputSeq !== undefined && turnId ? events.findLast((event): event is Extract<typeof event, { kind: 'assistant_message' }> =>
         event.kind === 'assistant_message' && event.seq > inputSeq && event.turnId === turnId && event.final && event.state === 'final') : undefined;
       if (final) task.finalText = final.message.text;
-      if (completion) {
-        task.state = completion.status;
-        task.outcome = completion.status === 'succeeded' ? 'completed' : 'supervisor_failed';
-        task.currentTurnId = null;
-      }
-      else if (end?.kind === 'turn_end' && final) {
+      if (end?.kind === 'turn_end' && final) {
         const boundSeq = inputSeq!;
         const marker = final.message.text.match(new RegExp(`\\[COS_TASK_RESULT\\s+task_id=${task.taskId}\\s+status=(succeeded|failed)\\]\\s*$`, 'i'));
         const proof = events.find(event => event.kind === 'tool_call' && event.seq > boundSeq && event.seq < end.seq &&
@@ -134,8 +134,11 @@ async function refresh(task: Task): Promise<Task> {
           task.state = 'cancelled'; task.outcome = 'cancelled'; task.currentTurnId = null;
         }
         else if (end.outcome !== 'completed') { task.state = 'failed'; task.outcome = end.outcome; }
-        else if (marker?.[1]?.toLowerCase() === 'succeeded' && proof) { task.state = 'succeeded'; task.outcome = 'completed'; }
-        else if (marker?.[1]?.toLowerCase() === 'failed' && proof) { task.state = 'failed'; task.outcome = 'supervisor_failed'; }
+        else if (completion?.status === 'succeeded' || completion?.status === 'failed') {
+          task.state = completion.status; task.outcome = completion.status === 'succeeded' ? 'completed' : 'supervisor_failed'; task.currentTurnId = null;
+        }
+        else if (marker?.[1]?.toLowerCase() === 'succeeded' && proof) { task.state = 'succeeded'; task.outcome = 'completed'; task.currentTurnId = null; }
+        else if (marker?.[1]?.toLowerCase() === 'failed' && proof) { task.state = 'failed'; task.outcome = 'supervisor_failed'; task.currentTurnId = null; }
         else task.state = 'awaiting_input';
       }
       else if (task.cancellationRequestedAt) task.state = 'cancelling';
@@ -162,6 +165,9 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
     if (!payload.cwd) return error(res, 400, 'workspace_required');
     const canonicalWorkspace = await fs.realpath(payload.cwd).catch(() => '');
     if (!canonicalWorkspace) return error(res, 400, 'workspace_unavailable');
+    let ceiling = '';
+    try { ceiling = await fs.realpath(projectsRoot()); } catch { return error(res, 503, 'projects_ceiling_unavailable', 'Projects workspace is unavailable'); }
+    if (!isWithin(ceiling, canonicalWorkspace)) return error(res, 403, 'workspace_outside_projects', 'Workspace must be inside ~/Downloads/Projects');
     let matchedProject = payload.projectId
       ? await getProject(payload.projectId)
       : (await listProjects()).find(project => project.path === canonicalWorkspace) ?? null;

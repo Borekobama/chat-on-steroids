@@ -19,6 +19,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
 import { HeadTailBuffer } from './head-tail-buffer.js';
 import { CommandBatchDisplay } from './command-batch.js';
@@ -635,10 +636,14 @@ export function applyCommandSandbox(
   cwd: string,
   settings: CommandSandboxSettings | undefined
 ): string[] {
-  if (!settings?.enabled) return command;
+  if (!settings) throw new Error('command sandbox settings are required for shell commands');
+  if (!settings.enabled) throw new Error('command sandbox is required for shell commands');
   if (!path.isAbsolute(settings.codexPath)) throw new Error('command sandbox Codex path must be absolute');
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(settings.permissionProfile)) {
     throw new Error('command sandbox permission profile is invalid');
+  }
+  if (settings.permissionProfile !== 'projects-only') {
+    throw new Error('command sandbox permission profile must be projects-only');
   }
   return [
     settings.codexPath,
@@ -755,12 +760,13 @@ export class UnifiedExecProcessManager {
         }
       }
       const command = applyCommandSandbox(commandWithPath, request.cwd, request.commandSandbox);
+      const env = { ...request.env, CODEX_HOME: path.join(os.homedir(), '.codex') };
       process = await UnifiedExecProcess.spawn({
         batchMarker: request.batchMarker,
         command,
         shellType: request.shellType,
         cwd: request.cwd,
-        env: request.env,
+        env,
         tty: request.tty
       });
     } catch (error) {

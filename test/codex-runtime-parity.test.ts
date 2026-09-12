@@ -90,6 +90,12 @@ describe('Codex unified exec runtime parity', () => {
     expect(() =>
       applyCommandSandbox(['/bin/true'], '/workspace', { ...settings, permissionProfile: '../unsafe' })
     ).toThrow('command sandbox permission profile is invalid');
+    expect(() =>
+      applyCommandSandbox(['/bin/true'], '/workspace', { ...settings, enabled: false })
+    ).toThrow('command sandbox is required');
+    expect(() =>
+      applyCommandSandbox(['/bin/true'], '/workspace', { ...settings, permissionProfile: 'default' })
+    ).toThrow('must be projects-only');
   });
 
   /**

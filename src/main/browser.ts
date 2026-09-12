@@ -15,19 +15,22 @@ export function configureManagedBrowser(context: { userDataDir: string; extensio
 }
 export function managedBrowserProfile(): string | null {
   if (!getConfig().ui.managedBrowser || !managedContext) return null;
-  if (getConfig().ui.chatBrowser === 'helium' && process.platform === 'darwin')
-    return path.join(os.homedir(), 'Library', 'Application Support', 'net.imput.helium');
   const profile = path.join(managedContext.userDataDir, 'managed-browser', 'profile');
+  if (getConfig().ui.chatBrowser === 'helium' && process.platform === 'darwin') {
+    const isolated = path.join(managedContext.userDataDir, 'managed-browser', 'helium-profile');
+    mkdirSync(isolated, { recursive: true, mode: 0o700 });
+    return isolated;
+  }
   mkdirSync(profile, { recursive: true, mode: 0o700 });
   return profile;
 }
 
-function managedProfileDirectory(profile: string, browser: ChatBrowser): string {
+function managedProfileDirectory(profile: string, browser: ChatBrowser): string | null {
   if (browser !== 'helium') return 'Default';
   try {
     const state = JSON.parse(readFileSync(path.join(profile, 'Local State'), 'utf8')) as { profile?: { info_cache?: Record<string, { name?: string }> } };
-    return Object.entries(state.profile?.info_cache ?? {}).find(([, value]) => value.name === 'CoS')?.[0] ?? 'Default';
-  } catch { return 'Default'; }
+    return Object.entries(state.profile?.info_cache ?? {}).find(([, value]) => value.name === 'CoS')?.[0] ?? null;
+  } catch { return null; }
 }
 
 /** A successful OS handoff is not a live browser. Unknown probes never grant opening authority. */
@@ -265,6 +268,9 @@ export async function openInPreferredBrowser(
   // prevent background timer/renderer throttling of long-running orchestration tabs.
   const profile = options.managedProfile ?? managedBrowserProfile();
   const profileDirectory = profile ? managedProfileDirectory(profile, selected) : 'Default';
+  if (profile && selected === 'helium' && !profileDirectory) {
+    throw new Error('Helium managed profile "CoS" is unavailable; refusing to use personal Default profile.');
+  }
   const targetUrl = profile ? (() => { const target = new URL(url); target.searchParams.set('cos-managed-profile', '1'); return target.toString(); })() : url;
   const args = [
     ...(profile ? [`--user-data-dir=${profile}`, `--profile-directory=${profileDirectory}`] : []),

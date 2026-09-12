@@ -632,6 +632,7 @@ export class PluginManager {
           { timeout: 20000 },
         );
       } else {
+        throw new Error('Local plugins are disabled: CoS cannot safely contain their subprocess permissions.');
         let launch = { command: row.launch.command, args: row.launch.args, env: {} as Record<string, string> };
         if (row.launch.manifest) {
           const manifest = vAny.McpbManifestSchema.parse(row.launch.manifest);
@@ -649,8 +650,9 @@ export class PluginManager {
             pathSeparator: path.sep,
             logger: { log: () => {}, warn: () => {}, error: () => {} },
           });
-          if (!cfg?.command) throw new Error('MCPB requires unsupported configuration/runtime setup');
-          launch = { command: cfg.command, args: cfg.args ?? [], env: cfg.env ?? {} };
+          const configuredCommand = cfg?.command;
+          if (typeof configuredCommand !== 'string') throw new Error('MCPB requires unsupported configuration/runtime setup');
+          launch = { command: configuredCommand!, args: cfg?.args ?? [], env: cfg?.env ?? {} };
           if (JSON.stringify(launch).includes('${'))
             throw new Error('MCPB configuration is incomplete; provide its required fields');
           // MCPB recipes also permit ordinary relative entry points. Resolve packaged assets
@@ -683,7 +685,7 @@ export class PluginManager {
         // into a stable cwd so replacing the installation cannot erase that data.
         signal.throwIfAborted();
         if (this.closing || !row.enabled || !this.records.includes(row)) return;
-        transport = new StdioClientTransport({
+        const stdio = new StdioClientTransport({
           command: launch.command,
           args: launch.args,
           cwd: data,
@@ -691,8 +693,9 @@ export class PluginManager {
           stderr: 'ignore',
           maxBufferSize: 16 * 1024 * 1024,
         });
-        this.connecting.set(client, transport);
-        await client.connect(transport, { timeout: 20000 });
+        transport = stdio;
+        this.connecting.set(client, stdio);
+        await client.connect(stdio, { timeout: 20000 });
       }
       const tools = await this.discover(client);
       signal.throwIfAborted();

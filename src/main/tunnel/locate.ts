@@ -107,9 +107,17 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
         locateCache.set(key, asDir);
         return asDir;
       }
-      if (path.basename(trimmed).toLowerCase() === fileName.toLowerCase() && isExecutableFile(trimmed)) {
+      const namesMatching = path.basename(trimmed).toLowerCase() === fileName.toLowerCase();
+      if (namesMatching && isExecutableFile(trimmed)) {
         locateCache.set(key, trimmed);
         return trimmed;
+      }
+      if (!namesMatching) {
+        const sibling = path.join(path.dirname(trimmed), fileName);
+        if (isExecutableFile(sibling)) {
+          locateCache.set(key, sibling);
+          return sibling;
+        }
       }
       // An explicit existing path is authoritative. Do not silently replace a
       // non-executable selection with the bundled client or a PATH entry.
