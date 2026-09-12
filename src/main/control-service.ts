@@ -19,7 +19,7 @@ const MAX_BODY = 64 * 1024;
 const ID = /^[0-9a-f-]{36}$/i;
 
 type TaskState = 'queued' | 'delivering' | 'running' | 'awaiting_input' | 'recovering' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
-type Task = {
+export type Task = {
   schemaVersion: 1; taskId: string; requestId: string; payloadHash: string;
   projectId: string | null; canonicalWorkspace: string | null; brief: string;
   requestedModel: string | null; requestedEffort: string | null;
@@ -32,6 +32,20 @@ type Task = {
 };
 type TaskInput = { requestId: string; projectId?: string | null; sessionId?: string | null; cwd?: string; brief: string; model?: string | null; effort?: string | null };
 type TaskMessage = { messageId: string; text: string };
+export type ControlRefreshHooks = {
+  listInputs: typeof listInputs;
+  getSession: typeof getSession;
+  readEvents: typeof readEvents;
+  processIdsOwnedBy: (sessionId: string) => Iterable<number>;
+  hasProcessOrReservation: (processId: number) => boolean;
+};
+const refreshHooks: ControlRefreshHooks = {
+  listInputs,
+  getSession,
+  readEvents,
+  processIdsOwnedBy: execProcessIdsOwnedBy,
+  hasProcessOrReservation: processId => unifiedExecManager.hasProcessOrReservation(processId)
+};
 
 let socketPath = '';
 let discoveryPath = '';
@@ -61,7 +75,7 @@ async function loadTasks(): Promise<void> { tasks = (await readDurable<Task[]>(S
 async function saveTasks(): Promise<void> { await writeDurableNow(STATE, tasks); }
 function taskView(task: Task): Omit<Task, 'brief'> { const { brief: _brief, ...view } = task; return view; }
 function supervisorText(task: Task): string {
-  return `${task.brief}\n\nCoS WEB SUPERVISOR TASK\nTask ID: ${task.taskId}\nWorkspace: ${task.canonicalWorkspace}\nKeep this ChatGPT conversation as Supervisor Shunt parent. Use one supervisor-shunt run-role invocation at a time with --parent-host chatgpt_cos. Inspect actual diffs and verify independently. One precise correction is allowed before escalation. Do not use CoS worker chats, Goal, or Loop. Do not launch nested Shunt agents. End with changed files, verification, and unresolved blockers. When acceptance is complete, call session_finish with task_id=${task.taskId} and status=succeeded, then end the same turn final response with [COS_TASK_RESULT task_id=${task.taskId} status=succeeded]. This task form records immediately and does not hold the turn. For terminal failure, use status=failed in both places. If user input is needed, omit both and ask one clear question.`;
+  return `${task.brief}\n\nCoS WEB SUPERVISOR TASK\nTask ID: ${task.taskId}\nWorkspace: ${task.canonicalWorkspace}\nKeep this ChatGPT conversation as Supervisor Shunt parent. Use one supervisor-shunt run-role invocation at a time with --parent-host chatgpt_cos. Inspect actual diffs and verify independently. One precise correction is allowed before escalation. Do not use CoS worker chats, Goal, or Loop. Do not launch nested Shunt agents. End with changed files, verification, and unresolved blockers. When acceptance is complete, call session_finish with task_id=${task.taskId} and status=succeeded, then end the same turn with the final response. This task form records immediately and does not hold the turn. For terminal failure, use status=failed. If user input is needed, omit session_finish and ask one clear question.`;
 }
 
 export function deliveredTurnId(events: Awaited<ReturnType<typeof readEvents>>, inputId: string): { seq: number; turnId: string } | null {
@@ -71,13 +85,13 @@ export function deliveredTurnId(events: Awaited<ReturnType<typeof readEvents>>, 
   return turnId ? { seq: user.seq, turnId } : null;
 }
 
-export function cancellationReachedTerminal(cancellationRequestedAt: number | undefined, hasTerminalTurn: boolean): boolean {
-  return cancellationRequestedAt !== undefined && hasTerminalTurn;
+export function cancellationReachedTerminal(cancellationRequestedAt: number | undefined, hasTerminalTurn: boolean, hasOwnedProcess = false): boolean {
+  return cancellationRequestedAt !== undefined && hasTerminalTurn && !hasOwnedProcess;
 }
 
-export function taskCompletionEvidence(events: SessionEvent[], taskId: string, inputSeq: number, turnId: string): { seq: number; status: 'succeeded' | 'failed' } | null {
+export function taskCompletionEvidence(events: SessionEvent[], taskId: string, inputSeq: number, turnId: string, terminalSeq = Number.POSITIVE_INFINITY): { seq: number; status: 'succeeded' | 'failed' } | null {
   for (const event of events) {
-    if (event.kind !== 'tool_call' || event.seq <= inputSeq || event.turnId !== turnId || event.call.tool !== 'session_finish' ||
+    if (event.kind !== 'tool_call' || event.seq <= inputSeq || event.seq >= terminalSeq || event.turnId !== turnId || event.call.tool !== 'session_finish' ||
         event.call.outcome !== 'ok' || event.call.args.truncated) continue;
     try {
       const args = JSON.parse(event.call.args.text) as { task_id?: unknown; status?: unknown };
@@ -94,11 +108,11 @@ async function body(req: http.IncomingMessage): Promise<unknown> {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new Error('invalid_json'); }
 }
 function taskId(pathname: string): string | null { const match = pathname.match(/^\/v1\/tasks\/([^/]+)(?:\/([^/]+))?$/); return match?.[1] && validId(match[1]) ? match[1] : null; }
-async function refresh(task: Task): Promise<Task> {
+async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): Promise<Task> {
   if (['succeeded', 'failed', 'cancelled'].includes(task.state)) return task;
   const alreadyCompleted = task.state === 'succeeded' || task.state === 'failed';
   const activeInputId = task.inputIds.at(-1) ?? task.inputId;
-  const row = (await listInputs()).find(input => input.id === activeInputId);
+  const row = (await hooks.listInputs()).find(input => input.id === activeInputId);
   if (row && !alreadyCompleted) {
     task.sessionId = row.deliveredSessionId ?? task.sessionId ?? null;
     if (row.state === 'queued') task.state = 'queued';
@@ -106,52 +120,58 @@ async function refresh(task: Task): Promise<Task> {
     else if (row.state === 'failed') { task.state = 'failed'; task.outcome = row.error ?? 'input_failed'; }
     else if (row.state === 'cancelled' && task.state !== 'cancelling') { task.state = 'cancelled'; task.outcome = row.error ?? 'input_cancelled'; }
   }
+  let exactTerminal = false;
   if (task.sessionId) {
-    const session = await getSession(task.sessionId);
+    const session = await hooks.getSession(task.sessionId);
     if (session) {
       if (session.conversationId && !task.conversationIds.includes(session.conversationId)) task.conversationIds.push(session.conversationId);
-      task.currentTurnId = session.activeTurnId ?? null;
-      const events = await readEvents(task.sessionId, { from: task.boundInputSeq ?? 0 });
+      const events = await hooks.readEvents(task.sessionId, { from: task.boundInputSeq ?? 0 });
       const binding = task.boundTurnId ? null : deliveredTurnId(events, activeInputId);
       if (binding) { task.boundInputSeq = binding.seq; task.boundTurnId = binding.turnId; }
       // Current provider turn is not proof that this task's exact input started it.
       // A recorder restart may lose the binding; fail closed instead of accepting stale evidence.
       const turnId = task.boundTurnId;
       const inputSeq = task.boundInputSeq ?? 0;
-      const completion = inputSeq !== undefined && turnId ? taskCompletionEvidence(events, task.taskId, inputSeq, turnId) : null;
       const end = inputSeq !== undefined && turnId ? events.find(event => event.kind === 'turn_end' && event.seq > inputSeq && event.turnId === turnId) : undefined;
+      exactTerminal = end?.kind === 'turn_end';
+      task.currentTurnId = turnId && !exactTerminal ? turnId : null;
+      const completion = inputSeq !== undefined && turnId && end?.kind === 'turn_end'
+        ? taskCompletionEvidence(events, task.taskId, inputSeq, turnId, end.seq)
+        : null;
       const final = inputSeq !== undefined && turnId ? events.findLast((event): event is Extract<typeof event, { kind: 'assistant_message' }> =>
-        event.kind === 'assistant_message' && event.seq > inputSeq && event.turnId === turnId && event.final && event.state === 'final') : undefined;
+        event.kind === 'assistant_message' && event.seq > inputSeq && (!end || event.seq < end.seq) &&
+        event.turnId === turnId && event.final && event.state === 'final') : undefined;
       if (final) task.finalText = final.message.text;
-      if (end?.kind === 'turn_end' && final) {
-        const boundSeq = inputSeq!;
-        const marker = final.message.text.match(new RegExp(`\\[COS_TASK_RESULT\\s+task_id=${task.taskId}\\s+status=(succeeded|failed)\\]\\s*$`, 'i'));
-        const proof = events.find(event => event.kind === 'tool_call' && event.seq > boundSeq && event.seq < end.seq &&
-          event.turnId === turnId && event.call.tool === 'session_finish' && event.call.outcome === 'ok' &&
-          !event.call.args.truncated && event.call.args.text.includes(task.taskId) &&
-          event.call.args.text.includes(`"status":"${marker?.[1]?.toLowerCase()}"`));
-        if (cancellationReachedTerminal(task.cancellationRequestedAt, true)) {
-          task.state = 'cancelled'; task.outcome = 'cancelled'; task.currentTurnId = null;
-        }
+      if (end?.kind === 'turn_end') {
+        if (task.cancellationRequestedAt) task.state = 'cancelling';
         else if (end.outcome !== 'completed') { task.state = 'failed'; task.outcome = end.outcome; }
-        else if (completion?.status === 'succeeded' || completion?.status === 'failed') {
+        else if (final && (completion?.status === 'succeeded' || completion?.status === 'failed')) {
           task.state = completion.status; task.outcome = completion.status === 'succeeded' ? 'completed' : 'supervisor_failed'; task.currentTurnId = null;
         }
-        else if (marker?.[1]?.toLowerCase() === 'succeeded' && proof) { task.state = 'succeeded'; task.outcome = 'completed'; task.currentTurnId = null; }
-        else if (marker?.[1]?.toLowerCase() === 'failed' && proof) { task.state = 'failed'; task.outcome = 'supervisor_failed'; task.currentTurnId = null; }
         else task.state = 'awaiting_input';
       }
       else if (task.cancellationRequestedAt) task.state = 'cancelling';
-      else if (session.activeTurnId) task.state = 'running';
+      else if (task.boundTurnId) task.state = 'running';
       task.eventCursor = Math.max(task.eventCursor, ...events.map(event => event.seq), 0);
     }
   }
-  if (task.cancellationRequestedAt && (!task.sessionId || !task.currentTurnId) &&
-      (!task.sessionId || ![...execProcessIdsOwnedBy(task.sessionId)].some(processId => unifiedExecManager.hasProcessOrReservation(processId)))) {
+  const hasOwnedProcess = !!task.sessionId && [...hooks.processIdsOwnedBy(task.sessionId)]
+    .some(processId => hooks.hasProcessOrReservation(processId));
+  const undeliveredCancelled = !task.boundTurnId && (!row || row.state === 'cancelled' || row.state === 'failed');
+  if (!task.cancellationRequestedAt && hasOwnedProcess && ['succeeded', 'failed', 'cancelled'].includes(task.state)) {
+    task.state = 'running'; task.outcome = null;
+  } else if (cancellationReachedTerminal(task.cancellationRequestedAt, exactTerminal || undeliveredCancelled, hasOwnedProcess)) {
     task.state = 'cancelled'; task.outcome = 'cancelled';
+  } else if (task.cancellationRequestedAt) {
+    task.state = 'cancelling'; task.outcome = null;
   }
   task.updatedAt = Date.now();
   return task;
+}
+
+/** Test seam for the real refresh state machine; production uses process/session owners above. */
+export async function refreshControlTaskForTests(task: Task, hooks: ControlRefreshHooks): Promise<Task> {
+  return refresh(structuredClone(task), hooks);
 }
 async function route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost');
@@ -239,7 +259,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
       const input = inputArgs.parse({ id: payload.messageId, projectId: task.projectId, sessionId: task.sessionId, text: payload.text, mode: 'auto', dueAt, model: null, reasoningEffort: null, automation: 'off' });
       const intent = { messageId: payload.messageId!, payloadHash, inputId: input.id, text: input.text, dueAt };
       task.inputIds.push(input.id); (task.messages ??= []).push(intent);
-      task.boundInputSeq = undefined; task.boundTurnId = undefined; task.finalText = null; await saveTasks();
+      task.boundInputSeq = undefined; task.boundTurnId = undefined; task.currentTurnId = null; task.finalText = null; await saveTasks();
       const delivered = await sendDesktopInput(input); return { terminal: false, prior: null, sent: delivered };
     });
     if (sent.terminal) return error(res, 409, 'task_terminal');

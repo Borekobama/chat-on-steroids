@@ -13,7 +13,6 @@
  */
 
 import { promises as fs } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
@@ -21,6 +20,7 @@ import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
 import { initSessionStore, resetSessionStoreForTests, unsetSessionRootForTests } from '../src/main/session/store.js';
+import { makeSandboxShim, makeTempDir } from './helpers.js';
 
 /** Bytes the probe command writes to stdout. Comfortably past both budgets under test. */
 const PROBE_BYTES = 200_000;
@@ -55,13 +55,15 @@ async function serve(): Promise<McpEndpoint> {
   // Windows runners likewise expose temp directories through a redirected path. Injecting the
   // raw mkdtemp spelling here therefore creates a root production would never persist and makes
   // the sandbox correctly reject it as changed on disk before exec_command can test anything.
-  dir = await validateNewRoot(await fs.mkdtemp(path.join(os.tmpdir(), 'clf-budget-')), []);
+  dir = await validateNewRoot(await makeTempDir('clf-budget-'), []);
   await fs.writeFile(path.join(dir, PROBE_FILE), 'x'.repeat(PROBE_BYTES), 'utf8');
   initConfigPath(dir);
   initSessionStore(dir);
   initDurableStore(dir);
   const cfg = defaultConfig();
-  await saveConfig({ ...cfg, roots: [{ name: 'probe', path: dir }], readOnly: false });
+  const sandbox = await makeSandboxShim(dir);
+  await saveConfig({ ...cfg, roots: [{ name: 'probe', path: dir }], readOnly: false,
+    commandSandbox: { enabled: true, codexPath: sandbox, permissionProfile: 'projects-only' } });
   return startMcpServer(() => ({
     roots: [{ name: 'probe', path: dir }],
     caps: cfg.capabilities,

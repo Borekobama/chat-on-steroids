@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launchCommand, runCommand, runPowerShell } from './exec.js';
@@ -23,14 +23,6 @@ export function managedBrowserProfile(): string | null {
   }
   mkdirSync(profile, { recursive: true, mode: 0o700 });
   return profile;
-}
-
-function managedProfileDirectory(profile: string, browser: ChatBrowser): string | null {
-  if (browser !== 'helium') return 'Default';
-  try {
-    const state = JSON.parse(readFileSync(path.join(profile, 'Local State'), 'utf8')) as { profile?: { info_cache?: Record<string, { name?: string }> } };
-    return Object.entries(state.profile?.info_cache ?? {}).find(([, value]) => value.name === 'CoS')?.[0] ?? null;
-  } catch { return null; }
 }
 
 /** A successful OS handoff is not a live browser. Unknown probes never grant opening authority. */
@@ -267,10 +259,9 @@ export async function openInPreferredBrowser(
   // existing instance cannot change its policy. Memory Saver exclusions alone do not
   // prevent background timer/renderer throttling of long-running orchestration tabs.
   const profile = options.managedProfile ?? managedBrowserProfile();
-  const profileDirectory = profile ? managedProfileDirectory(profile, selected) : 'Default';
-  if (profile && selected === 'helium' && !profileDirectory) {
-    throw new Error('Helium managed profile "CoS" is unavailable; refusing to use personal Default profile.');
-  }
+  // Managed profiles use a CoS-owned user-data directory. Its Default profile is isolated
+  // from every browser's personal Default profile, including Helium's.
+  const profileDirectory = 'Default';
   const targetUrl = profile ? (() => { const target = new URL(url); target.searchParams.set('cos-managed-profile', '1'); return target.toString(); })() : url;
   const args = [
     ...(profile ? [`--user-data-dir=${profile}`, `--profile-directory=${profileDirectory}`] : []),

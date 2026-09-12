@@ -8,7 +8,7 @@ import {
 const truncationPolicy = { kind: 'tokens' as const, tokens: 10_000 };
 
 it('revokes a reserved process before its foreground launch completes', async () => {
-  const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
+  const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS, (command, cwd) => ({ command, cwd }));
   const processId = manager.allocateProcessId();
   expect(await manager.terminateProcess(processId)).toBe(true);
   await expect(manager.execCommand({
@@ -22,7 +22,7 @@ it('revokes a reserved process before its foreground launch completes', async ()
 });
 
 it('does not let a lock attempt barge ahead of an already queued waiter', async () => {
-  const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
+  const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS, (command, cwd) => ({ command, cwd }));
   const processId = manager.allocateProcessId();
   const initial = manager.execCommand({
     command: [process.execPath, '-e', 'setInterval(() => {}, 1000)'],
@@ -71,7 +71,7 @@ it('does not let a lock attempt barge ahead of an already queued waiter', async 
 });
 
 it('refuses new capacity without evicting a completed unread result', async () => {
-  const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
+  const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS, (command, cwd) => ({ command, cwd }));
   const unreadId = manager.allocateProcessId();
   const request = (processId: number, command: string, yieldTimeMs: number) => ({
     command: [process.execPath, '-e', command],

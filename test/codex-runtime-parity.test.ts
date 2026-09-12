@@ -1,4 +1,4 @@
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -31,7 +31,7 @@ import { composeCommandBatch, parseCommandBatchSections } from '../src/main/code
 const truncationPolicy = { kind: 'tokens' as const, tokens: 10_000 };
 
 function manager(): UnifiedExecProcessManager {
-  return new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
+  return new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS, (command, cwd) => ({ command, cwd }));
 }
 
 async function waitForProcess(instance: UnifiedExecProcessManager, processId: number): Promise<void> {
@@ -71,7 +71,7 @@ describe('Codex unified exec runtime parity', () => {
       codexPath: '/Applications/ChatGPT.app/Contents/Resources/codex',
       permissionProfile: 'projects-only'
     };
-    expect(applyCommandSandbox(['/bin/sh', '-c', 'pwd'], '/workspace', settings)).toEqual([
+    expect(applyCommandSandbox(['/bin/sh', '-c', 'pwd'], '/workspace', settings, '/trusted-home')).toEqual([
       settings.codexPath,
       'sandbox',
       '-c',
@@ -79,6 +79,9 @@ describe('Codex unified exec runtime parity', () => {
       '--permission-profile',
       'projects-only',
       '--cd',
+      '/trusted-home',
+      '/usr/bin/env',
+      '-C',
       '/workspace',
       '/bin/sh',
       '-c',
@@ -454,7 +457,7 @@ describe('Codex unified exec runtime parity', () => {
   });
 
   it.runIf(process.platform !== 'win32')('Ctrl-C on a POSIX pipe session terminates the whole process group', async () => {
-    const root = await mkdtemp(path.join(tmpdir(), 'clf-posix-pipe-interrupt-parity-'));
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), 'clf-posix-pipe-interrupt-parity-')));
     tempRoots.push(root);
     const ready = path.join(root, 'grandchild.pid');
     const survived = path.join(root, 'grandchild-survived.txt');
@@ -501,7 +504,7 @@ describe('Codex unified exec runtime parity', () => {
   });
 
   it.runIf(process.platform !== 'win32')('terminating a POSIX PTY session kills descendants in its process group', async () => {
-    const root = await mkdtemp(path.join(tmpdir(), 'clf-posix-pty-tree-parity-'));
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), 'clf-posix-pty-tree-parity-')));
     tempRoots.push(root);
     const ready = path.join(root, 'grandchild.pid');
     const survived = path.join(root, 'grandchild-survived.txt');
