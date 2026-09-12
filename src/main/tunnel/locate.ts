@@ -111,6 +111,10 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
         locateCache.set(key, trimmed);
         return trimmed;
       }
+      // An explicit existing path is authoritative. Do not silently replace a
+      // non-executable selection with the bundled client or a PATH entry.
+      locateCache.set(key, null);
+      return null;
     }
     // cloudflared normally sits beside tunnel-client in the release archive.
     const sibling = path.join(path.dirname(trimmed), fileName);

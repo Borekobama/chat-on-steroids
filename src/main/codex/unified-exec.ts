@@ -643,6 +643,8 @@ export function applyCommandSandbox(
   return [
     settings.codexPath,
     'sandbox',
+    '-c',
+    'shell_environment_policy.inherit=all',
     '--permission-profile',
     settings.permissionProfile,
     '--cd',
@@ -744,7 +746,15 @@ export class UnifiedExecProcessManager {
       // process launcher so pipe-mode output is UTF-8 just like PTY output.
       const preparedCommand =
         request.shellType === 'powershell' ? prefixPowershellScriptWithUtf8(request.command) : request.command;
-      const command = applyCommandSandbox(preparedCommand, request.cwd, request.commandSandbox);
+      const commandWithPath = [...preparedCommand];
+      if (globalThis.process.platform !== 'win32' && request.env.PATH && commandWithPath.length >= 3) {
+        const shellFlag = commandWithPath[1];
+        if (shellFlag === '-c' || shellFlag === '-lc') {
+          const pathValue = request.env.PATH.replaceAll("'", "'\\''");
+          commandWithPath[2] = `export PATH='${pathValue}'; ${commandWithPath[2]}`;
+        }
+      }
+      const command = applyCommandSandbox(commandWithPath, request.cwd, request.commandSandbox);
       process = await UnifiedExecProcess.spawn({
         batchMarker: request.batchMarker,
         command,

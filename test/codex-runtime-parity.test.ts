@@ -74,6 +74,8 @@ describe('Codex unified exec runtime parity', () => {
     expect(applyCommandSandbox(['/bin/sh', '-c', 'pwd'], '/workspace', settings)).toEqual([
       settings.codexPath,
       'sandbox',
+      '-c',
+      'shell_environment_policy.inherit=all',
       '--permission-profile',
       'projects-only',
       '--cd',
