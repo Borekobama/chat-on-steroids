@@ -1,5 +1,5 @@
 import { promises as fs } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import path from 'node:path';
 
 /**
@@ -8,8 +8,30 @@ import path from 'node:path';
  * and the sandbox compares canonical paths.
  */
 export async function makeTempDir(prefix = 'clf-'): Promise<string> {
-  const dir = await fs.mkdtemp(path.join(tmpdir(), prefix));
+  const parent = path.join(homedir(), 'Downloads', 'Projects', '.cos-test-tmp');
+  await fs.mkdir(parent, { recursive: true });
+  const dir = await fs.mkdtemp(path.join(parent, prefix));
   return await fs.realpath(dir);
+}
+
+/** Test-only stand-in for `codex sandbox`; production never receives this path. */
+export async function makeSandboxShim(directory: string): Promise<string> {
+  const shim = path.join(directory, 'sandbox-shim.sh');
+  await fs.writeFile(shim, `#!/bin/sh
+while [ "$1" != "/usr/bin/env" ]; do
+  [ "$#" -gt 0 ] || exit 64
+  shift
+done
+shift
+[ "$1" = "-C" ] || exit 64
+shift
+workdir=$1
+shift
+cd "$workdir" || exit
+exec "$@"
+`);
+  await fs.chmod(shim, 0o700);
+  return shim;
 }
 
 export async function removeTempDir(dir: string): Promise<void> {

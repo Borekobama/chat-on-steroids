@@ -3,20 +3,26 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ToolSchema } from '@modelcontextprotocol/core';
 import { Client, StreamableHTTPClientTransport, UnauthorizedError, type Tool, type CallToolResult } from '@modelcontextprotocol/client';
-import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
-import { getMcpConfigForManifest, vAny } from '@anthropic-ai/mcpb/browser';
+import { vAny } from '@anthropic-ai/mcpb/browser';
 import { getSecret, setSecret, clearSecret } from '../secrets.js';
 import { readDurable, writeDurableNow } from '../durable.js';
-import { setEnvValue } from '../env.js';
 import { redactCredentialText } from '../redaction.js';
 import type { PluginConfigPatch, PluginInstallRequest, PluginSnapshot, PluginView } from '../../shared/plugins.js';
-import { installSource, pluginEnvironment, resolveGithub, stopInstallers, type InstalledLaunch } from './installer.js';
-import { terminateProcessTree } from '../exec.js';
+import { installSource, resolveGithub, stopInstallers, type InstalledLaunch } from './installer.js';
 import { pluginCatalog, reviewedPluginLicense } from './catalog.js';
 import sharp from 'sharp';
 import { pluginExposure } from './exposure.js';
 import { PluginOAuth, PluginNeedsAuth, PluginOAuthSetupError, clearPluginOAuth } from './oauth.js';
 export { PLUGIN_MAX_TOOLS, PLUGIN_MAX_SCHEMA_BYTES } from './exposure.js';
+
+export type LocalPluginTransportFactory = (input: {
+  launch: InstalledLaunch;
+  directory: string;
+  dataDirectory: string;
+  config: Record<string, string>;
+  secrets: Record<string, string>;
+  catalogId?: string;
+}) => Promise<Parameters<Client['connect']>[0]>;
 
 interface RecordEntry extends Omit<PluginView, 'tools'> {
   /** Validated discovery belongs to the installation, not a replaceable connection. */
@@ -28,7 +34,6 @@ interface RecordEntry extends Omit<PluginView, 'tools'> {
 interface Live {
   client: Client;
   tools: Tool[];
-  transport?: StdioClientTransport;
   users: number;
   oauth?: PluginOAuth;
 }
@@ -52,7 +57,7 @@ const boundedFetch: typeof fetch = async (input, init) => {
 export class PluginManager {
   constructor(private openAuthorization: (url: URL) => Promise<void> = async url => {
     const { shell } = await import('electron'); await shell.openExternal(url.href);
-  }) {}
+  }, private readonly localTransportFactory?: LocalPluginTransportFactory) {}
   private root = '';
   private records: RecordEntry[] = [];
   private live = new Map<string, Live>();
@@ -63,7 +68,7 @@ export class PluginManager {
   private revision = 0;
   private exposureCache: ReturnType<typeof pluginExposure> | null = null;
   private closing = false;
-  private connecting = new Map<Client, StdioClientTransport | undefined>();
+  private connecting = new Set<Client>();
   private authenticating = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   onChanged(listener: () => void): () => void {
     this.listeners.add(listener);
@@ -261,6 +266,7 @@ export class PluginManager {
       if (!source) throw new Error('Choose an integration or installation source');
       if (source.auth && source.kind !== 'remote') throw new Error('OAuth requires a remote source.');
       if (source.kind === 'github') source = resolveGithub(source);
+      if (source.kind !== 'remote' && !this.localTransportFactory) throw new Error('Local plugins are disabled: CoS cannot safely contain their subprocess permissions.');
       if (source.kind === 'remote') this.remoteUrl(source.url);
       this.validateConfig(request.config ?? {});
       const id = randomUUID(),
@@ -379,6 +385,7 @@ export class PluginManager {
     if (this.closing) throw new Error('Plugins are shutting down');
     if (source.auth && source.kind !== 'remote') throw new Error('OAuth requires a remote source.');
     if (source.kind === 'github') source = resolveGithub(source);
+    if (source.kind !== 'remote' && !this.localTransportFactory) throw new Error('Local plugins are disabled: CoS cannot safely contain their subprocess permissions.');
     if (source.kind === 'remote') this.remoteUrl(source.url);
     const directory = path.join(this.root, row.id, randomUUID());
     const old = { ...row };
@@ -472,7 +479,6 @@ export class PluginManager {
     this.exposureCache = null;
     if (live) {
       live.oauth?.dispose();
-      if (live.transport?.pid) await terminateProcessTree(live.transport.pid, true);
       await live.client.close().catch(() => undefined);
     }
   }
@@ -593,16 +599,14 @@ export class PluginManager {
     row.error = undefined;
     this.changed();
     const client = new Client({ name: 'Chat On Steroids Plugins', version: '1.0.0' });
-    let transport: StdioClientTransport | undefined;
     let oauth: PluginOAuth | undefined;
     const retire = () => {
       void (async () => {
-        if (transport?.pid) await terminateProcessTree(transport.pid, true);
         await client.close().catch(() => undefined);
       })().catch(() => undefined);
     };
     signal.addEventListener('abort', retire, { once: true });
-    this.connecting.set(client, undefined);
+    this.connecting.add(client);
     try {
       const secrets = await this.credentials(row);
       signal.throwIfAborted();
@@ -632,66 +636,18 @@ export class PluginManager {
           { timeout: 20000 },
         );
       } else {
-        let launch = { command: row.launch.command, args: row.launch.args, env: {} as Record<string, string> };
-        if (row.launch.manifest) {
-          const manifest = vAny.McpbManifestSchema.parse(row.launch.manifest);
-          const missing = Object.entries(manifest.user_config ?? {})
-            .filter(
-              ([key, field]) => field.required && !(row.config[key] ?? secrets[key]) && field.default === undefined,
-            )
-            .map(([key]) => key);
-          if (missing.length) throw new Error(`Configure required bundle fields: ${missing.join(', ')}`);
-          const cfg = await getMcpConfigForManifest({
-            manifest,
-            extensionPath: row.directory,
-            systemDirs: {},
-            userConfig: { ...row.config, ...secrets },
-            pathSeparator: path.sep,
-            logger: { log: () => {}, warn: () => {}, error: () => {} },
-          });
-          if (!cfg?.command) throw new Error('MCPB requires unsupported configuration/runtime setup');
-          launch = { command: cfg.command, args: cfg.args ?? [], env: cfg.env ?? {} };
-          if (JSON.stringify(launch).includes('${'))
-            throw new Error('MCPB configuration is incomplete; provide its required fields');
-          // MCPB recipes also permit ordinary relative entry points. Resolve packaged assets
-          // against the bundle before switching cwd to the stable per-plugin data directory.
-          const packagedPath = async (value: string): Promise<string> => {
-            if (path.isAbsolute(value) || value.startsWith('-')) return value;
-            const candidate = path.resolve(row.directory, value);
-            if (!candidate.startsWith(path.resolve(row.directory) + path.sep)) return value;
-            try {
-              await fs.access(candidate);
-              return candidate;
-            } catch {
-              return value;
-            }
-          };
-          launch.args = await Promise.all(launch.args.map(packagedPath));
-          if (manifest.server.type === 'binary') launch.command = await packagedPath(launch.command);
-        }
-        const env = pluginEnvironment();
-        // Use the upstream response policy, not markdown surgery after execution. Apply at
-        // launch so existing official installations also stop echoing submitted/generated code.
-        // Explicit user configuration/CLI options retain their normal precedence.
-        if (row.source.kind === 'npm' && row.source.package === '@playwright/mcp')
-          setEnvValue(env, 'PLAYWRIGHT_MCP_CODEGEN', 'none');
-        for (const [k, v] of Object.entries({ ...row.config, ...secrets, ...launch.env })) setEnvValue(env, k, v);
-        const data = path.join(this.root, row.id, 'data');
-        await fs.mkdir(data, { recursive: true });
-        if (row.catalogId === 'memory') setEnvValue(env, 'MEMORY_FILE_PATH', path.join(data, 'memory.json'));
-        // A generation directory contains immutable installed code. Servers write relative user data
-        // into a stable cwd so replacing the installation cannot erase that data.
-        signal.throwIfAborted();
-        if (this.closing || !row.enabled || !this.records.includes(row)) return;
-        transport = new StdioClientTransport({
-          command: launch.command,
-          args: launch.args,
-          cwd: data,
-          env,
-          stderr: 'ignore',
-          maxBufferSize: 16 * 1024 * 1024,
+        if (!this.localTransportFactory) throw new Error('Local plugins are disabled: CoS cannot safely contain their subprocess permissions.');
+        const dataDirectory = path.join(this.root, row.id, 'data');
+        await fs.mkdir(dataDirectory, { recursive: true });
+        const transport = await this.localTransportFactory({
+          launch: row.launch,
+          directory: row.directory,
+          dataDirectory,
+          config: { ...row.config },
+          secrets,
+          ...(row.catalogId ? { catalogId: row.catalogId } : {})
         });
-        this.connecting.set(client, transport);
+        signal.throwIfAborted();
         await client.connect(transport, { timeout: 20000 });
       }
       const tools = await this.discover(client);
@@ -709,11 +665,10 @@ export class PluginManager {
           throw new Error('Open Blender, enable its MCP addon, and click Start MCP Server in Blender. Then restart this plugin.');
       }
       if (signal.aborted || this.closing || !row.enabled) {
-        if (transport?.pid) await terminateProcessTree(transport.pid, true);
         await client.close();
         return;
       }
-      const live: Live = { client, tools, transport, users: 0, oauth };
+      const live: Live = { client, tools, users: 0, oauth };
       this.live.set(row.id, live);
       client.setNotificationHandler('notifications/tools/list_changed', () => {
         // A current connection can invalidate its own listing, never resurrect a retired one.
@@ -755,7 +710,6 @@ export class PluginManager {
       oauth?.dispose();
       if (this.live.get(row.id)?.client === client) this.live.delete(row.id);
       this.exposureCache = null;
-      if (transport?.pid) await terminateProcessTree(transport.pid, true);
       await client.close().catch(() => undefined);
       if (!signal.aborted) {
         const needsAuth = e instanceof PluginNeedsAuth || e instanceof UnauthorizedError;
@@ -838,10 +792,7 @@ export class PluginManager {
     await Promise.all(this.records.map(row => this.disconnect(row)));
     await stopInstallers();
     await Promise.all(
-      [...this.connecting].map(async ([client, transport]) => {
-        if (transport?.pid) await terminateProcessTree(transport.pid, true);
-        await client.close().catch(() => undefined);
-      }),
+      [...this.connecting].map(client => client.close().catch(() => undefined)),
     );
     await Promise.all(this.queues.values());
     await Promise.all(this.records.map((row) => this.disconnect(row)));

@@ -21,7 +21,7 @@ import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { effectiveCapabilities, defaultConfig } from '../src/main/config.js';
+import { effectiveCapabilities, defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
 import { friendlyError } from '../src/main/mcp/kernel.js';
@@ -61,7 +61,7 @@ import {
 } from '../src/main/codex/ownership.js';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
 import { locateRipgrep } from '../src/main/ripgrep.js';
-import { IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
+import { IS_WINDOWS, makeSandboxShim, makeTempDir, removeTempDir, writeTree } from './helpers.js';
 
 // ---------------------------------------------------------------- transport
 
@@ -246,6 +246,10 @@ function allCaps(): Capabilities {
 
 beforeAll(async () => {
   base = await makeTempDir('clf-mcp-');
+  initConfigPath(base);
+  const sandbox = await makeSandboxShim(base);
+  const saved = defaultConfig();
+  await saveConfig({ ...saved, commandSandbox: { enabled: true, codexPath: sandbox, permissionProfile: 'projects-only' } });
   // This suite calls real tools, and calling a tool records it. Recording is on by
   // default now, so without a directory of its own the recorder wrote session folders
   // into the process's working directory — which for a test run is the repository.
@@ -3726,7 +3730,6 @@ describe('exec sessions belong to the chat that opened them', () => {
 
     expect(textOf(blocked)).toMatch(/Background session \d+ completed/);
     expect(textOf(blocked)).toContain('owed-');
-
     const admitted = await asChat(blockedRequest, 'exec_command', {
       cmd: IS_WINDOWS ? "Write-Output 'admitted-after-drain'" : "printf '%s\\n' admitted-after-drain",
       workdir: '/workspace',

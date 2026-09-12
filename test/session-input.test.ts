@@ -399,12 +399,13 @@ describe('durable user input ownership', () => {
     await acknowledgeBrowserInput(second.id, 'second-owner', binding.conversationId);
     expect(automate.mock.calls.at(-1)?.[1]).toBe('off');
   });
-  it('expires a legacy initial browser attempt while retaining an intentional after-turn wait', async () => {
+  it('retries then expires a legacy initial browser attempt while retaining an intentional after-turn wait', async () => {
     const stale = await seedLegacyInput(input({ sessionId: null }));
     const after = await seedLegacyInput(input({ mode: 'after-turn' }));
     now += 600001;
     binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'fresh-end', time: now };
     expect(await pendingBrowserInputs()).toContainEqual({ id: after.id, conversationId: binding.conversationId });
+    now += 60000;
     expect((await listInputs()).find(row => row.id === stale.id)).toMatchObject({ state: 'failed' });
     resetInputForTests();
     expect(await claimBrowserInput(stale.id, 'after-restart', null)).toBeNull();
@@ -1225,14 +1226,17 @@ it('admits active direct injections independently across chats and preserves all
   expect(await offerToolInput(sessionId, 'conversation-a', 'tool-a', now)).toHaveLength(2);
   expect(await offerToolInput('session-two', 'conversation-b', 'tool-b', now)).toHaveLength(1);
 });
-it('expires an unclaimed ordinary initial browser attempt 60 seconds after its due time', async () => {
+it('retries an unclaimed ordinary initial browser attempt once before failing', async () => {
   const row = await enqueueInput(input({ sessionId: null, dueAt: now + 120000 }));
   expect(row.transportIntent).toBe('browser');
   now += 179999;
   resetInputForTests();
   expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe('queued');
   now++;
-  expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed', error: expect.stringContaining('60 seconds') });
+  expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'queued', browserRetryAt: now });
+  expect(changed).toHaveBeenCalled();
+  now += 60000;
+  expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed', error: expect.stringContaining('automatic retry') });
   expect(await claimBrowserInput(row.id, 'late', null)).toBeNull();
 });
 it('never times out an intentional after-turn wait or a finish stage', async () => {

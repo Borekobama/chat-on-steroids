@@ -35,6 +35,7 @@ import {
   isAbsoluteVirtualPath,
   isNativeWindowsPath,
   resolvePath,
+  resolveWritablePath,
   type Resolved
 } from '../sandbox.js';
 import { currentWorkspace, learnWorkspace, setCurrentWorkspace } from '../workspace.js';
@@ -450,6 +451,7 @@ export async function dispatch(
   const context: CallContext = {
     publication: parent?.publication ?? inboundPublication() ?? { completedAt: null, failed: false },
     startedAt: Date.now(),
+    receiptStartedAt: performance.timeOrigin + performance.now(),
     transportKey,
     agent: null,
     caller: parent ? { ...parent.caller } : { transportKey, requestId, conversationId: null, sessionId: null },
@@ -461,7 +463,7 @@ export async function dispatch(
       trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent))
     );
     // In-process callers have no socket; resolving their outer invocation publishes it.
-    if (!parent && !inboundPublication()) context.publication!.completedAt = Date.now();
+    if (!parent && !inboundPublication()) context.publication!.completedAt = performance.timeOrigin + performance.now();
     return result;
   } catch (error) {
     if (!parent) context.publication!.failed = true;
@@ -679,7 +681,7 @@ async function dispatchTracked(
   if (!nested && requestId && !blockedChat && !supersededConversation && !compacting) {
     const explicitPoll = name === 'write_stdin' && args && typeof args === 'object'
       ? (args as { session_id?: number }).session_id : undefined;
-    await acknowledgeBackgroundExecOutput(context.caller.sessionId, startedAt, explicitPoll);
+    await acknowledgeBackgroundExecOutput(context.caller.sessionId, context.receiptStartedAt ?? startedAt, explicitPoll);
   }
   let handlerRan = false;
   markTiming('identity');
@@ -921,7 +923,7 @@ async function validatedWorkspace() {
 export async function resolveIn(
   roots: Parameters<typeof resolvePath>[0],
   requested: string,
-  options: { allowMissing?: boolean; base?: string | null } = {}
+  options: { allowMissing?: boolean; base?: string | null; writable?: boolean } = {}
 ): Promise<Resolved> {
   // An explicit adapter-supplied base beats the workspace; otherwise the workspace is the base.
   // Either way the joining happens inside `resolvePath`, ahead of validation,
@@ -931,7 +933,7 @@ export async function resolveIn(
   // `/elsewhere`, and nothing downstream can tell it apart from a path that was always that.
   const workspace = await validatedWorkspace();
   const base = options.base !== undefined ? options.base : (workspace?.virtual ?? null);
-  const resolved = await resolvePath(roots, requested, {
+  const resolved = await (options.writable ? resolveWritablePath : resolvePath)(roots, requested, {
     ...(options.allowMissing === undefined ? {} : { allowMissing: options.allowMissing }),
     base
   });

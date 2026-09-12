@@ -19,6 +19,8 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { HeadTailBuffer } from './head-tail-buffer.js';
 import { CommandBatchDisplay } from './command-batch.js';
@@ -633,12 +635,23 @@ export interface ExecCommandRequest {
 export function applyCommandSandbox(
   command: string[],
   cwd: string,
-  settings: CommandSandboxSettings | undefined
+  settings: CommandSandboxSettings | undefined,
+  trustedHome = os.homedir()
 ): string[] {
-  if (!settings?.enabled) return command;
+  if (!settings) throw new Error('command sandbox settings are required for shell commands');
+  if (!settings.enabled) throw new Error('command sandbox is required for shell commands');
   if (!path.isAbsolute(settings.codexPath)) throw new Error('command sandbox Codex path must be absolute');
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(settings.permissionProfile)) {
     throw new Error('command sandbox permission profile is invalid');
+  }
+  if (settings.permissionProfile !== 'projects-only') {
+    throw new Error('command sandbox permission profile must be projects-only');
+  }
+  if (process.platform === 'win32') {
+    throw new Error('command sandbox requires a contained working-directory launcher on Windows');
+  }
+  if (!path.isAbsolute(cwd) || !path.isAbsolute(trustedHome)) {
+    throw new Error('command sandbox paths must be absolute');
   }
   return [
     settings.codexPath,
@@ -648,6 +661,9 @@ export function applyCommandSandbox(
     '--permission-profile',
     settings.permissionProfile,
     '--cd',
+    trustedHome,
+    '/usr/bin/env',
+    '-C',
     cwd,
     ...command
   ];
@@ -708,7 +724,15 @@ export class UnifiedExecProcessManager {
   private readonly revokedProcessIds = new Set<number>();
   private readonly maxWriteStdinYieldTimeMs: number;
 
-  constructor(maxWriteStdinYieldTimeMs: number) {
+  constructor(
+    maxWriteStdinYieldTimeMs: number,
+    private readonly sandboxLaunch: (
+      command: string[], cwd: string, settings: CommandSandboxSettings | undefined, trustedHome: string
+    ) => { command: string[]; cwd: string } = (command, cwd, settings, trustedHome) => ({
+      command: applyCommandSandbox(command, cwd, settings, trustedHome),
+      cwd: trustedHome
+    })
+  ) {
     this.maxWriteStdinYieldTimeMs = Math.max(maxWriteStdinYieldTimeMs, MIN_EMPTY_YIELD_TIME_MS);
   }
 
@@ -754,13 +778,25 @@ export class UnifiedExecProcessManager {
           commandWithPath[2] = `export PATH='${pathValue}'; ${commandWithPath[2]}`;
         }
       }
-      const command = applyCommandSandbox(commandWithPath, request.cwd, request.commandSandbox);
+      const trustedHome = await fs.realpath(os.homedir());
+      const canonicalCwd = await fs.realpath(request.cwd);
+      const sameCwd = globalThis.process.platform === 'win32'
+        ? canonicalCwd.toLowerCase() === path.resolve(request.cwd).toLowerCase()
+        : canonicalCwd === path.resolve(request.cwd);
+      if (!sameCwd) throw new Error('command working directory changed after authorization');
+      const launch = this.sandboxLaunch(commandWithPath, canonicalCwd, request.commandSandbox, trustedHome);
+      const env = { ...request.env };
+      for (const key of Object.keys(env)) {
+        if (key.toLowerCase() === 'home' || key.toLowerCase() === 'codex_home') delete env[key];
+      }
+      env.HOME = trustedHome;
+      env.CODEX_HOME = path.join(trustedHome, '.codex');
       process = await UnifiedExecProcess.spawn({
         batchMarker: request.batchMarker,
-        command,
+        command: launch.command,
         shellType: request.shellType,
-        cwd: request.cwd,
-        env: request.env,
+        cwd: launch.cwd,
+        env,
         tty: request.tty
       });
     } catch (error) {

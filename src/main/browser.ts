@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launchCommand, runCommand, runPowerShell } from './exec.js';
@@ -15,19 +15,14 @@ export function configureManagedBrowser(context: { userDataDir: string; extensio
 }
 export function managedBrowserProfile(): string | null {
   if (!getConfig().ui.managedBrowser || !managedContext) return null;
-  if (getConfig().ui.chatBrowser === 'helium' && process.platform === 'darwin')
-    return path.join(os.homedir(), 'Library', 'Application Support', 'net.imput.helium');
   const profile = path.join(managedContext.userDataDir, 'managed-browser', 'profile');
+  if (getConfig().ui.chatBrowser === 'helium' && process.platform === 'darwin') {
+    const isolated = path.join(managedContext.userDataDir, 'managed-browser', 'helium-profile');
+    mkdirSync(isolated, { recursive: true, mode: 0o700 });
+    return isolated;
+  }
   mkdirSync(profile, { recursive: true, mode: 0o700 });
   return profile;
-}
-
-function managedProfileDirectory(profile: string, browser: ChatBrowser): string {
-  if (browser !== 'helium') return 'Default';
-  try {
-    const state = JSON.parse(readFileSync(path.join(profile, 'Local State'), 'utf8')) as { profile?: { info_cache?: Record<string, { name?: string }> } };
-    return Object.entries(state.profile?.info_cache ?? {}).find(([, value]) => value.name === 'CoS')?.[0] ?? 'Default';
-  } catch { return 'Default'; }
 }
 
 /** A successful OS handoff is not a live browser. Unknown probes never grant opening authority. */
@@ -264,7 +259,9 @@ export async function openInPreferredBrowser(
   // existing instance cannot change its policy. Memory Saver exclusions alone do not
   // prevent background timer/renderer throttling of long-running orchestration tabs.
   const profile = options.managedProfile ?? managedBrowserProfile();
-  const profileDirectory = profile ? managedProfileDirectory(profile, selected) : 'Default';
+  // Managed profiles use a CoS-owned user-data directory. Its Default profile is isolated
+  // from every browser's personal Default profile, including Helium's.
+  const profileDirectory = 'Default';
   const targetUrl = profile ? (() => { const target = new URL(url); target.searchParams.set('cos-managed-profile', '1'); return target.toString(); })() : url;
   const args = [
     ...(profile ? [`--user-data-dir=${profile}`, `--profile-directory=${profileDirectory}`] : []),

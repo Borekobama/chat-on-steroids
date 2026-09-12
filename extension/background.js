@@ -1742,6 +1742,7 @@ async function reconcileBackgroundWindow(policy) {
   if (policy.background !== true) return;
   const managed = new Set((Array.isArray(policy.managedConversations) ? policy.managedConversations : []).map(cleanConversationId).filter(Boolean));
   const inputIds = new Set((Array.isArray(policy.inputs) ? policy.inputs : []).map(input => input?.id).filter(id => typeof id === 'string'));
+  const disposableSetup = tab => policy.managedBrowser === true && /^(?:chrome|helium):\/\/setup\/?$/i.test(tab.pendingUrl || tab.url || '');
   const owns = tab => {
     if (managed.has(conversationForTab(tab))) return true;
     try {
@@ -1756,6 +1757,7 @@ async function reconcileBackgroundWindow(policy) {
   };
   return inBackgroundWindow(async () => {
     let window = await storedBackgroundWindow();
+    let adopted = false;
     const tabs = await chrome.tabs.query({});
     const owned = tabs.filter(tab => Number.isInteger(tab.id) && Number.isInteger(tab.windowId) && owns(tab));
     if (!window) {
@@ -1763,13 +1765,16 @@ async function reconcileBackgroundWindow(policy) {
       // containing one managed conversation is not authority over its other tabs.
       const ids = [...new Set(owned.map(tab => tab.windowId))].sort((a, b) => a - b);
       for (const id of ids) {
-        if (tabs.some(tab => tab.windowId === id && !owns(tab))) continue;
+        if (tabs.some(tab => tab.windowId === id && !owns(tab) && !disposableSetup(tab))) continue;
         try { window = await chrome.windows.get(id); } catch { continue; }
         await chrome.storage.session.set({ chatBackgroundWindow: id });
+        adopted = true;
         break;
       }
     }
     if (!window || !Number.isInteger(window.id)) return false;
+    const setupTabs = tabs.filter(tab => tab.windowId === window.id && Number.isInteger(tab.id) && disposableSetup(tab));
+    if (setupTabs.length) await chrome.tabs.remove(setupTabs.map(tab => tab.id));
     for (const tab of owned) {
       if (tab.windowId === window.id) continue;
       // The app's policy is conversation/command scoped; re-read after every
@@ -1780,6 +1785,7 @@ async function reconcileBackgroundWindow(policy) {
         await chrome.tabs.move(current.id, { windowId: window.id, index: -1 });
       } catch { /* A closing/navigating tab is reconsidered by the next ordinary status pass. */ }
     }
+    if (adopted) await chrome.windows.update(window.id, { state: 'minimized', focused: false });
     return true;
   });
 }

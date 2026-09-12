@@ -59,7 +59,8 @@ export async function downloadArtifactFile(
   validateOpenAIFileUrl(reference.download_url);
   if (reference.size !== undefined && reference.size > maxFileBytes) throw new ArtifactFetchError('ChatGPT file exceeds the configured per-file limit.');
   const resolved = await resolveIn(roots as Parameters<typeof resolveIn>[0], requestedPath, {
-    allowMissing: true
+    allowMissing: true,
+    writable: true
   });
   const parentReal = nodePath.dirname(resolved.real);
   const name = nodePath.basename(resolved.real);

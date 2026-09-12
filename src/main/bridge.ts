@@ -1494,6 +1494,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
               replacements: inputRows.filter(next => next.createdAt > row.createdAt && next.purpose !== 'decision')
                 .map(next => ({ id: next.id, conversationId: next.conversationId })) }))],
         background: getConfig().ui.backgroundChats === true,
+        managedBrowser: getConfig().ui.managedBrowser === true,
         browserOnly: getConfig().ui.browserOnly === true,
         browserWorkArea: currentBrowserWorkArea(),
         browserWindowBounds: browserWindowBounds(),
@@ -5808,21 +5809,28 @@ async function browserTabPolicy(openConversations: Set<string>) {
     return row?.activeTurnId === null && Math.max(row.lastTurnEndAt ?? 0, row.lastAssistantFinalAt ?? 0) > 0;
   });
   const quietFor = (id: string, ms: number) => Date.now() - lastActivity.get(id)! >= ms;
+  const reusable = available.filter(id => quietFor(id, 120_000) && !isGoalDecisionChat(id) &&
+    !supersededSourceConversations().includes(id));
+  const keep = getConfig().ui.tabsToKeepOpen ?? getConfig().multiAgent.maxWorkers + 2;
+  const protectedOpen = [...protectedChats].filter(id => openConversations.has(id)).length;
+  const reusableSlots = Math.max(0, keep - protectedOpen);
+  const overflow = [...reusable].sort((a, b) => (lastActivity.get(b) ?? 0) - (lastActivity.get(a) ?? 0))
+    .slice(reusableSlots);
   const idlePages = available.filter(id => quietFor(id, 300_000));
   return {
     idleReuseAfterMs: 120_000,
     idleCloseAfterMs: 300_000,
+    tabsToKeepOpen: keep,
     cancelledDecisionClaims: cancelledDecisionClaims.map(row => ({ id: row.id, owner: row.owner, conversationId: row.conversationId })),
     // Only terminal/blocked helpers and superseded sources grant close authority.
     retiredConversations: [...new Set([...idle, ...supersededSourceConversations()])]
       .filter(id => openConversations.has(id) && !protectedChats.has(id)).sort(),
     conversationActivityAt: Object.fromEntries(lastActivity),
     managedConversations: [...managed].sort(),
-    reusableConversations: available.filter(id => quietFor(id, 120_000) && !isGoalDecisionChat(id) &&
-      !supersededSourceConversations().includes(id)).sort(),
+    reusableConversations: reusable.sort(),
     nonDiscardableConversations: [...protectedChats].sort(),
     blockedConversations: blocked.sort(),
-    closableConversations: [...new Set([...idlePages, ...idle, ...supersededSourceConversations().filter(id => openConversations.has(id) && !protectedChats.has(id))])].sort()
+    closableConversations: [...new Set([...overflow, ...idlePages, ...idle, ...supersededSourceConversations().filter(id => openConversations.has(id) && !protectedChats.has(id))])].sort()
   };
 }
 

@@ -288,7 +288,7 @@ describe('terminal sessions at shutdown', () => {
     // conout pipe is ready — long after the 150ms early-exit grace period. Snapshotting it at
     // spawn stored 0 forever, which both lied to `list_processes` and made `terminate()` skip
     // `terminateProcessTree` under its own `pid > 0` guard.
-    const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
+    const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS, (command, cwd) => ({ command, cwd }));
     const processId = manager.allocateProcessId();
     const started = manager.execCommand({
       command: [process.execPath, '-e', 'setInterval(() => {}, 1000)'],
@@ -321,7 +321,7 @@ describe('terminal sessions at shutdown', () => {
   });
 
   it('terminates every live session even when one termination rejects, and skips the exited ones', async () => {
-    const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
+    const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS, (command, cwd) => ({ command, cwd }));
     const terminated: string[] = [];
     const makeEntry = (name: string, exited: boolean, reject = false): unknown => ({
       processId: manager.allocateProcessId(),

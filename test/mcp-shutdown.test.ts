@@ -1,6 +1,5 @@
 import { promises as fs } from 'node:fs';
 import * as filesystem from '../src/main/codex/filesystem.js';
-import os from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
@@ -8,6 +7,7 @@ import { validateNewRoot } from '../src/main/sandbox.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
 import { initSessionStore, resetSessionStoreForTests, unsetSessionRootForTests } from '../src/main/session/store.js';
+import { makeTempDir } from './helpers.js';
 
 let dir = '';
 let endpoint: McpEndpoint | null = null;
@@ -25,7 +25,7 @@ afterEach(async () => {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 it('drains an accepted MCP mutation before closing its response socket', async () => {
-  dir = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-mcp-drain-'));
+  dir = await makeTempDir('clf-mcp-drain-');
   initConfigPath(dir);
   initSessionStore(dir);
   initDurableStore(dir);
@@ -101,7 +101,7 @@ it('drains an accepted MCP mutation before closing its response socket', async (
   }
 });
 it('does not put a force-close deadline on an ordinary endpoint stop', async () => {
-  dir = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-mcp-graceful-stop-'));
+  dir = await makeTempDir('clf-mcp-graceful-stop-');
   initConfigPath(dir);
   initSessionStore(dir);
   initDurableStore(dir);

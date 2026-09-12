@@ -17,7 +17,7 @@ import * as desktopBackend from '../src/main/computer/index.js';
 import sharp from 'sharp';
 import { randomBytes } from 'node:crypto';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
-import { makeTempDir, removeTempDir } from './helpers.js';
+import { makeSandboxShim, makeTempDir, removeTempDir } from './helpers.js';
 
 let directory: string, endpoint: McpEndpoint, ctx: ToolContext;
 async function rpc(method: string, params: object, requestId?: string, surface: 'core' | 'desktop' = 'core'): Promise<any> {
@@ -41,7 +41,8 @@ beforeAll(async () => {
   directory = await makeTempDir('clf-code-mode-mcp-');
   initConfigPath(directory); initDurableStore(directory); initSessionStore(directory); resetInputForTests();
   const config = defaultConfig();
-  await saveConfig({ ...config, multiAgent: { ...config.multiAgent, enabled: false }, ui: { ...config.ui, finishTool: true } });
+  const sandbox = await makeSandboxShim(directory);
+  await saveConfig({ ...config, commandSandbox: { enabled: true, codexPath: sandbox, permissionProfile: 'projects-only' }, multiAgent: { ...config.multiAgent, enabled: false }, ui: { ...config.ui, finishTool: true } });
   await fs.writeFile(path.join(directory, 'alpha.txt'), 'alpha PRIVATE_ALPHA');
   await fs.writeFile(path.join(directory, 'beta.txt'), 'beta PRIVATE_BETA');
   ctx = { roots: [{ name: 'workspace', path: directory }], caps: config.capabilities, readOnly: false, sessionTools: true, agentTools: true };
