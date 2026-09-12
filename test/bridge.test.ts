@@ -577,7 +577,7 @@ describe('active agent tab discard projection', () => {
       try {
         noteAgentAlive(chats[0], 'page'); // periodic page presence must not renew idle work
         const quiet = (await request('POST', '/status', { body: { openConversations: chats } })).body;
-        expect(quiet.closableConversations).toEqual([]);
+        expect(quiet.closableConversations).toEqual([chats[0]]);
         expect(quiet.retiredConversations).toEqual([]);
         expect(quiet.reusableConversations).toEqual(chats.slice(0, 2));
         setChatBlocked(chats[2]!, true);
