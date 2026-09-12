@@ -10,6 +10,7 @@ import { readDurable, writeDurableNow } from './durable.js';
 import { addProject, getProject, listProjects, projectWorkspace } from './projects.js';
 import { execProcessIdsOwnedBy } from './codex/ownership.js';
 import { unifiedExecManager } from './codex/manager.js';
+import type { SessionEvent } from '../shared/session.js';
 
 const STATE = 'control-tasks';
 const API = '1';
@@ -64,6 +65,22 @@ export function deliveredTurnId(events: Awaited<ReturnType<typeof readEvents>>, 
   return turnId ? { seq: user.seq, turnId } : null;
 }
 
+export function cancellationReachedTerminal(cancellationRequestedAt: number | undefined, hasTerminalTurn: boolean): boolean {
+  return cancellationRequestedAt !== undefined && hasTerminalTurn;
+}
+
+export function taskCompletionEvidence(events: SessionEvent[], taskId: string, inputSeq: number, turnId: string): { seq: number; status: 'succeeded' | 'failed' } | null {
+  for (const event of events) {
+    if (event.kind !== 'tool_call' || event.seq <= inputSeq || event.turnId !== turnId || event.call.tool !== 'session_finish' ||
+        event.call.outcome !== 'ok' || event.call.args.truncated) continue;
+    try {
+      const args = JSON.parse(event.call.args.text) as { task_id?: unknown; status?: unknown };
+      if (args.task_id === taskId && (args.status === 'succeeded' || args.status === 'failed')) return { seq: event.seq, status: args.status };
+    } catch { /* Malformed recorder evidence cannot complete a task. */ }
+  }
+  return null;
+}
+
 async function body(req: http.IncomingMessage): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = [];
   for await (const chunk of req) { size += (chunk as Buffer).length; if (size > MAX_BODY) throw new Error('body_too_large'); chunks.push(chunk as Buffer); }
@@ -72,10 +89,11 @@ async function body(req: http.IncomingMessage): Promise<unknown> {
 }
 function taskId(pathname: string): string | null { const match = pathname.match(/^\/v1\/tasks\/([^/]+)(?:\/([^/]+))?$/); return match?.[1] && validId(match[1]) ? match[1] : null; }
 async function refresh(task: Task): Promise<Task> {
-  if (['succeeded', 'failed', 'cancelled'].includes(task.state)) return task;
+  if (task.state === 'cancelled' || (['succeeded', 'failed'].includes(task.state) && task.finalText)) return task;
+  const alreadyCompleted = task.state === 'succeeded' || task.state === 'failed';
   const activeInputId = task.inputIds.at(-1) ?? task.inputId;
   const row = (await listInputs()).find(input => input.id === activeInputId);
-  if (row) {
+  if (row && !alreadyCompleted) {
     task.sessionId = row.deliveredSessionId ?? task.sessionId ?? null;
     if (row.state === 'queued') task.state = 'queued';
     else if (row.state === 'browser' || row.state === 'tool') task.state = 'delivering';
@@ -90,20 +108,31 @@ async function refresh(task: Task): Promise<Task> {
       const events = await readEvents(task.sessionId, { from: task.boundInputSeq ?? 0 });
       const binding = task.boundTurnId ? null : deliveredTurnId(events, activeInputId);
       if (binding) { task.boundInputSeq = binding.seq; task.boundTurnId = binding.turnId; }
-      const turnId = task.boundTurnId;
-      const inputSeq = task.boundInputSeq;
+      // A recorder reload can lose the confirmed user-message event while the durable
+      // delivery row still binds this task to the exact session and active provider turn.
+      // Fall back only to that current turn; never accept task-id evidence cross-turn.
+      const turnId = task.boundTurnId ?? task.currentTurnId;
+      const inputSeq = task.boundInputSeq ?? 0;
+      const completion = inputSeq !== undefined && turnId ? taskCompletionEvidence(events, task.taskId, inputSeq, turnId) : null;
       const end = inputSeq !== undefined && turnId ? events.find(event => event.kind === 'turn_end' && event.seq > inputSeq && event.turnId === turnId) : undefined;
       const final = inputSeq !== undefined && turnId ? events.findLast((event): event is Extract<typeof event, { kind: 'assistant_message' }> =>
         event.kind === 'assistant_message' && event.seq > inputSeq && event.turnId === turnId && event.final && event.state === 'final') : undefined;
       if (final) task.finalText = final.message.text;
-      if (end?.kind === 'turn_end' && final) {
+      if (completion) {
+        task.state = completion.status;
+        task.outcome = completion.status === 'succeeded' ? 'completed' : 'supervisor_failed';
+        task.currentTurnId = null;
+      }
+      else if (end?.kind === 'turn_end' && final) {
         const boundSeq = inputSeq!;
         const marker = final.message.text.match(new RegExp(`\\[COS_TASK_RESULT\\s+task_id=${task.taskId}\\s+status=(succeeded|failed)\\]\\s*$`, 'i'));
         const proof = events.find(event => event.kind === 'tool_call' && event.seq > boundSeq && event.seq < end.seq &&
           event.turnId === turnId && event.call.tool === 'session_finish' && event.call.outcome === 'ok' &&
           !event.call.args.truncated && event.call.args.text.includes(task.taskId) &&
           event.call.args.text.includes(`"status":"${marker?.[1]?.toLowerCase()}"`));
-        if (task.cancellationRequestedAt) task.state = 'cancelling';
+        if (cancellationReachedTerminal(task.cancellationRequestedAt, true)) {
+          task.state = 'cancelled'; task.outcome = 'cancelled'; task.currentTurnId = null;
+        }
         else if (end.outcome !== 'completed') { task.state = 'failed'; task.outcome = end.outcome; }
         else if (marker?.[1]?.toLowerCase() === 'succeeded' && proof) { task.state = 'succeeded'; task.outcome = 'completed'; }
         else if (marker?.[1]?.toLowerCase() === 'failed' && proof) { task.state = 'failed'; task.outcome = 'supervisor_failed'; }
