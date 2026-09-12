@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   UnifiedExecError,
   UnifiedExecProcessManager,
+  applyCommandSandbox,
   applyUnifiedExecEnv,
   execCommandResponseText,
   execCommandStructuredOutput,
@@ -62,6 +63,33 @@ describe('Codex unified exec runtime parity', () => {
   afterEach(async () => {
     await Promise.all(managers.splice(0).map((item) => item.terminateAllProcesses()));
     await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  it('wraps commands in the configured Codex permission profile and fails closed on bad settings', () => {
+    const settings = {
+      enabled: true,
+      codexPath: '/Applications/ChatGPT.app/Contents/Resources/codex',
+      permissionProfile: 'projects-only'
+    };
+    expect(applyCommandSandbox(['/bin/sh', '-c', 'pwd'], '/workspace', settings)).toEqual([
+      settings.codexPath,
+      'sandbox',
+      '-c',
+      'shell_environment_policy.inherit=all',
+      '--permission-profile',
+      'projects-only',
+      '--cd',
+      '/workspace',
+      '/bin/sh',
+      '-c',
+      'pwd'
+    ]);
+    expect(() => applyCommandSandbox(['/bin/true'], '/workspace', { ...settings, codexPath: 'codex' })).toThrow(
+      'command sandbox Codex path must be absolute'
+    );
+    expect(() =>
+      applyCommandSandbox(['/bin/true'], '/workspace', { ...settings, permissionProfile: '../unsafe' })
+    ).toThrow('command sandbox permission profile is invalid');
   });
 
   /**
@@ -231,7 +259,7 @@ describe('Codex unified exec runtime parity', () => {
 
   it('does not let batch command output impersonate wrapper exit markers', () => {
     const batch = composeCommandBatch(['Write-Output one', 'Write-Output two'], 'powershell');
-    const marker = /clf-batch:([0-9a-f]{24})/.exec(batch)?.[1];
+    const marker = batch.marker;
     expect(marker).toBeDefined();
 
     const output = [
@@ -244,7 +272,7 @@ describe('Codex unified exec runtime parity', () => {
       `--- exit code 1 --- [clf-batch:${marker}]`
     ].join('\n');
 
-    expect(parseCommandBatchSections(output)).toEqual([
+    expect(parseCommandBatchSections(output, marker)).toEqual([
       { index: 1, exitCode: 5, text: '--- exit code 0 ---\nreal failure' },
       { index: 2, exitCode: 1, text: 'no matches' }
     ]);

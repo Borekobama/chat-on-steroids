@@ -4,7 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { initDurableStore } from '../src/main/durable.js';
-import { deliveredTurnId, startControlService, stopControlService } from '../src/main/control-service.js';
+import { cancellationReachedTerminal, deliveredTurnId, startControlService, stopControlService, taskCompletionEvidence } from '../src/main/control-service.js';
 import type { SessionEvent } from '../src/shared/session.js';
 
 async function request(socketPath: string, method: string, route: string, value?: unknown): Promise<{ status: number; body: any }> {
@@ -59,5 +59,24 @@ describe('CoS control service', () => {
       { kind: 'assistant_message', seq: 12, turnId: 'provider-turn', final: true, state: 'final' }
     ] as SessionEvent[];
     expect(deliveredTurnId(events, 'input-1')).toEqual({ seq: 3, turnId: 'provider-turn' });
+  });
+
+  it('finishes cancellation after the bound turn reaches a terminal response', () => {
+    expect(cancellationReachedTerminal(Date.now(), true)).toBe(true);
+    expect(cancellationReachedTerminal(Date.now(), false)).toBe(false);
+    expect(cancellationReachedTerminal(undefined, true)).toBe(false);
+  });
+
+  it('accepts only exact bound immediate task completion evidence', () => {
+    const finish = (seq: number, turnId: string, taskId: string, status: string) => ({
+      kind: 'tool_call', seq, turnId, call: { tool: 'session_finish', outcome: 'ok', args: { truncated: false, text: JSON.stringify({ task_id: taskId, status }) } }
+    }) as SessionEvent;
+    const events = [
+      finish(3, 'turn-1', 'wrong-task', 'succeeded'),
+      finish(4, 'wrong-turn', 'task-1', 'succeeded'),
+      finish(5, 'turn-1', 'task-1', 'failed')
+    ];
+    expect(taskCompletionEvidence(events, 'task-1', 2, 'turn-1')).toEqual({ seq: 5, status: 'failed' });
+    expect(taskCompletionEvidence(events, 'task-1', 5, 'turn-1')).toBeNull();
   });
 });

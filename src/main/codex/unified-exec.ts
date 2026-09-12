@@ -19,7 +19,9 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import path from 'node:path';
 import { HeadTailBuffer } from './head-tail-buffer.js';
+import { CommandBatchDisplay } from './command-batch.js';
 import {
   approxTokenCount,
   approxTokensFromByteCount,
@@ -45,6 +47,7 @@ import {
 } from './unified-exec-constants.js';
 import { terminateProcessTree } from '../exec.js';
 import { prefixPowershellScriptWithUtf8, type ShellType } from './shell.js';
+import type { CommandSandboxSettings } from '../../shared/types.js';
 
 // --------------------------------------------------------------------------- errors
 
@@ -221,6 +224,7 @@ async function loadPty(): Promise<PtyModule | null> {
 // --------------------------------------------------------------------------- process
 
 export interface SpawnParams {
+  batchMarker?: string;
   /** The derived argv; element 0 is the executable. */
   command: string[];
   shellType: ShellType;
@@ -260,6 +264,8 @@ function quoteWindowsArgument(argument: string): string {
  */
 class UnifiedExecProcess {
   private buffer = new HeadTailBuffer();
+  private displayBuffer: HeadTailBuffer | undefined;
+  private readonly batchDisplay: CommandBatchDisplay | undefined;
   readonly outputNotify = new Notify();
   readonly outputClosedNotify = new Notify();
   readonly cancelNotify = new Notify();
@@ -275,9 +281,13 @@ class UnifiedExecProcess {
   readonly tty: boolean;
   private readonly spawnPid: number;
 
-  private constructor(tty: boolean, pid: number) {
+  private constructor(tty: boolean, pid: number, batchMarker?: string) {
     this.tty = tty;
     this.spawnPid = pid;
+    if (batchMarker) {
+      this.batchDisplay = new CommandBatchDisplay(batchMarker);
+      this.displayBuffer = new HeadTailBuffer();
+    }
   }
 
   /**
@@ -328,7 +338,7 @@ class UnifiedExecProcess {
       } catch (error) {
         throw UnifiedExecError.createProcess(error instanceof Error ? error.message : String(error));
       }
-      const managed = new UnifiedExecProcess(true, handle.pid);
+      const managed = new UnifiedExecProcess(true, handle.pid, params.batchMarker);
       managed.pty = handle;
       handle.onData((data) => managed.pushChunk(Buffer.from(data, 'utf8')));
       handle.onExit((event) => {
@@ -360,7 +370,7 @@ class UnifiedExecProcess {
       throw UnifiedExecError.createProcess(error instanceof Error ? error.message : String(error));
     }
 
-    const managed = new UnifiedExecProcess(false, child.pid ?? -1);
+    const managed = new UnifiedExecProcess(false, child.pid ?? -1, params.batchMarker);
     managed.child = child;
     // stdout and stderr are combined into one stream, exactly as `combine_output_receivers`
     // does on the local Codex path, so interleaving is preserved in arrival order.
@@ -413,6 +423,7 @@ class UnifiedExecProcess {
   private pushChunk(chunk: Buffer): void {
     if (chunk.length === 0) return;
     this.buffer.pushChunk(chunk);
+    if (this.batchDisplay) this.displayBuffer!.pushChunk(this.batchDisplay.push(chunk));
     this.outputNotify.notifyWaiters();
   }
 
@@ -423,6 +434,7 @@ class UnifiedExecProcess {
 
   private closeOutput(): void {
     if (this.outputClosed) return;
+    if (this.batchDisplay) this.displayBuffer!.pushChunk(this.batchDisplay.push(Buffer.alloc(0), true));
     this.outputClosed = true;
     this.outputClosedNotify.notifyWaiters();
   }
@@ -439,10 +451,17 @@ class UnifiedExecProcess {
   }
 
   /** `std::mem::take` of the shared buffer. */
-  takeBuffer(): HeadTailBuffer {
-    const drained = this.buffer;
+  takeBuffer(): { raw: HeadTailBuffer; display?: HeadTailBuffer } {
+    const drained = { raw: this.buffer, display: this.displayBuffer };
     this.buffer = new HeadTailBuffer();
+    if (this.displayBuffer) this.displayBuffer = new HeadTailBuffer();
     return drained;
+  }
+
+  /** Completed output is immutable once both exit and stream closure are observed. */
+  completedOutput(): Buffer | null {
+    return this.hasExited() && this.outputClosed
+      ? (this.displayBuffer ?? this.buffer).toBytesWithOmissionMarker() : null;
   }
 
   hasExited(): boolean {
@@ -529,6 +548,8 @@ export interface ExecCommandToolOutput {
   chunkId: string;
   wallTimeMs: number;
   rawOutput: Buffer;
+  /** Batches alone retain a separately bounded, delimiter-free presentation stream. */
+  displayOutput?: Buffer;
   truncationPolicy: TruncationPolicy;
   maxOutputTokens: number | undefined;
   /** The session id, present only while the process is still running. */
@@ -545,7 +566,7 @@ function modelOutputMaxTokens(output: ExecCommandToolOutput): number {
 
 /** `ExecCommandToolOutput::truncated_output`. */
 export function truncatedOutput(output: ExecCommandToolOutput, maxTokens: number): string {
-  const text = output.rawOutput.toString('utf8');
+  const text = (output.displayOutput ?? output.rawOutput).toString('utf8');
   const policy: TruncationPolicy = { kind: 'tokens', tokens: maxTokens };
   if (output.outputOmittedBytes === null || output.outputOmittedBytes === 0) {
     return formattedTruncateText(text, policy);
@@ -593,6 +614,7 @@ export function execCommandStructuredOutput(output: ExecCommandToolOutput): Reco
 // --------------------------------------------------------------------------- manager
 
 export interface ExecCommandRequest {
+  batchMarker?: string;
   command: string[];
   shellType: ShellType;
   hookCommand: string;
@@ -605,6 +627,30 @@ export interface ExecCommandRequest {
   displayCwd: string;
   env: NodeJS.ProcessEnv;
   tty: boolean;
+  commandSandbox?: CommandSandboxSettings;
+}
+
+export function applyCommandSandbox(
+  command: string[],
+  cwd: string,
+  settings: CommandSandboxSettings | undefined
+): string[] {
+  if (!settings?.enabled) return command;
+  if (!path.isAbsolute(settings.codexPath)) throw new Error('command sandbox Codex path must be absolute');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(settings.permissionProfile)) {
+    throw new Error('command sandbox permission profile is invalid');
+  }
+  return [
+    settings.codexPath,
+    'sandbox',
+    '-c',
+    'shell_environment_policy.inherit=all',
+    '--permission-profile',
+    settings.permissionProfile,
+    '--cd',
+    cwd,
+    ...command
+  ];
 }
 
 export interface WriteStdinRequest {
@@ -631,6 +677,24 @@ interface ProcessEntry {
   hookCommand: string;
   tty: boolean;
   initialExecCommandActive: boolean;
+  /** Cursor into this process's own completed buffer; offers never consume bytes. */
+  delivery?: { offset: number; offer?: { end: number; publication: OutputPublication } };
+}
+
+/** Local response completion, not a claim that a remote model understood the output. */
+export interface OutputPublication {
+  completedAt: number | null;
+  failed: boolean;
+}
+
+export interface CompletedOutputPage {
+  processId: number;
+  command: string;
+  exitCode: number | null;
+  output: string;
+  start: number;
+  end: number;
+  total: number;
 }
 
 export interface BackgroundExecState {
@@ -680,9 +744,19 @@ export class UnifiedExecProcessManager {
     try {
       // `UnifiedExecRuntime::run` prefixes every PowerShell script before it reaches the
       // process launcher so pipe-mode output is UTF-8 just like PTY output.
-      const command =
+      const preparedCommand =
         request.shellType === 'powershell' ? prefixPowershellScriptWithUtf8(request.command) : request.command;
+      const commandWithPath = [...preparedCommand];
+      if (globalThis.process.platform !== 'win32' && request.env.PATH && commandWithPath.length >= 3) {
+        const shellFlag = commandWithPath[1];
+        if (shellFlag === '-c' || shellFlag === '-lc') {
+          const pathValue = request.env.PATH.replaceAll("'", "'\\''");
+          commandWithPath[2] = `export PATH='${pathValue}'; ${commandWithPath[2]}`;
+        }
+      }
+      const command = applyCommandSandbox(commandWithPath, request.cwd, request.commandSandbox);
       process = await UnifiedExecProcess.spawn({
+        batchMarker: request.batchMarker,
         command,
         shellType: request.shellType,
         cwd: request.cwd,
@@ -720,9 +794,10 @@ export class UnifiedExecProcessManager {
     const collected = await collectOutputUntilDeadline(process, deadline);
     const wallTimeMs = Math.max(0, performance.now() - wallStart);
 
-    const originalTokenCount = approxTokensFromByteCount(collected.totalBytes());
-    const outputOmittedBytes = collected.omittedBytes() === 0 ? null : collected.omittedBytes();
-    const rawOutput = collected.toBytesWithOmissionMarker();
+    const visible = collected.display ?? collected.raw;
+    const originalTokenCount = approxTokensFromByteCount(visible.totalBytes());
+    const outputOmittedBytes = visible.omittedBytes() === 0 ? null : visible.omittedBytes();
+    const rawOutput = collected.raw.toBytesWithOmissionMarker();
     const chunkId = generateChunkId();
 
     const failure = process.failureMessage();
@@ -754,6 +829,7 @@ export class UnifiedExecProcessManager {
       chunkId,
       wallTimeMs,
       rawOutput,
+      ...(collected.display ? { displayOutput: collected.display.toBytesWithOmissionMarker() } : {}),
       truncationPolicy: request.truncationPolicy,
       maxOutputTokens: request.maxOutputTokens,
       processId: responseProcessId,
@@ -827,9 +903,15 @@ export class UnifiedExecProcessManager {
       const collected = await collectOutputUntilDeadline(process, start + yieldTimeMs, request.input === '');
       const wallTimeMs = Math.max(0, performance.now() - wallStart);
 
-      const originalTokenCount = approxTokensFromByteCount(collected.totalBytes());
-      const outputOmittedBytes = collected.omittedBytes() === 0 ? null : collected.omittedBytes();
-      const rawOutput = collected.toBytesWithOmissionMarker();
+      const visible = collected.display ?? collected.raw;
+      const originalTokenCount = approxTokensFromByteCount(visible.totalBytes());
+      const outputOmittedBytes = visible.omittedBytes() === 0 ? null : visible.omittedBytes();
+      // An explicit poll may replay an offered-but-unacknowledged page, but must not
+      // repeat earlier pages that this caller has already acknowledged automatically.
+      const deliveredOffset = current.delivery?.offset ?? 0;
+      const rawOutput = deliveredOffset > 0
+        ? visible.toBytesWithOmissionMarker().subarray(deliveredOffset)
+        : collected.raw.toBytesWithOmissionMarker();
       const chunkId = generateChunkId();
 
       const failure = process.failureMessage();
@@ -858,6 +940,7 @@ export class UnifiedExecProcessManager {
         chunkId,
         wallTimeMs,
         rawOutput,
+        ...(collected.display ? { displayOutput: deliveredOffset > 0 ? rawOutput : collected.display.toBytesWithOmissionMarker() } : {}),
         truncationPolicy: request.truncationPolicy,
         maxOutputTokens: request.maxOutputTokens,
         processId: responseProcessId,
@@ -906,6 +989,63 @@ export class UnifiedExecProcessManager {
   /** Exited rows not handled by the starting exec; polling releases these rows. */
   exitedUnread(processIds: ReadonlySet<number>): Array<{ processId: number; exitCode: number | null }> {
     return this.backgroundState(processIds).exitedUnread;
+  }
+
+  /** A later owner call acknowledges a successfully published page, even within one request ID. */
+  async acknowledgeCompletedOutput(processIds: ReadonlySet<number>, startedAt: number, except?: number): Promise<number[]> {
+    const retired: number[] = [];
+    for (const id of processIds) {
+      if (id === except) continue; // Explicit polling still owns its normal result path.
+      const entry = this.processes.get(id);
+      if (!entry?.delivery?.offer) continue;
+      const release = await entry.process.interactionLock.lock();
+      try {
+        if (this.processes.get(id) !== entry) continue;
+        const offered = entry.delivery?.offer;
+        if (!offered || offered.publication.failed || offered.publication.completedAt === null ||
+            startedAt <= offered.publication.completedAt) continue;
+        const output = entry.process.completedOutput();
+        if (output === null) continue;
+        entry.delivery = { offset: offered.end };
+        if (offered.end >= output.length) {
+          this.releaseProcessId(id);
+          retired.push(id);
+        }
+      } finally { release(); }
+    }
+    return retired;
+  }
+
+  /**
+   * Offer one bounded page without draining the process. A broken response reoffers the
+   * same bytes; an older concurrent response cannot advance a newer delivery cursor.
+   */
+  async offerCompletedOutput(
+    processIds: ReadonlySet<number>, publication: OutputPublication, maxBytes: number
+  ): Promise<CompletedOutputPage | null> {
+    if (publication.failed || maxBytes < 4) return null;
+    for (const { processId } of this.backgroundState(processIds).exitedUnread) {
+      const entry = this.processes.get(processId);
+      if (!entry) continue;
+      const release = await entry.process.interactionLock.lock();
+      try {
+        if (this.processes.get(processId) !== entry || entry.initialExecCommandActive) continue;
+        const output = entry.process.completedOutput();
+        if (output === null) continue;
+        const delivery = entry.delivery ??= { offset: 0 };
+        // An in-flight or published offer owns this page until failure or later receipt.
+        if (delivery.offer && !delivery.offer.publication.failed) continue;
+        const start = delivery.offset;
+        let end = Math.min(output.length, start + Math.floor(maxBytes));
+        // Do not split a UTF-8 character across separately rendered MCP responses.
+        while (end > start && end < output.length && (output[end]! & 0xc0) === 0x80) end--;
+        if (end === start && output.length > start) continue;
+        delivery.offer = { end, publication };
+        return { processId, command: entry.hookCommand, exitCode: entry.process.exitCode(),
+          output: output.subarray(start, end).toString('utf8'), start, end, total: output.length };
+      } finally { release(); }
+    }
+    return null;
   }
 
   async terminateProcess(processId: number): Promise<boolean> {
@@ -983,8 +1123,9 @@ async function collectOutputUntilDeadline(
   process: UnifiedExecProcess,
   deadline: number,
   returnOnFirstOutput = false
-): Promise<HeadTailBuffer> {
+): Promise<{ raw: HeadTailBuffer; display?: HeadTailBuffer }> {
   const collected = new HeadTailBuffer();
+  let display: HeadTailBuffer | undefined;
   let exitSignalReceived = process.cancelled;
   let postExitDeadline: number | null = null;
 
@@ -992,7 +1133,11 @@ async function collectOutputUntilDeadline(
     // Drained and re-armed in one synchronous step, so a chunk arriving between the two
     // cannot be missed by the wait that follows.
     const drained = process.takeBuffer();
-    const hasDrainedOutput = drained.retainedBytes() > 0 || drained.omittedBytes() > 0;
+    if (drained.display) {
+      display ??= new HeadTailBuffer();
+      display.pushBuffer(drained.display);
+    }
+    const hasDrainedOutput = drained.raw.retainedBytes() > 0 || drained.raw.omittedBytes() > 0;
     const waitForOutput = hasDrainedOutput ? null : process.outputNotify.notified();
 
     if (!hasDrainedOutput) {
@@ -1032,13 +1177,13 @@ async function collectOutputUntilDeadline(
       continue;
     }
 
-    collected.pushBuffer(drained);
+    collected.pushBuffer(drained.raw);
     if (returnOnFirstOutput) break;
     exitSignalReceived ||= process.cancelled;
     if (Date.now() >= deadline) break;
   }
 
-  return collected;
+  return { raw: collected, display };
 }
 
 /** Resolves true when the timeout won the race. */

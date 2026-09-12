@@ -22,6 +22,7 @@ import {
   DESKTOP_CAPABILITIES,
   type ArtifactSettings,
   type CompactionSettings,
+  type CommandSandboxSettings,
   type Config,
   type GoalSettings,
   type MultiAgentSettings,
@@ -130,10 +131,8 @@ const DEFAULT_ARTIFACTS: ArtifactSettings = {
 /**
  * The goal loop's defaults.
  *
- * Off, because it types into somebody's chat on its own and because it cannot work at all
- * until an OpenRouter API key exists. The model is a starting point rather than a
- * recommendation: the Chat settings picker lists what OpenRouter actually publishes,
- * newest first, and whatever is chosen there is stored here verbatim.
+ * Off until explicitly enabled, with ChatGPT as the default response source.
+ * API provider/model settings apply only when API is selected; saved choices remain exact.
  */
 /**
  * The shipped Goal baseline. Keep the exact OpenRouter model id here rather than a provider
@@ -154,8 +153,7 @@ const DEFAULT_GOAL: GoalSettings = {
   // the one that can end by itself: a loop that never stops is a deliberate choice, not a
   // default anybody should discover by turning something on.
   mode: 'goal',
-  // OpenRouter stays the default provider so an upgrade changes nothing for anyone who
-  // never touches the switch; a hand-written config predating the field parses the same way.
+  // Default for the optional API backend only; ChatGPT does not read this block.
   provider: { kind: 'openrouter', baseUrl: '' },
   model: DEFAULT_GOAL_MODEL,
   reasoning: 'default',
@@ -265,6 +263,11 @@ const capabilitiesSchema = z
  */
 export const MAX_MCP_INSTRUCTIONS_CHARS = 4000;
 const DEFAULT_MCP = { instructions: '' } as const;
+const DEFAULT_COMMAND_SANDBOX: CommandSandboxSettings = {
+  enabled: false,
+  codexPath: '',
+  permissionProfile: 'projects-only'
+};
 
 const configSchema = z.object({
   // A config written by hand — or by a build before `/skills` was reserved — must not be
@@ -276,6 +279,18 @@ const configSchema = z.object({
     .transform(uniqueStoredRoots),
   capabilities: capabilitiesSchema,
   readOnly: z.boolean(),
+  commandSandbox: z
+    .object({
+      enabled: z.boolean().optional().default(DEFAULT_COMMAND_SANDBOX.enabled),
+      codexPath: z.string().max(4096).optional().default(DEFAULT_COMMAND_SANDBOX.codexPath),
+      permissionProfile: z
+        .string()
+        .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/)
+        .optional()
+        .default(DEFAULT_COMMAND_SANDBOX.permissionProfile)
+    })
+    .optional()
+    .default({ ...DEFAULT_COMMAND_SANDBOX }),
   tunnel: z.object({
     kind: z.enum(['openai', 'cloudflared', 'manual']),
     tunnelId: z.string().max(128),
@@ -295,7 +310,7 @@ const configSchema = z.object({
     planBackend: z.enum(['chatgpt', 'api']).optional(),
     finishAction: z.enum(['notify', 'goal']).optional(),
     finishLeadMinutes: z.number().int().min(3).max(5).optional(),
-    backgroundChats: z.boolean().optional().default(false),
+    backgroundChats: z.boolean().optional().default(true),
     browserOnly: z.boolean().optional().default(false),
     autoRefreshPlugins: z.boolean().optional().default(false),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
@@ -477,8 +492,9 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     roots: [],
     capabilities: firstLaunchCapabilities(platform, release),
     readOnly: false,
+    commandSandbox: { ...DEFAULT_COMMAND_SANDBOX },
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, managedBrowser: false, browserHeadless: false },
+    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, managedBrowser: false, browserHeadless: false, backgroundChats: true },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...FIRST_LAUNCH_MULTI_AGENT },
