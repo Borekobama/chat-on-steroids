@@ -88,6 +88,10 @@ function scheduleCancellationSweep(): void {
   cancellationSweep.unref?.();
 }
 function taskView(task: Task): Omit<Task, 'brief'> { const { brief: _brief, ...view } = task; return view; }
+export function workspaceLeaseView(task: Task) {
+  return { error: 'workspace_leased', message: 'Workspace already has an active task',
+    taskId: task.taskId, state: task.state, workspace: task.canonicalWorkspace };
+}
 function supervisorText(task: Task): string {
   return `${task.brief}\n\nCoS WEB SUPERVISOR TASK\nTask ID: ${task.taskId}\nWorkspace: ${task.canonicalWorkspace}\nKeep this ChatGPT conversation as Supervisor Shunt parent. Use one supervisor-shunt run-role invocation at a time with --parent-host chatgpt_cos. Inspect actual diffs and verify independently. One precise correction is allowed before escalation. Do not use CoS worker chats, Goal, or Loop. Do not launch nested Shunt agents. End with changed files, verification, and unresolved blockers. When acceptance is complete, call session_finish with task_id=${task.taskId} and status=succeeded, then end the same turn with the final response. This task form records immediately and does not hold the turn. For terminal failure, use status=failed. If user input is needed, omit session_finish and ask one clear question.`;
 }
@@ -243,7 +247,9 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
     });
     if (admitted.prior) return admitted.prior.requestId === payload.requestId && admitted.prior.payloadHash === requestHash
       ? json(res, 200, { taskId: admitted.prior.taskId, state: admitted.prior.state })
-      : error(res, 409, admitted.prior.requestId === payload.requestId ? 'request_conflict' : 'workspace_leased');
+      : admitted.prior.requestId === payload.requestId
+        ? error(res, 409, 'request_conflict')
+        : json(res, 409, workspaceLeaseView(admitted.prior));
     const task = admitted.task!;
     const supervisorBrief = supervisorText(task);
     void sendDesktopInput(inputArgs.parse({ id: task.inputId, projectId: task.projectId, sessionId: task.sessionId, text: supervisorBrief, mode: 'auto', dueAt: task.createdAt, model: task.requestedModel, reasoningEffort: task.requestedEffort, automation: 'off' }))

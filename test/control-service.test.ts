@@ -4,7 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { initDurableStore } from '../src/main/durable.js';
-import { cancellationReachedTerminal, deliveredTurnId, refreshControlTaskForTests, startControlService, stopControlService, taskCompletionEvidence, type ControlRefreshHooks, type Task } from '../src/main/control-service.js';
+import { cancellationReachedTerminal, deliveredTurnId, refreshControlTaskForTests, startControlService, stopControlService, taskCompletionEvidence, workspaceLeaseView, type ControlRefreshHooks, type Task } from '../src/main/control-service.js';
 import type { SessionEvent } from '../src/shared/session.js';
 const blocked = vi.hoisted(() => new Set<string>());
 vi.mock('../src/main/session/blocked-chats.js', () => ({
@@ -101,6 +101,13 @@ describe('CoS control service', () => {
     readEvents: async () => events as any,
     processIdsOwnedBy: () => [91],
     hasProcessOrReservation: () => activeProcesses
+  });
+
+  it('returns enough lease evidence to wait or cancel the exact task', () => {
+    expect(workspaceLeaseView(task())).toEqual({
+      error: 'workspace_leased', message: 'Workspace already has an active task',
+      taskId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', state: 'delivering', workspace: '/workspace'
+    });
   });
 
   it('binds completion to the exact delivered input and retains the lease until owned process cleanup', async () => {
