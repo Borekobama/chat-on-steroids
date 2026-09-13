@@ -66,6 +66,10 @@ it('carries validated user image bytes through an exact-session MCP result and a
     expect(second.result.content.some((row: { text?: string }) => row.text?.includes(stageOne.text))).toBe(false);
     expect(second.result.content.some((row: { text?: string }) => row.text?.includes(stageTwo.text))).toBe(false);
     expect((await listInputs()).find(row => row.id === stageOne.id)?.state).toBe('queued');
+    const taskFinish = await call('session_finish', { task_id: randomUUID(), status: 'succeeded' });
+    expect(taskFinish.result.isError).not.toBe(true);
+    expect(taskFinish.result.content.some((row: { text?: string }) => row.text?.includes(stageOne.text))).toBe(false);
+    expect((await listInputs()).find(row => row.id === stageOne.id)?.state).toBe('queued');
     const refusedFinish = await call('session_finish', { summary: '' });
     expect(refusedFinish.result.isError).toBe(true);
     expect((await listInputs()).find(row => row.id === stageOne.id)?.state).toBe('queued');

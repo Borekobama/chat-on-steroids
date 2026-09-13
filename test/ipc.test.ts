@@ -288,7 +288,7 @@ beforeEach(async () => {
 });
 
 describe('explicit settings replace the published tool contract', () => {
-  it.each(['finish', 'command', 'session'] as const)('withdraws %s from real endpoint publication after its setting is disabled', async kind => {
+  it.each(['finish', 'command', 'session'] as const)('updates %s in real endpoint publication after its setting is disabled', async kind => {
     const { startMcpServer } = await import('../src/main/mcp/server.js');
     const { effectiveCapabilities } = await import('../src/main/config.js');
     const { publishPluginSurface, pluginRefreshPublications, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
@@ -307,7 +307,12 @@ describe('explicit settings replace the published tool contract', () => {
       const patch = { ...current, ...(kind === 'finish' ? { ui: { ...current.ui, finishTool: false } } : kind === 'command' ? { capabilities: { ...current.capabilities, command: false } } : { sessions: { ...current.sessions, record: false } }) };
       expect((await save(patch)).ok).toBe(true);
       const after = snapshot();
-      expect(after.tools.map(row => row.name)).not.toContain(tool);
+      if (kind === 'finish') {
+        const finish = after.tools.find(row => row.name === tool)!;
+        expect(finish).toBeDefined();
+        expect(JSON.stringify(finish.inputSchema)).toContain('task_id');
+        expect(JSON.stringify(finish.inputSchema)).not.toContain('summary');
+      } else expect(after.tools.map(row => row.name)).not.toContain(tool);
       expect(after.schemaId).not.toBe(before.schemaId);
       const saved = getConfig();
       expect((await save({ ...saved, ui: { ...saved.ui, theme: 'dark' } })).ok).toBe(true);

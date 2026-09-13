@@ -13,6 +13,7 @@ import { addProject, getProject, listProjects, projectWorkspace } from './projec
 import { execProcessIdsOwnedBy } from './codex/ownership.js';
 import { unifiedExecManager } from './codex/manager.js';
 import type { SessionEvent } from '../shared/session.js';
+import { READONLY_MAX_BODY, runReadonlyCodex } from './control-readonly.js';
 
 const STATE = 'control-tasks';
 const API = '1';
@@ -96,21 +97,27 @@ function supervisorText(task: Task): string {
   return `${task.brief}\n\nCoS WEB SUPERVISOR TASK\nTask ID: ${task.taskId}\nWorkspace: ${task.canonicalWorkspace}\nKeep this ChatGPT conversation as Supervisor Shunt parent. Use one supervisor-shunt run-role invocation at a time with --parent-host chatgpt_cos. Inspect actual diffs and verify independently. One precise correction is allowed before escalation. Do not use CoS worker chats, Goal, or Loop. Do not launch nested Shunt agents. End with changed files, verification, and unresolved blockers. When acceptance is complete, call session_finish with task_id=${task.taskId} and status=succeeded, then end the same turn with the final response. This task form records immediately and does not hold the turn. For terminal failure, use status=failed. If user input is needed, omit session_finish and ask one clear question.`;
 }
 
-export function deliveredTurnId(events: Awaited<ReturnType<typeof readEvents>>, inputId: string): { seq: number; turnId: string } | null {
-  const user = events.find(event => event.kind === 'user_message' && event.inputId === inputId && event.inputDelivery === 'confirmed');
+export function deliveredTurnId(events: Awaited<ReturnType<typeof readEvents>>, inputId: string): { seq: number; time: number; turnId: string } | null {
+  const user = events.find(event => event.kind === 'user_message' && event.inputId === inputId &&
+    (event.inputDelivery === 'offered' || event.inputDelivery === 'confirmed'));
   if (!user) return null;
-  const turnId = user.turnId ?? events.find(event => event.kind === 'assistant_message' && event.seq > user.seq && event.turnId)?.turnId;
-  return turnId ? { seq: user.seq, turnId } : null;
+  // A tool handout is published to history before the carrier tool call itself is recorded.
+  // That exact later call therefore supplies the provider turn immediately. Its call start
+  // time remains older than the offer and is fenced from task-completion evidence below.
+  const turnId = user.turnId ?? events.find(event => event.seq > user.seq &&
+    (event.kind === 'tool_call' || event.kind === 'assistant_message') && event.turnId)?.turnId;
+  return turnId ? { seq: user.seq, time: user.time, turnId } : null;
 }
 
 export function cancellationReachedTerminal(cancellationRequestedAt: number | undefined, hasTerminalTurn: boolean, hasOwnedProcess = false, isolated = false): boolean {
   return cancellationRequestedAt !== undefined && (hasTerminalTurn || isolated) && !hasOwnedProcess;
 }
 
-export function taskCompletionEvidence(events: SessionEvent[], taskId: string, inputSeq: number, turnId: string, terminalSeq = Number.POSITIVE_INFINITY): { seq: number; status: 'succeeded' | 'failed' } | null {
+export function taskCompletionEvidence(events: SessionEvent[], taskId: string, inputSeq: number, turnId: string,
+  terminalSeq = Number.POSITIVE_INFINITY, inputDeliveredAt = Number.NEGATIVE_INFINITY): { seq: number; status: 'succeeded' | 'failed' } | null {
   for (const event of events) {
     if (event.kind !== 'tool_call' || event.seq <= inputSeq || event.seq >= terminalSeq || event.turnId !== turnId || event.call.tool !== 'session_finish' ||
-        event.call.outcome !== 'ok' || event.call.args.truncated) continue;
+        event.call.outcome !== 'ok' || event.call.args.truncated || event.time <= inputDeliveredAt) continue;
     try {
       const args = JSON.parse(event.call.args.text) as { task_id?: unknown; status?: unknown };
       if (args.task_id === taskId && (args.status === 'succeeded' || args.status === 'failed')) return { seq: event.seq, status: args.status };
@@ -119,9 +126,9 @@ export function taskCompletionEvidence(events: SessionEvent[], taskId: string, i
   return null;
 }
 
-async function body(req: http.IncomingMessage): Promise<unknown> {
+async function body(req: http.IncomingMessage, maxBody = MAX_BODY): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = [];
-  for await (const chunk of req) { size += (chunk as Buffer).length; if (size > MAX_BODY) throw new Error('body_too_large'); chunks.push(chunk as Buffer); }
+  for await (const chunk of req) { size += (chunk as Buffer).length; if (size > maxBody) throw new Error('body_too_large'); chunks.push(chunk as Buffer); }
   if (!chunks.length) return {};
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new Error('invalid_json'); }
 }
@@ -145,19 +152,27 @@ async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): P
       if (session.conversationId && !task.conversationIds.includes(session.conversationId)) task.conversationIds.push(session.conversationId);
       const events = await hooks.readEvents(task.sessionId, { from: task.boundInputSeq ?? 0 });
       const binding = task.boundTurnId ? null : deliveredTurnId(events, activeInputId);
-      if (binding) { task.boundInputSeq = binding.seq; task.boundTurnId = binding.turnId; }
+      if (binding) {
+        task.boundInputSeq = binding.seq;
+        task.boundTurnId = binding.turnId;
+        // Keep the prior answer while a follow-up is only queued. Exact delivery is the point
+        // at which that answer stops satisfying the task's current work.
+        task.finalText = null;
+      }
       // Current provider turn is not proof that this task's exact input started it.
       // A recorder restart may lose the binding; fail closed instead of accepting stale evidence.
       const turnId = task.boundTurnId;
       const inputSeq = task.boundInputSeq ?? 0;
       const end = inputSeq !== undefined && turnId ? events.find(event => event.kind === 'turn_end' && event.seq > inputSeq && event.turnId === turnId) : undefined;
       exactTerminal = end?.kind === 'turn_end';
-      task.currentTurnId = turnId && !exactTerminal ? turnId : null;
+      if (turnId) task.currentTurnId = !exactTerminal ? turnId : null;
+      else if (task.currentTurnId && events.some(event => event.kind === 'turn_end' && event.turnId === task.currentTurnId)) task.currentTurnId = null;
       const completion = inputSeq !== undefined && turnId && end?.kind === 'turn_end'
-        ? taskCompletionEvidence(events, task.taskId, inputSeq, turnId, end.seq)
+        ? taskCompletionEvidence(events, task.taskId, inputSeq, turnId, end.seq,
+            binding?.time ?? events.find(event => event.kind === 'user_message' && event.seq === inputSeq)?.time ?? Number.NEGATIVE_INFINITY)
         : null;
       const final = inputSeq !== undefined && turnId ? events.findLast((event): event is Extract<typeof event, { kind: 'assistant_message' }> =>
-        event.kind === 'assistant_message' && event.seq > inputSeq && (!end || event.seq < end.seq) &&
+        event.kind === 'assistant_message' && event.seq > inputSeq &&
         event.turnId === turnId && event.final && event.state === 'final') : undefined;
       if (final) task.finalText = final.message.text;
       if (end?.kind === 'turn_end') {
@@ -199,10 +214,21 @@ async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): P
 export async function refreshControlTaskForTests(task: Task, hooks: ControlRefreshHooks): Promise<Task> {
   return refresh(structuredClone(task), hooks);
 }
+
+/** A new message invalidates prior completion authority. The currently running provider turn
+ * and prior final stay useful until this exact new input actually crosses a delivery boundary. */
+export function beginControlTaskFollowup(task: Task): void {
+  task.boundInputSeq = undefined;
+  task.boundTurnId = undefined;
+}
 async function route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const pathname = url.pathname;
-  if (req.method === 'GET' && pathname === '/v1/health') return json(res, 200, { apiVersion: API, ready: true, capabilities: ['submit', 'status', 'result', 'input', 'cancel'] });
+  if (req.method === 'GET' && pathname === '/v1/health') return json(res, 200, { apiVersion: API, ready: true, capabilities: ['submit', 'status', 'result', 'input', 'cancel', 'codex_readonly'] });
+  if (req.method === 'POST' && pathname === '/v1/codex/readonly') {
+    const result = await runReadonlyCodex(await body(req, READONLY_MAX_BODY));
+    return json(res, 200, result);
+  }
   if (req.method === 'POST' && pathname === '/v1/tasks') {
     const payload = await body(req) as Partial<TaskInput>;
     if (!validId(payload.requestId) || typeof payload.brief !== 'string' || !payload.brief.trim() || payload.brief.length > 16000 ||
@@ -287,7 +313,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
       const input = inputArgs.parse({ id: payload.messageId, projectId: task.projectId, sessionId: task.sessionId, text: payload.text, mode: 'auto', dueAt, model: null, reasoningEffort: null, automation: 'off' });
       const intent = { messageId: payload.messageId!, payloadHash, inputId: input.id, text: input.text, dueAt };
       task.inputIds.push(input.id); (task.messages ??= []).push(intent);
-      task.boundInputSeq = undefined; task.boundTurnId = undefined; task.currentTurnId = null; task.finalText = null; await saveTasks();
+      beginControlTaskFollowup(task); await saveTasks();
       const delivered = await sendDesktopInput(input); return { terminal: false, prior: null, sent: delivered };
     });
     if (sent.terminal) return error(res, 409, 'task_terminal');
