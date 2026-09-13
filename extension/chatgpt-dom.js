@@ -174,7 +174,19 @@ var CLF_DOM = (() => {
     return safe(() => {
       if (!node) return '';
       if (role === 'user') {
+        // Only blocks that nothing else here already contains. `querySelectorAll` also
+        // returns a match nested inside an earlier match, and `text()` reads a whole
+        // subtree, so an inner block was read twice: once as part of its container and
+        // once on its own. The recorded message then carried that passage twice, and every
+        // reader comparing authored text against what was submitted saw a message longer
+        // than the one it sent. `node` itself never counts as a container: the query cannot
+        // return it, and treating it as one would empty this preferred path.
         const parts = [...node.querySelectorAll('.whitespace-pre-wrap')]
+          .filter((part) => {
+            const outer = part.parentElement && part.parentElement.closest &&
+              part.parentElement.closest('.whitespace-pre-wrap');
+            return !outer || outer === node || !(node.contains && node.contains(outer));
+          })
           .filter(part => !part.hasAttribute?.('data-clf-user-text'))
           .map((part) => text(part))
           .filter(Boolean);
@@ -1360,6 +1372,22 @@ var CLF_DOM = (() => {
       for (const turn of turns()) {
         if (turn.role !== 'assistant') continue;
         for (const section of turnNodes(turn)) {
+          // Native Pro failure header observed in Chrome, 2026-09-12: an
+          // expandable button outside authored markdown, not an alert/Retry card.
+          // Keep every occurrence's node identity; old failed turns remain rendered.
+          for (const button of section.querySelectorAll('button[aria-expanded]')) {
+            if (button.closest(`${OWN_SURFACES}, .markdown, [data-message-author-role="user"], [hidden], [inert], [aria-hidden="true"]`) ||
+                button.closest(TURN) !== section || !displayed(button) ||
+                (button.textContent || '').trim() !== 'Thinking failed') continue;
+            let hidden = false;
+            for (let parent = button; parent; parent = parent.parentElement) {
+              const style = getComputedStyle(parent);
+              if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') { hidden = true; break; }
+            }
+            if (hidden) continue;
+            out.push({ text: 'Thinking failed', node: button, turnId: turn.id, turn,
+              reason: 'thinking_failed', recoverable: false });
+          }
           for (const markdown of section.querySelectorAll('.markdown')) {
             const value = text(markdown, 500).replace(/\s+/g, ' ').trim();
             if (!value || !transportFailure(value) || texts.has(value)) continue;
@@ -1937,12 +1965,13 @@ var CLF_DOM = (() => {
         const data = event.data;
         if (event.source !== window || event.origin !== location.origin || data?.source !== 'clf-picker-reply' || data.nonce !== nonce || data.v !== 1) return;
         const state = data.picker;
+        const groupId = value => typeof value === 'string' && /^[a-zA-Z0-9._ -]{1,80}$/.test(value) && value.trim() === value && value.trim();
         const valid = state && typeof state.version === 'string' && Number.isInteger(state.currentBucket) &&
           Array.isArray(state.versions) && state.versions.length > 0 && state.versions.length <= 20 &&
-          state.versions.every(v => typeof v.id === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(v.id) && typeof v.label === 'string' && v.label.length > 0 && v.label.length <= 80) &&
+          state.versions.every(v => groupId(v.id) && typeof v.label === 'string' && v.label.length > 0 && v.label.length <= 80) &&
           Array.isArray(state.choices) && state.choices.length > 0 && state.choices.length <= 12 &&
           state.choices.every(c => Number.isInteger(c.bucket) && typeof c.id === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(c.id) && typeof c.label === 'string' && c.label.length > 0 && c.label.length <= 80 &&
-            typeof c.familyId === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(c.familyId) && typeof c.familyLabel === 'string' && c.familyLabel.length > 0 && c.familyLabel.length <= 80 &&
+            groupId(c.familyId) && typeof c.familyLabel === 'string' && c.familyLabel.length > 0 && c.familyLabel.length <= 80 &&
             ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(c.effort) && typeof c.available === 'boolean') &&
           new Set(state.versions.map(v => v.id)).size === state.versions.length && new Set(state.choices.map(c => c.bucket)).size === state.choices.length &&
           state.versions.some(v => v.id === state.version) && state.choices.some(c => c.bucket === state.currentBucket);
@@ -1985,6 +2014,11 @@ var CLF_DOM = (() => {
     return {
       state,
       async open() {
+        // A cold home editor mounts before its native Chat/Work picker. Workers
+        // enter here directly, without the New Chat reuse/catalog preparation.
+        // Wait for that surface, then use the same owned Chat transition before
+        // interpreting account choices. Work's picker is not a denied Chat model.
+        if (!await wait(trigger, 15000) || !await prepareChatModelSurface(stillCurrent)) return null;
         if (!picker()) { const button = await wait(trigger, 15000); if (!key(button, 'Enter') || !await wait(picker)) return null; }
         return state();
       },
@@ -2064,6 +2098,14 @@ var CLF_DOM = (() => {
       before.chat.click(); check();
     });
   }
+  function collectModelChoices(result, state) {
+    for (const choice of state.choices.filter(c => c.available)) {
+      const entry = result.get(choice.familyId) || { id: choice.familyId, label: choice.familyLabel, efforts: [], aliases: [] };
+      if (!entry.efforts.includes(choice.effort)) entry.efforts.push(choice.effort);
+      if (!entry.aliases.includes(choice.id)) entry.aliases.push(choice.id);
+      result.set(choice.familyId, entry);
+    }
+  }
   async function inspectModelSettings(stillCurrent = () => true, failure = () => {}) {
     const ui = modelPickerAccess(stillCurrent), original = await ui.open();
     if (!original) { ui.close(); failure('picker_unavailable'); return null; }
@@ -2075,14 +2117,7 @@ var CLF_DOM = (() => {
       for (const version of original.versions) {
         const state = await ui.version(version.id);
         if (!state) throw new Error('model_unconfirmed');
-        for (const choice of state.choices.filter(c => c.available)) {
-          // A provider family owns its execution lanes. Instant/Thinking/Pro slugs
-          // are selectable pairs within that family, not separate model rows.
-          const entry = result.get(choice.familyId) || { id: choice.familyId, label: choice.familyLabel, efforts: [], aliases: [] };
-          if (!entry.efforts.includes(choice.effort)) entry.efforts.push(choice.effort);
-          if (!entry.aliases.includes(choice.id)) entry.aliases.push(choice.id);
-          result.set(choice.familyId, entry);
-        }
+        collectModelChoices(result, state);
       }
     } catch { failure('model_unconfirmed'); result.clear(); }
     finally {

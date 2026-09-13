@@ -59,11 +59,9 @@ const RETRY_ALARM = 'clf-bridge-drain';
  * exempt, which is the trap: 0.25 works on this machine and silently becomes 0.5 for everybody
  * who installs a release.
  *
- * So this is a sleeping-service-worker fallback with an honest bound, not a fast path. The app
- * arms a repair fifteen to sixty seconds into an unattributed incident, depending on how many
- * chats are still suspect; the browser sees it on the next pass, which is up to thirty seconds
- * later. Anything better would need a keepalive, an offscreen document or a second timer
- * framework to beat a browser API floor, and a broken turn is not worth that.
+ * The app owns repair deadlines and normally wakes this worker over its socket.
+ * This alarm is the fallback when that wake is unavailable; it can add up to
+ * thirty seconds before the next collection pass.
  *
  * That floor is also why one pass collects *every* repair now due rather than one: the app can
  * decide three at the same instant, and handing them out one per pass would spread three
@@ -1903,20 +1901,13 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
     }
     if (input.close === true && input.lifetime === 'temporary-planner') {
       if (!tab || tab.pinned) continue;
-      // Preserve the warm planner until newer app work has an actual browser tab.
-      // Terminal input metadata is the lifecycle authority, including after restart;
-      // unrelated personal/catalog tabs are not a replacement for this handoff.
-      const replacements = Array.isArray(input.replacements) ? input.replacements : [];
-      const replacement = tabs.find(candidate => candidate.id !== tab.id && replacements.some(next => matchesInput(next, candidate)));
-      if (!replacement && input.retire !== true) continue;
       const documentId = tabDocuments[String(tab.id)];
       const source = { tab: tab.id, documentId, navigationEpoch: tabEpochs[String(tab.id)] };
       try {
         const proof = await tabReply(tab.id, { type: 'clf-close-temporary-planner', id: input.id, owner: input.owner }, { documentId });
         const current = await chrome.tabs.get(tab.id);
-        const successor = replacement ? await chrome.tabs.get(replacement.id) : null;
-        if (proof?.safe === true && ownsDocument(source) && !current.pinned && !current.pendingUrl && String(current.url || '').includes(marker) &&
-            (input.retire === true || (successor && replacements.some(next => matchesInput(next, successor))))) await chrome.tabs.remove(tab.id);
+        if (proof?.safe === true && ownsDocument(source) && !current.pinned && !current.pendingUrl && new URL(current.url).searchParams.get('cos-input') === input.id &&
+            new URL(current.url).searchParams.get('temporary-chat') === 'true') await chrome.tabs.remove(tab.id);
       } catch { /* only the exact still-owned temporary document may close */ }
       continue;
     }
@@ -1961,6 +1952,23 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
             tab = await createChatTab(url, background);
             await elect(input.id, { tab: tab.id, stage: 'ready', fallbackUsed: true });
             tabs.push(tab);
+            // A failed New Chat transition can leave the borrowed managed page
+            // empty. Its conversation ownership is gone, so ordinary pruning can
+            // never retire it. The same preparation owns this exact one-hop home;
+            // close it only after the replacement exists and a fresh draft check.
+            if (reusable.has(conversationFromUrl(candidate.url)) && latest.url === 'https://chatgpt.com/' &&
+                tabEpochs[String(candidate.id)] === source.navigationEpoch + 1) {
+              const abandoned = { ...source, navigationEpoch: source.navigationEpoch + 1 };
+              try {
+                const proof = await tabReply(candidate.id, { type: 'clf-tab-close-check', conversationId: null }, { documentId: source.documentId });
+                const current = await chrome.tabs.get(candidate.id);
+                if (proof?.safe === true && proof.conversationId === null && proof.navigationEpoch === abandoned.navigationEpoch &&
+                    ownsDocument(abandoned) && current && !current.pinned && !current.pendingUrl && current.url === 'https://chatgpt.com/') {
+                  await chrome.tabs.remove(candidate.id);
+                  tabs = tabs.filter(row => row.id !== candidate.id);
+                }
+              } catch { /* A draft, navigation or missing proof keeps the document. */ }
+            }
           }
           break;
         }
@@ -1973,6 +1981,7 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       continue;
     }
     offerDesktopInput(tab.id, { type: 'clf-desktop-input', id: input.id, conversationId: target,
+      ...(input.silenceTurnId ? { silenceTurnId: input.silenceTurnId } : {}),
       ...(input.directTurn ? { directTurn: input.directTurn } : {}), ...(input.lifetime ? { lifetime: input.lifetime } : {}) });
   }
 }
@@ -2309,6 +2318,7 @@ async function maintainOnce() {
     .map((entry) => ({
       conversationId: cleanConversationId(entry && entry.conversationId),
       token: entry && typeof entry.token === 'string' ? entry.token : '',
+      requiresClaim: entry?.requiresClaim === true,
       focus: Boolean(entry && entry.focus === true)
     }))
     .filter((entry) => entry.conversationId && entry.token);
@@ -2398,7 +2408,7 @@ async function maintainOnce() {
 }
 
 async function performBrowserRepairs(repairs, policy) {
-  for (const { conversationId, token, focus } of repairs) {
+  for (const { conversationId, token, focus, requiresClaim } of repairs) {
     // Re-scanned per repair rather than reused from above. Earlier entries in this same batch
     // may have created a tab, and the scan has to be the state immediately before the action or
     // the duplicate rule below is deciding on a tab list that no longer exists.
@@ -2417,14 +2427,20 @@ async function performBrowserRepairs(repairs, policy) {
     const [target] = (owned.length > 0 ? owned : candidates).sort((a, b) => a.id - b.id);
     const repairAction = target ? 'reloaded' : 'reopened';
     try {
+      if (!target && policy.browserOnly === true) continue;
       // Select the working tab within Chrome without stealing OS focus from the
       // desktop app. Tab selection and window activation are separate operations.
       if (target && focus) {
         await chrome.tabs.update(target.id, { active: true });
       }
+      // The tab scan can yield while exact MCP evidence clears an attribution
+      // incident. Claim this server-held attempt only at the browser action boundary.
+      if (requiresClaim) {
+        const claim = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({ token }) });
+        if (!claim.ok || claim.data?.allowed !== true) continue;
+      }
       if (target) await chrome.tabs.reload(target.id);
       else {
-        if (policy.browserOnly === true) continue;
         await createChatTab(`https://chatgpt.com/c/${encodeURIComponent(conversationId)}`, policy.background === true, focus);
       }
     } catch {
@@ -2705,8 +2721,21 @@ const HANDLERS = {
       return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
     }
     const result = await call(typeof message.partial === 'string' ? '/input/progress' : typeof message.response === 'string' ? '/input/answer' : message.fail === true ? '/input/fail' : message.ack === true ? '/input/ack' : '/input/claim', {
-      method: 'POST', body: JSON.stringify({ id, owner, conversationId, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined })
+      method: 'POST', body: JSON.stringify({ id, owner, conversationId, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined })
     });
+    if (typeof message.response === 'string' && message.lifetime === 'temporary-planner' && result.ok && result.data?.ok === true && ownsDocument(source)) {
+      // Acceptance retires this exact helper immediately. Fresh page proof still
+      // protects generation, a user draft, pinning and document/navigation changes.
+      try {
+        const current = await chrome.tabs.get(source.tab);
+        if (!current.pinned && !current.pendingUrl && ownsDocument(source) && current.url === tab.url) {
+          const proof = await tabReply(source.tab, { type: 'clf-close-temporary-planner', id, owner }, { documentId: source.documentId });
+          const latest = await chrome.tabs.get(source.tab);
+          if (proof?.safe === true && ownsDocument(source) && !latest.pinned && !latest.pendingUrl && latest.url === tab.url &&
+              new URL(latest.url).searchParams.get('cos-input') === id) await chrome.tabs.remove(source.tab);
+        }
+      } catch { /* terminal outbox maintenance can retry the same exact safe close */ }
+    }
     if (typeof message.response === 'string' && message.lifetime !== 'temporary-planner' && result.ok && result.data?.ok === true && ownsDocument(source)) {
       // Accepting the answer retires the helper's work, not the user's tab or draft.
       // Use the same live page proof as maintenance before the final physical close.
@@ -3038,8 +3067,16 @@ const HANDLERS = {
     // ChatGPT assigns /c/B through an SPA transition. Read Chrome's current tab and
     // retain the exact document/epoch lease across that await before accepting its route.
     const tab = await chrome.tabs.get(source.tab).catch(() => null);
-    if (!ownsDocument(source) || !tab || tab.pendingUrl || tab.status === 'loading' ||
-        !isChatGptUrl(tab.url) || conversationFromUrl(tab.url) !== cleanConversationId(message.conversationId))
+    if (!ownsDocument(source) || !tab || !isChatGptUrl(tab.url))
+      return { ok: false, error: 'stale_document' };
+    const named = cleanConversationId(message.conversationId);
+    // Destination permits precede the first Send and therefore have no chat route.
+    // Loading that same leased document is normal; leaving it for another route is not.
+    // Named source checkpoints still require a fully settled matching conversation.
+    if (named
+      ? (tab.pendingUrl || tab.status === 'loading' || conversationFromUrl(tab.url) !== named)
+      : (conversationFromUrl(tab.url) !== null ||
+          (tab.pendingUrl && tab.pendingUrl !== tab.url)))
       return { ok: false, error: 'stale_document' };
     const sourceUrl = tab.url;
     const result = await call('/compact', {
@@ -3051,6 +3088,8 @@ const HANDLERS = {
         cancel: message.cancel === true,
         ticket: message.ticket === true,
         automatic: message.automatic === true,
+        ...((message.destinationAttempt === true || message.destinationDispatch === true || message.destinationLost === true)
+          ? { commandId: String(message.commandId || ''), client: String(message.client || '') } : {}),
         // The capture. `token` names the transaction the page was given when it marked the
         // compaction turn, and `summary` is that turn's own answer. Both are forwarded
         // verbatim and only together: the app refuses a brief whose token does not name an
@@ -3096,6 +3135,7 @@ const HANDLERS = {
         conversationId,
         turnId: String(message.turnId || ''),
         clientId: String(source.tab),
+        ...(message.nativeBusy === true ? { nativeBusy: true } : {}),
         ...(message.terminalRequired === true ? { terminalRequired: true } : {})
       })
     });
@@ -3142,6 +3182,7 @@ const HANDLERS = {
       body: JSON.stringify({
         conversationId: message.conversationId,
         token: String(message.token || ''),
+        ...(message.nativeBusy === true ? { nativeBusy: true } : {}),
         clientId: String(source.tab)
       })
     });
@@ -3221,6 +3262,7 @@ const HANDLERS = {
     const conversationId = cleanConversationId(tabConversations[key]) ?? requestedConversation;
     const body = {};
     if (typeof message.autoCompact === 'boolean') body.autoCompact = message.autoCompact;
+    if (typeof message.loopAfterTurn === 'boolean') body.loopAfterTurn = message.loopAfterTurn;
     // Goal and Loop are one setting behind two switches, and the app refuses a body carrying
     // both. Pass through whichever one the sheet actually moved.
     if (typeof message.goal === 'boolean') body.goal = message.goal;

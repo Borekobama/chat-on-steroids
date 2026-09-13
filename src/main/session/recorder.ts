@@ -28,7 +28,7 @@ import type {
   ToolOutcome,
   TurnOutcome
 } from '../../shared/session.js';
-import { estimateTokens, originTitle } from '../../shared/session.js';
+import { estimateTokens, originTitle, workSequence } from '../../shared/session.js';
 import { getConfig } from '../config.js';
 import { logInfo, logWarn } from '../logger.js';
 import { redactCredentialText } from '../redaction.js';
@@ -40,6 +40,8 @@ import {
   MAX_USER_MESSAGE_CHARS,
   MAX_ASSET_BYTES,
   appendEvent,
+  recordProcessCall,
+  completeProcessCall,
   observeSessionModel,
   conversationAttachment,
   createSession,
@@ -482,7 +484,7 @@ interface StoredHistory {
   knownTurnEnds: Set<string>;
   /** Durable start time of the newest turn that ended in the recovered tail. */
   lastTurnStartedAt: number | null;
-  /** Newest still-open local generation, so a reloaded page can adopt it after app restart. */
+  /** Current generation from lifecycle replay; older unended turns are history, not active work. */
   activeTurnId: string | null;
   /** Durable start time of activeTurnId. */
   activeTurnStartedAt: number | null;
@@ -507,6 +509,8 @@ async function storedHistory(sessionId: string): Promise<StoredHistory> {
   const knownTurnEnds = new Set<string>();
   let lastTurnEndedAt: number | null = null;
   let lastTurnStartedAt: number | null = null;
+  let activeTurnId: string | null = null;
+  let activeTurnStartedAt: number | null = null;
   const turnStarts = new Map<string, number>();
   const pageTools = new Map<string, ProgressRecord>();
   try {
@@ -523,11 +527,20 @@ async function storedHistory(sessionId: string): Promise<StoredHistory> {
           knownTurnEnds.delete(event.turnId);
           openTurns.add(event.turnId);
           turnStarts.set(event.turnId, event.time);
+          // Match live recording: each committed start replaces the current generation.
+          // An older turn missing its end remains forensic history; it must not become
+          // active again after a later turn completes and the user closes/revisits the chat.
+          activeTurnId = event.turnId;
+          activeTurnStartedAt = event.time;
         }
       } else if (event.kind === 'turn_end') {
         if (event.turnId) {
           knownTurnEnds.add(event.turnId);
           openTurns.delete(event.turnId);
+          if (activeTurnId === event.turnId) {
+            activeTurnId = null;
+            activeTurnStartedAt = null;
+          }
         }
         if (lastTurnEndedAt === null || event.time >= lastTurnEndedAt) {
           lastTurnEndedAt = event.time;
@@ -552,16 +565,6 @@ async function storedHistory(sessionId: string): Promise<StoredHistory> {
     }
   } catch (err) {
     logWarn(`could not read stored session history: ${(err as Error).message}`);
-  }
-  let activeTurnId: string | null = null;
-  let activeTurnStartedAt: number | null = null;
-  for (const turnId of openTurns) {
-    const startedAt = turnStarts.get(turnId) ?? null;
-    if (startedAt === null) continue;
-    if (activeTurnStartedAt === null || startedAt > activeTurnStartedAt) {
-      activeTurnId = turnId;
-      activeTurnStartedAt = startedAt;
-    }
   }
   return { openTurns, knownTurnStarts, knownTurnEnds, lastTurnStartedAt, activeTurnId, activeTurnStartedAt, pageTools };
 }
@@ -1312,10 +1315,23 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
     const authoredResultText = redactResult(input.tool, textParts.join('\n'));
     const resultText = input.protocolResult === undefined ? authoredResultText : redactResult(input.tool, safeJson(input.protocolResult));
     const assets: AssetRef[] = [...evidence.assets];
+    let missingImages = 0;
+    const imageRecordingReasons = new Set<string>();
     for (const part of input.content) {
-      if (part.type !== 'image' || !part.data) continue;
-      const asset = await storeImage(sessionId, part.data, part.mimeType ?? 'image/png');
-      if (asset) assets.push(asset);
+      if (part.type !== 'image') continue;
+      try {
+        assets.push(await storeImage(sessionId, part.data ?? '', part.mimeType ?? 'image/png'));
+      } catch (err) {
+        missingImages++;
+        // Only fixed storage diagnostics may enter the transcript; arbitrary fs errors
+        // can contain private paths. Recording failure never changes the MCP payload.
+        const message = err instanceof Error ? err.message : '';
+        const reason = message === 'Global session asset quota exceeded' || message === 'Session asset quota exceeded'
+          ? 'recording storage limit reached'
+          : message === 'Session image exceeds the recording limit' ? 'recording image size limit' : 'recording write failed';
+        imageRecordingReasons.add(reason);
+        logWarn(`session image not stored: ${reason}`);
+      }
     }
 
     const summary: ActivitySummary = summarizeToolCall({
@@ -1326,8 +1342,15 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       durationMs: input.durationMs,
       resultHead: authoredResultText.split('\n', 1)[0] ?? ''
     });
+    if (missingImages) {
+      const notice = `${missingImages} image preview(s) not saved: ${[...imageRecordingReasons].join('; ')}. Image content remains in the tool response.`;
+      summary.detail = summary.detail ? `${summary.detail} · ${notice}` : notice;
+      if (summary.tone !== 'bad') summary.tone = 'warn';
+    }
 
     const call: ToolCallRecord = {
+      ...(target.attribution === 'request_id' && target.conversationId && evidence.processCompletion && evidence.processSessionId && input.tool === 'exec_command'
+        ? { process: { sessionId: evidence.processSessionId } } : {}),
       ...callModel,
       callId: randomUUID(),
       tool: input.tool,
@@ -1350,7 +1373,8 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       ...(input.endsActivity === true ? { endsActivity: true as const } : {})
     };
 
-    await appendEvent(sessionId, {
+    const recordCall = call.process ? recordProcessCall : appendEvent;
+    await recordCall(sessionId, {
       time: input.startedAt,
       source: 'mcp',
       kind: 'tool_call',
@@ -1358,13 +1382,24 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       ...(eventAgent ? { agent: eventAgent } : {}),
       ...(target.turnId ? { turnId: target.turnId } : {})
     });
-    const reopenedTurnId = await reopenFalselyEndedTurn(
+    if (call.process && evidence.processCompletion) {
+      // Bind once to the recorded call, never look up a reusable numeric process id.
+      // A process that exited during recorder admission resolves this same promise.
+      void evidence.processCompletion.then(completion => {
+        const work = completeProcessCall(sessionId, call.callId, completion)
+          .then(() => notifyChanged())
+          .catch(() => logWarn('session recorder could not store process completion'));
+        pendingRecordings.add(work);
+        void work.then(() => pendingRecordings.delete(work));
+      });
+    }
+    const reopenedTurnId = await serializeObservations(target.conversationId ?? sessionId, () => reopenFalselyEndedTurn(
       sessionId,
       target.conversationId,
       input.requestId ?? null,
       input.startedAt,
       eventAgent
-    );
+    ));
     notifyChanged();
     try {
       const filed = await getSession(sessionId);
@@ -1392,6 +1427,24 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
     logWarn(`session recorder could not store a tool call: ${(err as Error).message}`);
     return null;
   }
+}
+
+/** A fresh exact observation can disprove a failed view, including after reload/restart. */
+async function reopenThinkingFailure(sessionId: string, live: LiveConversation | undefined, at: number,
+  owner?: string): Promise<string | null> {
+  if (!live || live.turnId) return null;
+  const [boundary] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end', 'user_message'] });
+  if (live.turnId || boundary?.kind !== 'turn_end' || boundary.reason !== 'thinking_failed' ||
+      !boundary.turnId || (owner && boundary.turnId !== owner) || at <= boundary.time) return null;
+  await appendEvent(sessionId, { source: 'app', time: at, kind: 'turn_start', turnId: boundary.turnId,
+    detail: 'fresh work resumed the same turn after its native view failed' });
+  live.knownTurnEnds.delete(boundary.turnId);
+  live.openTurns.add(boundary.turnId);
+  live.turnId = boundary.turnId;
+  live.turnStartedAt = live.lastTurnStartedAt ?? at;
+  live.lastTurnOutcome = null;
+  live.endedTurn = null;
+  return boundary.turnId;
 }
 
 /**
@@ -1423,6 +1476,11 @@ async function reopenFalselyEndedTurn(
   if (!conversationId || !requestId) return null;
   const live = conversations.get(conversationId);
   if (!live || live.sessionId !== sessionId) return null;
+  const failed = await reopenThinkingFailure(sessionId, live, startedAt);
+  if (failed) {
+    live.turnRequestIds.add(requestId);
+    return failed;
+  }
   if (live.turnStartedAt !== null) {
     live.turnRequestIds.add(requestId);
     return null;
@@ -1571,16 +1629,10 @@ async function targetSession(target: Target): Promise<string | null> {
   return ensureUnattributedSession();
 }
 
-async function storeImage(sessionId: string, base64: string, mimeType: string): Promise<AssetRef | null> {
-  try {
-    const data = Buffer.from(base64, 'base64');
-    if (data.length === 0 || data.length > MAX_ASSET_BYTES) return null;
-    const asset = await writeAsset(sessionId, data, mimeType);
-    return asset;
-  } catch (err) {
-    logWarn(`session asset not stored: ${(err as Error).message}`);
-    return null;
-  }
+async function storeImage(sessionId: string, base64: string, mimeType: string): Promise<AssetRef> {
+  const data = Buffer.from(base64, 'base64');
+  if (data.length === 0 || data.length > MAX_ASSET_BYTES) throw new Error('Session image exceeds the recording limit');
+  return writeAsset(sessionId, data, mimeType);
 }
 
 // ------------------------------------------------------- extension events
@@ -1621,6 +1673,8 @@ export interface ChatObservation {
   /** Internal React conversation id used only to cross-check the URL conversation id. */
   fiberConversationId?: string;
   outcome?: TurnOutcome;
+  /** Exact native failure; closes input immediately, recovery separately owns listening. */
+  reason?: 'thinking_failed';
   detail?: string;
   /** Browser terminal proof; app-owned Goal policy is applied only after this is durable. */
   goalEligible?: boolean;
@@ -1751,11 +1805,16 @@ export function recordChatObservations(
   // work below rethrows it to the journal owner, which retains the batch for its normal retry.
   void ownership?.catch(() => undefined);
   const transcript = hasEvidence ? observations.filter((item) => item.kind !== 'tool_evidence') : observations;
-  const prior = observationChains.get(conversationId) ?? Promise.resolve();
-  const work = prior.then(async () => {
+  return serializeObservations(conversationId, async () => {
     await ownership;
     return recordChatObservationsNow(conversationId, transcript, agent);
   });
+}
+
+/** Transcript and MCP lifecycle changes share the same per-conversation publication order. */
+function serializeObservations<T>(conversationId: string, action: () => Promise<T>): Promise<T> {
+  const prior = observationChains.get(conversationId) ?? Promise.resolve();
+  const work = prior.then(action);
   const tracked = work.then(
     () => undefined,
     () => undefined
@@ -1975,8 +2034,16 @@ async function recordChatObservationsNow(
         // DOM after restart cannot renew work, nor can an old message borrow a
         // newer page turn. Preserve the revision while using its canonical owner
         // and the recorder's terminal boundary to decide activity.
-        const workingActivity = state !== 'final' && item.activeNow === true &&
-          (!canonicalTurn || canonicalTurn === live?.turnId) &&
+        const [uncertainEnd] = canonicalTurn && !live?.turnId
+          ? await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end', 'user_message'] }) : [];
+        // A fresh exact interim can resume an uncertain failure without inventing
+        // a new user turn. Old messages and explicit completed/stopped turns cannot.
+        const resumedUncertainTurn = uncertainEnd?.kind === 'turn_end' && uncertainEnd.turnId === canonicalTurn &&
+          uncertainEnd.outcome !== 'completed' && uncertainEnd.outcome !== 'stopped' && item.time > uncertainEnd.time;
+        // HTML, provider identity and authored-time promotion revise history, not work.
+        // In particular a post-failure Fiber backfill must not reopen the dead turn.
+        const workingActivity = written.contentChanged && state !== 'final' && item.activeNow === true &&
+          (!canonicalTurn || canonicalTurn === live?.turnId || resumedUncertainTurn) &&
           !(live?.turnStartedAt === null && (live.lastTurnOutcome === 'stopped' || live.lastTurnOutcome === 'completed'));
         if (state === 'final' && written.event.kind === 'assistant_message' && canonicalTurn && recoverableTurns.has(canonicalTurn) &&
             !explicitEnds.has(canonicalTurn) && live?.turnId === canonicalTurn) {
@@ -2003,6 +2070,21 @@ async function recordChatObservationsNow(
           recoveredGoalSeen = true;
         }
         if (!written.changed) continue;
+        if (state === 'final' && written.event.kind === 'assistant_message' && written.event.providerMessageId &&
+            uncertainEnd?.kind === 'turn_end' && uncertainEnd.reason === 'thinking_failed' &&
+            uncertainEnd.turnId === canonicalTurn && (written.event.finalContentSeq ?? written.event.seq) > uncertainEnd.seq &&
+            live && !live.turnId && runningToolCalls(conversationId) === 0) {
+          await appendEvent(sessionId, { ...base, kind: 'turn_end', turnId: canonicalTurn, outcome: 'completed',
+            detail: 'the exact native final superseded the failed view' });
+          live.lastTurnOutcome = 'completed';
+          activity.endedTurnId = canonicalTurn;
+          activity.terminal = true;
+          activity.meaningful = true;
+        }
+        if (workingActivity && canonicalTurn &&
+            await reopenThinkingFailure(sessionId, live, item.time, canonicalTurn)) {
+          activity.terminal = false;
+        }
         if (terminalActivity || workingActivity) { activity.meaningful = true; activity.at = Math.max(activity.at ?? 0, item.time); }
         if (terminalActivity) activity.terminal = true;
         if (workingActivity) activity.working = true;
@@ -2012,12 +2094,19 @@ async function recordChatObservationsNow(
         const newlyObserved = !!live && !!item.messageId && !live.pageTools.has(item.messageId);
         const written = await recordPageTool(sessionId, live, item, base);
         if (!written) continue;
+        if (item.turnId && await reopenThinkingFailure(sessionId, live, item.time, item.turnId)) {
+          activity.terminal = false;
+          activity.working = true;
+          activity.meaningful = true;
+          activity.at = Math.max(activity.at ?? 0, item.time);
+        }
         if (newlyObserved && item.turnId === live?.turnId && live.turnStartedAt !== null && item.time >= live.turnStartedAt) {
           activity.toolStartedAt = Math.max(activity.toolStartedAt ?? 0, item.time);
         }
         break;
       }
       case 'chat_error': {
+        if (item.reason === 'thinking_failed' && !item.turnId) continue;
         // Documents identify rendered nodes, not a shared notice: remounts, duplicate
         // tabs and journal retries can all report the same problem. Coalesce a short
         // burst here, inside the conversation's serialized writer, using committed history
@@ -2026,12 +2115,16 @@ async function recordChatObservationsNow(
         const text = (item.text ?? '').replace(/\s+/g, ' ').trim();
         const recent = await readRecentEvents(sessionId, 32, { kinds: ['chat_error'], maxBytes: 256 * 1024 });
         if (recent.some(event => event.kind === 'chat_error' &&
-            Math.abs(item.time - event.time) <= 30_000 &&
+            (Math.abs(item.time - event.time) <= 30_000 ||
+              (item.reason === 'thinking_failed' && event.reason === item.reason && event.turnId === item.turnId)) &&
             (item.blocking === true || (event.turnId ?? '') === (item.turnId ?? '')) &&
             event.message.text.replace(/\s+/g, ' ').trim() === text)) continue;
         await appendEvent(sessionId, {
           ...base,
           kind: 'chat_error',
+          ...(item.reason === 'thinking_failed' ? { reason: item.reason } : {}),
+          ...(typeof item.recoverable === 'boolean' ? { recoverable: item.recoverable } : {}),
+          ...(typeof item.blocking === 'boolean' ? { blocking: item.blocking } : {}),
           message: await storeText(sessionId, item.text ?? '', 2000)
         });
         activity.meaningful = true; activity.at = Math.max(activity.at ?? 0, item.time);
@@ -2072,10 +2165,17 @@ async function recordChatObservationsNow(
         // the turn it names, but it must not tear down a newer active generation.
         if (!item.turnId) continue;
         if (live?.knownTurnEnds.has(item.turnId)) continue;
+        if (live?.turnId === item.turnId) {
+          const [latest] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
+          // A replay of the pre-reopen end cannot undo newer app-owned work.
+          if (latest?.kind === 'turn_start' && latest.source === 'app' && latest.turnId === item.turnId &&
+              latest.time >= item.time) continue;
+        }
         await appendEvent(sessionId, {
           ...base,
           kind: 'turn_end',
           outcome: item.outcome ?? 'unknown',
+          ...(item.outcome === 'failed' && item.reason === 'thinking_failed' ? { reason: item.reason } : {}),
           ...(item.detail ? { detail: item.detail } : {})
         });
         // As above, durable journal state owns idempotency; in-memory state follows it.
@@ -2119,12 +2219,12 @@ async function recordChatObservationsNow(
       ]) : [[], []];
   // Repair a previously recorded false reopen only from its durable A/end/A
   // lineage and an exact native final. A page-authored new start is new work.
-  const [lastBoundary, priorBoundary] = recoveredFinal?.native && latestWork && latestWork.seq >= recoveredFinal.seq
+  const [lastBoundary, priorBoundary] = recoveredFinal?.native && latestWork && workSequence(latestWork) >= recoveredFinal.seq
     ? await readRecentEvents(sessionId, 2, { kinds: ['turn_start', 'turn_end'] }) : [];
   const nativeReopen = recoveredFinal?.native && lastBoundary?.kind === 'turn_start' && lastBoundary.source === 'app' &&
     lastBoundary.turnId === recoveredFinal.turnId && priorBoundary?.kind === 'turn_end' &&
     priorBoundary.turnId === recoveredFinal.turnId && priorBoundary.outcome === 'completed';
-  if (recoveredFinal && latestWork && (latestWork.seq < recoveredFinal.seq || nativeReopen) &&
+  if (recoveredFinal && latestWork && (workSequence(latestWork) < recoveredFinal.seq || nativeReopen) &&
       (!latestUser || (latestUser.kind === 'user_message' && (latestUser.origin ?? latestUser.seq) < recoveredFinal.origin)) &&
       runningToolCalls(conversationId) === 0 && live?.turnId === recoveredFinal.turnId && live.openTurns.has(recoveredFinal.turnId)) {
     const { turnId, time } = recoveredFinal;

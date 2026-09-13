@@ -303,39 +303,48 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     await h.inspectModels({ ...request, nonce: secondId }, true);
     expect(h.create).toHaveBeenCalledTimes(2);
   });
-  it('does not close a temporary planner when its answer is accepted', async () => {
+  it('immediately closes an exact temporary helper after its answer is accepted', async () => {
     const h = await worker([]);
     const url = `https://chatgpt.com/?temporary-chat=true&cos-input=${firstId}`;
     h.tabs.push({ id: 7, url });
     const sender = { tab: { id: 7 }, documentId: 'planner', frameId: 0, url };
     const owner = await h.authorizeDocument(sender, { navigationEpoch: 1 });
+    h.sendMessage.mockResolvedValue({ safe: true } as never);
     expect((await h.desktopInput({ id: firstId, owner: '7:planner:1', lifetime: 'temporary-planner', response: 'Plan complete' }, sender, owner)).ok).toBe(true);
+    expect(h.remove).toHaveBeenCalledWith(7);
+  });
+  it.each(['draft', 'pinned', 'pinned-during-proof', 'navigation', 'document', 'rejected'])('keeps a temporary helper after answer publication when %s prevents closing', async reason => {
+    const h = await worker([]);
+    const url = `https://chatgpt.com/?temporary-chat=true&cos-input=${firstId}`;
+    h.tabs.push({ id: 7, url, pinned: reason === 'pinned' });
+    const sender = { tab: { id: 7 }, documentId: 'planner', frameId: 0, url };
+    const owner = await h.authorizeDocument(sender, { navigationEpoch: 1 });
+    if (reason === 'rejected') h.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: false }) });
+    h.sendMessage.mockImplementation(async () => {
+      if (reason === 'pinned-during-proof') h.tabs[0]!.pinned = true;
+      if (reason === 'navigation') h.tabs[0]!.url = 'https://chatgpt.com/';
+      if (reason === 'document') await h.authorizeDocument({ ...sender, documentId: 'new-document' }, { navigationEpoch: 1 });
+      return { safe: reason !== 'draft' } as never;
+    });
+    await h.desktopInput({ id: firstId, owner: '7:planner:1', lifetime: 'temporary-planner', response: 'Plan complete' }, sender, owner);
     expect(h.remove).not.toHaveBeenCalled();
   });
-  it('keeps the completed planner until a newer app-work tab exists, then closes only the planner', async () => {
-    const work = { id: secondId, conversationId: null };
-    const cleanup = { id: firstId, conversationId: null, owner: '7:planner:1', lifetime: 'temporary-planner', close: true, replacements: [work] };
-    const inputs = [cleanup];
-    const h = await worker(inputs);
+  it('closes a terminal temporary helper without waiting for replacement app work', async () => {
+    const h = await worker([{ id: firstId, conversationId: null, owner: '7:planner:1', lifetime: 'temporary-planner', close: true } as any]);
     h.tabs.push({ id: 7, url: `https://chatgpt.com/?temporary-chat=true&cos-input=${firstId}` }, { id: 8, url: `https://chatgpt.com/c/${firstId}` });
     await h.authorizeDocument({ tab: { id: 7 }, documentId: 'planner', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
     h.sendMessage.mockImplementation(async (_id, message) => message.type === 'clf-close-temporary-planner' ? { safe: true } as never : { ok: true });
-    await h.maintain(); expect(h.remove).not.toHaveBeenCalled();
-    // The existing unrelated chat is not a successor. Opening the queued app input is.
-    inputs.unshift(work as typeof cleanup);
     await h.maintain();
-    expect(h.create).toHaveBeenCalledTimes(1);
     expect(h.remove.mock.calls).toEqual([[7]]);
-    expect(h.create.mock.invocationCallOrder[0]).toBeLessThan(h.remove.mock.invocationCallOrder[0]!);
+    expect(h.create).not.toHaveBeenCalled();
   });
-  it.each(['draft', 'replacement-closed', 'navigation'])('keeps a retiring planner when %s prevents safe handoff', async reason => {
+  it.each(['draft', 'navigation'])('keeps a retiring helper when %s prevents safe closure', async reason => {
     const work = { id: secondId, conversationId: null };
     const h = await worker([{ id: firstId, conversationId: null, owner: '7:planner:1', lifetime: 'temporary-planner', close: true, replacements: [work] } as any]);
     h.tabs.push({ id: 7, url: `https://chatgpt.com/?temporary-chat=true&cos-input=${firstId}` }, { id: 8, url: `https://chatgpt.com/?cos-input=${secondId}` });
     await h.authorizeDocument({ tab: { id: 7 }, documentId: 'planner', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
     h.sendMessage.mockImplementation(async (_id, message) => {
       if (message.type !== 'clf-close-temporary-planner') return { ok: true };
-      if (reason === 'replacement-closed') h.tabs.pop();
       if (reason === 'navigation') h.tabs[0]!.url = 'https://chatgpt.com/';
       return { safe: reason !== 'draft' } as never;
     });
@@ -715,6 +724,35 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     h.tabs.length = 0;
     await h.maintain();
     expect(h.create).toHaveBeenCalledTimes(reason === 'explicit-failure' ? 1 : 0);
+  });
+  it.each(['empty', 'draft', 'navigated', 'pinned', 'personal', 'epoch-changed'])('retires an abandoned managed New Chat after fallback only with exact empty proof (%s)', async mode => {
+    const h = await worker([{ id: firstId, conversationId: null }]);
+    const initial = mode === 'personal' ? 'https://chatgpt.com/' : `https://chatgpt.com/c/${secondId}`;
+    h.tabs.push({ id: 7, url: initial });
+    const sender = { tab: { id: 7 }, documentId: 'reuse-source', frameId: 0, url: initial };
+    await h.authorizeDocument(sender, { navigationEpoch: 1 });
+    h.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ app: 'chat-on-steroids', bridge: BRIDGE_PROTOCOL, compatible: true, paired: true, ok: true,
+      inputs: [{ id: firstId, conversationId: null }], reusableConversations: [secondId] }) });
+    h.sendMessage.mockImplementation(async (_id, message): Promise<any> => {
+      if (message.type === 'clf-input-reuse-state') return { safe: true, navigationEpoch: 1 };
+      if (message.type === 'clf-prepare-desktop-input') {
+        h.tabs[0] = { id: 7, url: 'https://chatgpt.com/' };
+        await h.authorizeDocument({ ...sender, url: h.tabs[0].url }, { navigationEpoch: 2 });
+        return { ready: false, fallback: true, preSend: true };
+      }
+      if (message.type === 'clf-tab-close-check') {
+        expect(h.create).toHaveBeenCalledTimes(1);
+        if (mode === 'navigated') h.tabs[0]!.url = `https://chatgpt.com/c/${firstId}`;
+        if (mode === 'pinned') h.tabs[0]!.pinned = true;
+        if (mode === 'epoch-changed') await h.authorizeDocument({ ...sender, url: h.tabs[0]!.url }, { navigationEpoch: 3 });
+        return { safe: mode !== 'draft', conversationId: null, navigationEpoch: 2 };
+      }
+      return { ok: true };
+    });
+    await h.maintain();
+    expect(h.create).toHaveBeenCalledTimes(1);
+    expect(h.remove).toHaveBeenCalledTimes(mode === 'empty' ? 1 : 0);
+    if (mode === 'empty') expect(h.remove).toHaveBeenCalledWith(7);
   });
   it('delivers follow-up messages into an already open waiting conversation without closing or creating tabs', async () => {
     const h = await worker([{ id: firstId, conversationId: secondId }]);

@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.0] — 6 sol in 2 weeks
+
+- Cleaner setup, compact profiles and better sidebar controls.
+- More reliable Goal/Loop recovery, queued messages and conversation history.
+- Updated runtime, MCP and plugin dependencies.
+
 ## [2.0.9] — they nerfed astra
 
 - Code mode combines local and plugin tools in one JavaScript call, with saved task plans and automatic background command results.

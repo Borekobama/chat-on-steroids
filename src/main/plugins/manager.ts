@@ -257,6 +257,13 @@ export class PluginManager {
       })),
     };
   }
+  private async createGeneration(id: string): Promise<string> {
+    const parent = path.join(this.root, id);
+    await fs.mkdir(parent, { recursive: true });
+    // The plugin UUID owns identity; a generation only needs an exclusively created
+    // directory. Another UUID consumes 28 avoidable characters of Windows MAX_PATH.
+    return fs.mkdtemp(path.join(parent, 'g-'));
+  }
   install(request: PluginInstallRequest): Promise<PluginSnapshot> {
     return this.serial('install', async () => {
       if (this.closing) throw new Error('Plugins are shutting down');
@@ -270,7 +277,7 @@ export class PluginManager {
       if (source.kind === 'remote') this.remoteUrl(source.url);
       this.validateConfig(request.config ?? {});
       const id = randomUUID(),
-        directory = path.join(this.root, id, randomUUID());
+        directory = await this.createGeneration(id);
       let row: RecordEntry | undefined;
       try {
         const launch = await installSource(source, directory);
@@ -387,7 +394,7 @@ export class PluginManager {
     if (source.kind === 'github') source = resolveGithub(source);
     if (source.kind !== 'remote' && !this.localTransportFactory) throw new Error('Local plugins are disabled: CoS cannot safely contain their subprocess permissions.');
     if (source.kind === 'remote') this.remoteUrl(source.url);
-    const directory = path.join(this.root, row.id, randomUUID());
+    const directory = await this.createGeneration(row.id);
     const old = { ...row };
     try {
       const launch = await installSource(source, directory);

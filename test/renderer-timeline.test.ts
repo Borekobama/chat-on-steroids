@@ -134,7 +134,7 @@ async function settle(ms = 0): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[] } = {}) {
+async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[]; pro?: boolean } = {}) {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
@@ -185,7 +185,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
   const api: any = new Proxy(
     {
       getState: () => ok(state),
-      getChatModels: () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['none', 'high'] }] }),
+      getChatModels: () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: options.pro ? ['high', 'pro'] : ['none', 'high'] }] }),
       getSessionControls: (id: string) => ok({ sessionId: id, conversationId: 'chat-a', automation: live.automation, activeTurnId: 'held-turn', finishHeld: live.finishHeld, blocked: '', job: live.compacting ? { busy: true } : null }),
       releaseSessionFinish: (id: string, turn: string) => { live.controlCalls.push({ id, action: `release:${turn}` }); live.finishHeld = false; return ok({}); },
       setSessionAutomation: (id: string, action: string) => { live.controlCalls.push({ id, action }); live.automation = action; return ok({}); },
@@ -299,24 +299,28 @@ it('clears control projections on an existing-session switch and fences A to B t
   const first = summary([]), second = { ...summary([]), id: '2026-09-02-test0002', title: 'Other session' };
   const { w, append } = await boot([], true, [], [], { sessions: [first, second] });
   const api = (w as any).api;
-  const busy = { automation: 'off', objective: '', blocked: '', job: { busy: true } };
+  const busy = { automation: 'off', objective: '', blocked: '', job: { busy: true },
+    recovery: [{ kind: 'unattributed', deadline: Date.now() + 60_000 }] };
   api.getSessionControls = async () => ({ ok: true, data: busy });
   await append([]);
   const status = w.document.getElementById('sessionControlStatus')!;
   expect(status.textContent).toContain('Compaction');
+  expect(w.document.getElementById('recoveryStatus')!.textContent).toContain('Reload in');
   const pending: Array<(value: unknown) => void> = [];
   api.getSessionControls = () => new Promise(resolve => pending.push(resolve));
   await append([]); // old A refresh
   (w.document.querySelector(`#sessionList [data-id="${second.id}"]`) as HTMLElement).click();
   expect(status.textContent).toBe('');
+  expect(w.document.getElementById('recoveryStatus')!.hidden).toBe(true);
   expect(w.document.getElementById('cancelCompaction')!.hidden).toBe(true);
   (w.document.querySelector(`#sessionList [data-id="${first.id}"]`) as HTMLElement).click();
   expect(pending).toHaveLength(3);
-  pending[2]!({ ok: true, data: { ...busy, job: null } }); await settle();
+  pending[2]!({ ok: true, data: { ...busy, job: null, recovery: [] } }); await settle();
   pending[1]!({ ok: true, data: busy });
   pending[0]!({ ok: true, data: busy }); await settle();
   expect(status.textContent).toBe('');
   expect(w.document.getElementById('cancelCompaction')!.hidden).toBe(true);
+  expect(w.document.getElementById('recoveryStatus')!.hidden).toBe(true);
 });
 
 it('reorders queued tasks by drag and keyboard through the durable IPC operation', async () => {
@@ -430,6 +434,45 @@ it('shows a native image-only message immediately as a card without a guessed ca
   expect(row.querySelector('img')).toBeNull();
 });
 
+it.each(['image', 'txt', 'mixed', 'new-chat', 'after-turn'])('routes the composer attachment action truthfully (%s)', async kind => {
+  const app = await boot([], kind !== 'new-chat');
+  const image = { id: '11111111-2222-4333-8444-555555555555', name: 'image.png', mimeType: 'image/png', size: 42 };
+  const txt = { ...image, id: '22222222-2222-4333-8444-555555555555', name: 'notes.txt', mimeType: 'text/plain' };
+  const files = kind === 'txt' ? [txt] : kind === 'mixed' ? [image, txt] : [image];
+  (app.w as any).api.chooseFiles = async () => ({ ok: true, data: files });
+  app.w.document.getElementById('attachImages')!.click(); await settle();
+  expect(app.w.document.getElementById('immediateDeliveryLabel')!.textContent).toBe(
+    kind === 'new-chat' ? 'Send' : ['txt', 'mixed'].includes(kind) ? 'After this turn' : 'Inject now');
+  if (kind === 'after-turn') (app.w.document.getElementById('sendMode') as HTMLSelectElement).value = 'after-turn';
+  app.w.document.getElementById('composer')!.dispatchEvent(new app.w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  expect(app.live.sent).toHaveLength(1);
+  expect(app.live.sent[0]).toMatchObject({ text: 'Please look at the attached files.', attachments: files });
+  expect(app.live.sent[0]!.attachmentDelivery).toBe(kind === 'image' ? 'tool' : undefined);
+});
+
+it('restores the image draft after rejected injection and removes native-only delivery when the document is removed', async () => {
+  const app = await boot([]);
+  const image = { id: '11111111-2222-4333-8444-555555555555', name: 'image.png', mimeType: 'image/png', size: 42 };
+  const txt = { ...image, id: '22222222-2222-4333-8444-555555555555', name: 'notes.txt', mimeType: 'text/plain' };
+  (app.w as any).api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id, activeTurnId: 'held-turn', canInject: true, queueAtFinish: true } });
+  await app.append([]);
+  (app.w as any).api.chooseFiles = async () => ({ ok: true, data: [image, txt] });
+  app.w.document.getElementById('attachImages')!.click(); await settle();
+  expect(app.w.document.getElementById('afterTurnLabel')!.textContent).toBe('After this turn');
+  expect(app.w.document.getElementById('queueAtFinish')!.hidden).toBe(true);
+  (app.w.document.querySelector('[aria-label="Remove notes.txt"]') as HTMLButtonElement).click();
+  expect(app.w.document.getElementById('immediateDeliveryLabel')!.textContent).toBe('Inject now');
+  (app.w as any).api.sendInput = async () => ({ ok: false, error: 'Image is too large for injection' });
+  const field = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  field.value = 'Use the original image';
+  app.w.document.getElementById('composer')!.dispatchEvent(new app.w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  expect(field.value).toBe('Use the original image');
+  expect(app.w.document.querySelectorAll('#composerImages .image-remove')).toHaveLength(1);
+  expect(app.w.document.querySelector('[aria-label="Remove image.png"]')).not.toBeNull();
+});
+
 it('uses the same separate image row for pending and recorded native attachments', async () => {
   const app = await boot([]);
   const attachment = { id: 'a'.repeat(32), name: 'meme.png', mimeType: 'image/png', size: 42, preview: 'data:image/webp;base64,YQ==' };
@@ -445,6 +488,17 @@ it('uses the same separate image row for pending and recorded native attachments
   expect(recorded.querySelector('.message-attachments')?.nextElementSibling?.classList.contains('user-message-text')).toBe(true);
   expect(recorded.querySelector('.message-attachments > img')?.getAttribute('alt')).toBe('meme.png');
   expect(recorded.querySelector('.composer-image')).toBeNull();
+});
+
+it('explains a legacy missing image recording without asserting a provider receipt', async () => {
+  const app = await boot([]);
+  const event = toolCall(1, 'missing-image') as Extract<SessionEvent, { kind: 'tool_call' }>;
+  event.call.tool = 'view_image';
+  event.call.result = text('');
+  await app.append([event]);
+  const tool = app.w.document.querySelector('details.tool')!;
+  expect(tool.textContent).toContain('No image preview was retained in this recording.');
+  expect(tool.textContent).not.toContain('received');
 });
 
 it('loads recorded tool images on expansion and hides truncated binary envelopes', async () => {
@@ -492,6 +546,21 @@ it('pages project tasks as complete parent/worker groups and keeps the selected 
   await append([]);
   expect(section().querySelectorAll(':scope > .sess')).toHaveLength(8);
 });
+it('shows five project chats initially and reveals eight more per click', async () => {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Paged', path: '/paged', createdAt: 1 };
+  const tasks = Array.from({ length: 22 }, (_, index) => ({ ...summary([]), id: `page-task-${index}`, conversationId: `chat-${index}`, projectId: project.id }));
+  const { w, append } = await boot([], false, [], [project], { sessions: tasks });
+  const section = () => w.document.querySelector('.project-group')!;
+  expect(section().querySelectorAll(':scope > .sess')).toHaveLength(5);
+  for (const count of [13, 21, 22]) {
+    (section().querySelector('.project-show-more') as HTMLButtonElement).click();
+    expect(section().querySelectorAll(':scope > .sess')).toHaveLength(count);
+  }
+  expect(section().querySelector('.project-show-more')).toBeNull();
+  await append([]);
+  expect(section().querySelectorAll(':scope > .sess')).toHaveLength(22);
+});
+
 it('shows original user text while retaining transport instructions outside the visible bubble', async () => {
   const { w } = await boot([{ seq: 1, time: T0, source: 'app', kind: 'user_message', messageId: 'native-one', inputId: 'one', authoredText: 'hello', message: text('hello\n\nTransport-only control instruction') }]);
   expect(w.document.querySelector('.said.is-user .msg')?.textContent).toBe('hello');
@@ -1272,7 +1341,7 @@ it.each([true, false])('hands plan presentation to queued stages while sending a
   await settle();
   expect(preview.hidden).toBe(accepted);
   expect(preview.querySelectorAll('.plan-stage')).toHaveLength(accepted ? 0 : 6);
-  if (!accepted) expect(input.value).toBe('Build the whole task');
+  if (!accepted) expect(input.value).toBe('');
 });
 
 it.each(['delivery', 'model', 'refresh-failed', 'enqueue-failed'])('retries the durable full plan without pasting stage one (%s)', async failure => {
@@ -1481,7 +1550,7 @@ it('queues every generated stage in an existing session without Send and preserv
   w.document.getElementById('createPlan')!.click(); await settle();
   expect(live.sent).toHaveLength(1);
   expect(live.sent[0]).toMatchObject({ sessionId: summary([]).id, text: 'Build foundation', stages: ['Verify it'], mode: 'finish', model: null, reasoningEffort: null });
-  expect(input.value).toBe('Build the whole task');
+  expect(input.value).toBe('');
   input.value = ''; input.dispatchEvent(new w.Event('input'));
   expect(w.document.querySelectorAll('#finishQueue .queued-input')).toHaveLength(2);
   expect(w.document.querySelectorAll('[aria-label="Remove queued task"]')).toHaveLength(2);
@@ -1526,16 +1595,37 @@ it('retains a rejected queue admission independently of composer edits and retri
   expect(input.value).toBe('');
 });
 
-it('sends a retained new-chat plan with its captured request after the composer is cleared', async () => {
-  const { w, live } = await boot([], false);
+it.each([false, true])('clears the planner prompt and starts a new-chat plan with Enter from the empty composer (pro=%s)', async pro => {
+  const { w, live } = await boot([], false, [], [], { pro });
+  const effort = w.document.getElementById('composerReasoning') as HTMLSelectElement;
+  effort.value = pro ? 'pro' : 'high'; effort.dispatchEvent(new w.Event('change')); await settle();
   (w as any).api.draftTaskPlan = vi.fn(async () => ({ ok: true, data: ['Build foundation', 'Verify it'] }));
   const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
   input.value = 'Original objective';
   w.document.getElementById('createPlan')!.click(); await settle();
-  input.value = ''; input.dispatchEvent(new w.Event('input'));
-  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { cancelable: true })); await settle();
+  expect(input.value).toBe('');
+  input.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, cancelable: true }));
+  input.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', isComposing: true, cancelable: true }));
+  await settle(); expect(live.sent).toHaveLength(0);
+  input.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', cancelable: true })); await settle();
   expect(live.sent).toHaveLength(1);
-  expect(live.sent[0]).toMatchObject({ objective: 'Original objective', text: 'Build foundation', stages: ['Verify it'] });
+  expect(live.sent[0]).toMatchObject({ objective: 'Original objective', text: 'Build foundation', stages: ['Verify it'], reasoningEffort: pro ? 'pro' : 'high' });
+});
+
+it('does not erase a new composer draft while completed-plan queue admission is pending', async () => {
+  const { w } = await boot([]);
+  const api = (w as any).api, send = api.sendInput;
+  let admit!: () => Promise<void>;
+  api.sendInput = vi.fn((args: InputArgs) => new Promise(resolve => { admit = async () => resolve(await send(args)); }));
+  api.draftTaskPlan = vi.fn(async () => ({ ok: true, data: ['First checkpoint', 'Last checkpoint'] }));
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'Planner request';
+  w.document.getElementById('createPlan')!.click(); await settle();
+  expect(input.value).toBe('');
+  input.value = 'My next correction'; input.dispatchEvent(new w.Event('input'));
+  await admit(); await settle();
+  expect(input.value).toBe('My next correction');
+  expect(w.document.querySelectorAll('#finishQueue .queued-input')).toHaveLength(2);
 });
 
 it('clearing the complete planner task cancels generation and restores Create plan', async () => {
@@ -1720,6 +1810,29 @@ it.each(['navigate', 'objective edit', 'mode change', 'automation change'] as co
   expect(live.sent).toHaveLength(0);
 });
 
+it('shows Loop settling, its real waiting deadline, and generated text in the same row', async () => {
+  const { w, append } = await boot([]);
+  const api = (w as any).api;
+  const controls = { automation: 'loop', objective: 'Continue the task', blocked: '', job: null,
+    goalWait: { reason: 'quiet', until: Date.now() + 125_000 }, goalDraft: null as unknown };
+  api.getSessionControls = async () => ({ ok: true, data: controls });
+  await append([]);
+  const row = w.document.getElementById('goalLifecycle')!;
+  expect(row.hidden).toBe(false);
+  expect(row.textContent).toContain('Loop · Waiting for tool inactivity');
+  expect(row.querySelector('[role="timer"]')?.textContent).toContain('2:05');
+  expect(row.getAttribute('aria-busy')).toBe('true');
+  controls.goalDraft = { stage: 'answering', model: 'fixture', text: 'Continue with the remaining checks', error: null };
+  await append([]);
+  expect(w.document.getElementById('goalLifecycle')).toBe(row);
+  expect(row.textContent).toContain('Generating a continuation');
+  expect(row.textContent).toContain('Continue with the remaining checks');
+  expect(row.querySelector('[role="timer"]')).toBeNull();
+  controls.automation = 'off'; await append([]);
+  expect(row.hidden).toBe(true);
+  expect(row.textContent).toBe('');
+});
+
 it('follows the accepted New Chat receipt while preserving a typed follow-up', async () => {
   const { w, live, append } = await boot([], false);
   const composer = w.document.getElementById('chatInput') as HTMLTextAreaElement;
@@ -1733,6 +1846,38 @@ it('follows the accepted New Chat receipt while preserving a typed follow-up', a
   await append([]);
   expect(w.document.querySelector('#sessionList [data-id].is-sel')).not.toBeNull();
   expect(composer.value).toBe('Follow-up while delivery is pending');
+});
+
+it('shows Pro Loop delivery before sending and freezes changes made while the opening is being accepted', async () => {
+  const { w, live } = await boot([], false, [], [], { pro: true });
+  const row = w.document.getElementById('loopDeliveryRow')!;
+  const effort = w.document.getElementById('composerReasoning') as HTMLSelectElement;
+  const delivery = w.document.getElementById('loopDelivery') as HTMLSelectElement;
+  const choose = (value: string) => { effort.value = value; effort.dispatchEvent(new w.Event('change')); };
+  w.document.querySelector<HTMLButtonElement>('#automationSwitch [data-mode="loop"]')!.click();
+  expect(row.hidden).toBe(true);
+  choose('pro'); expect(row.hidden).toBe(false);
+  expect(delivery.value).toBe('finish');
+  delivery.value = 'after-turn'; delivery.dispatchEvent(new w.Event('change'));
+  choose('high'); expect(row.hidden).toBe(true);
+  choose('pro'); expect(row.hidden).toBe(false);
+  expect(delivery.value).toBe('after-turn');
+  const api = (w as any).api;
+  const originalSend = api.sendInput;
+  let accept!: () => void;
+  api.sendInput = vi.fn((input: InputArgs) => new Promise(resolve => { accept = () => resolve(originalSend(input)); }));
+  api.setInputAutomation = vi.fn(async () => ({ ok: true, data: true }));
+  (w.document.getElementById('chatInput') as HTMLTextAreaElement).value = 'First Pro Loop message';
+  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { cancelable: true }));
+  await settle();
+  expect(api.sendInput.mock.calls[0][0]).toMatchObject({ sessionId: null, automation: 'loop', loopAfterTurn: true });
+  delivery.value = 'finish'; delivery.dispatchEvent(new w.Event('change'));
+  accept(); await settle();
+  expect(api.setInputAutomation).toHaveBeenLastCalledWith(live.sent[0]!.id, 'loop', false);
+  w.document.querySelector<HTMLButtonElement>('#automationSwitch [data-mode="goal"]')!.click();
+  expect(row.hidden).toBe(true);
+  w.document.getElementById('newChat')!.click();
+  expect(delivery.value).toBe('finish');
 });
 
 it('applies Off to the exact accepted New Chat opening while preserving an unrelated composer draft', async () => {
@@ -1828,6 +1973,7 @@ it('retains an existing running chat planner across navigation and accepts its r
   expect(w.document.querySelectorAll('.plan-stage')).toHaveLength(0);
   (w.document.querySelector('#sessionList [data-id]') as HTMLElement).click(); await settle();
   expect(w.document.querySelectorAll('#finishQueue .queued-input')).toHaveLength(2);
+  expect(input.value).toBe('');
   expect(w.document.getElementById('taskPlanPreview')!.hidden).toBe(true);
   expect(live.sent).toHaveLength(1);
   expect(live.sent[0]).toMatchObject({ sessionId: summary([]).id, mode: 'finish', text: 'Original first stage', stages: ['Original checkpoint'] });
@@ -1882,9 +2028,26 @@ it('renders existing-chat Goal draft stages from main controls without starting 
   draft = { ...draft, stage: 'ready' }; await append([]);
   expect(row.textContent).toContain('awaiting ChatGPT delivery');
   draft = { ...draft, stage: 'failed', error: 'no_api_key' }; await append([]);
-  expect(row.textContent).toContain('no_api_key');
+  expect(row.textContent).toContain('No API key is configured for the continuation provider.');
+  expect(row.textContent).not.toContain('no_api_key');
   expect(row.getAttribute('aria-busy')).toBe('false');
   expect(opening).not.toHaveBeenCalled();
+});
+
+it('shows the immediate recovery deadline before a draft exists and clears it on fresh work', async () => {
+  const { w, append } = await boot([]);
+  const api = (w as any).api, original = api.getSessionControls;
+  let goalWait: object | null = { reason: 'silence', until: Date.now() + 120_000 };
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data,
+    automation: 'loop', goalWait, goalDraft: null } });
+  await append([]);
+  const row = w.document.getElementById('goalLifecycle')!;
+  expect(row.hidden).toBe(false);
+  expect(row.textContent).toContain('Loop · Waiting before recovery reload');
+  expect(row.querySelector('[role="timer"]')).not.toBeNull();
+  goalWait = null;
+  await append([]);
+  expect(row.hidden).toBe(true);
 });
 
 it('reuses the Goal animation for a session-finish draft while ordinary automation is off', async () => {
@@ -1962,6 +2125,49 @@ it('offers a per-task post-turn opt-in only for Astra', async () => {
   expect(edit).toHaveBeenCalledWith('choice-task', 'Next task', true);
 });
 
+it('opens every selected chat at the bottom and preserves manual reading during live updates', async () => {
+  const rows = Array.from({ length: 160 }, (_, i): SessionEvent => ({ seq: i + 1, time: T0 + i,
+    source: 'extension', kind: 'user_message', messageId: `opening-${i}`, message: text(`Opening item ${i + 1}`) }));
+  const first = summary(rows), second = { ...summary(rows), id: '2026-09-02-test0002', title: 'Other chat' };
+  const { w, append } = await boot(rows, false, [], [], { sessions: [first, second] });
+  const pane = w.document.getElementById('chatBody')!;
+  const timeline = w.document.getElementById('timeline')!;
+  Object.defineProperties(pane, { clientHeight: { value: 400 },
+    scrollHeight: { get: () => timeline.querySelectorAll('[data-timeline-key]').length * 100 } });
+  const select = async (id: string) => {
+    (w.document.querySelector(`#sessionList [data-id="${id}"]`) as HTMLElement).click();
+    await settle();
+    expect(pane.scrollTop).toBe(pane.scrollHeight); // Chromium clamps to the actual bottom.
+  };
+  await select(first.id);
+  for (let i = 0; i < 3; i++) {
+    pane.scrollTop = 700;
+    await append([]);
+    expect(pane.scrollTop).toBe(700);
+    await select(second.id);
+    pane.scrollTop = 0;
+    await select(first.id);
+  }
+
+  // A late opening response must neither replace the current chat nor drag its reader down.
+  const api = (w as any).api, original = api.getSession;
+  const pending: Array<() => void> = [];
+  api.getSession = async (id: string, options: unknown) => {
+    await new Promise<void>(resolve => pending.push(resolve));
+    return original(id, options);
+  };
+  await append([]); // Old A refresh is still in flight when A -> B -> A begins.
+  (w.document.querySelector(`#sessionList [data-id="${second.id}"]`) as HTMLElement).click();
+  (w.document.querySelector(`#sessionList [data-id="${first.id}"]`) as HTMLElement).click();
+  expect(pending).toHaveLength(3);
+  pending[2]!(); await settle();
+  expect(pane.scrollTop).toBe(pane.scrollHeight);
+  pane.scrollTop = 850;
+  pending[1]!(); pending[0]!(); await settle();
+  expect(pane.scrollTop).toBe(850);
+  expect(w.document.getElementById('chatTitle')!.textContent).toBe(first.title);
+});
+
 it('loads bounded earlier pages on deliberate upward scrolling without draining on render', async () => {
   const rows = Array.from({ length: 360 }, (_, i): SessionEvent => ({ seq: i + 1, time: T0 + i,
     source: 'extension', kind: 'user_message', messageId: `history-${i}`, message: text(`History item ${i + 1}`) }));
@@ -2007,8 +2213,15 @@ it('scrolls forward through evicted history with wheel, keyboard and scrollbar, 
   const pane = w.document.getElementById('chatBody')!;
   Object.defineProperties(pane, { clientHeight: { configurable: true, value: 400 },
     scrollHeight: { configurable: true, get: () => timeline.querySelectorAll('[data-timeline-key]').length * 20 } });
+  // Model one layout snapshot per DOM revision. A selector scan inside every
+  // rectangle read made this mock quadratic and exhausted Windows CI's timeout.
+  let geometryRows: Map<Element, number> | null = null;
+  const geometryChanges = new w.MutationObserver(() => { geometryRows = null; });
+  geometryChanges.observe(timeline, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-timeline-key'] });
   w.HTMLElement.prototype.getBoundingClientRect = function () {
-    const index = [...timeline.querySelectorAll('[data-timeline-key]')].indexOf(this);
+    if (geometryChanges.takeRecords().length) geometryRows = null;
+    geometryRows ??= new Map([...timeline.querySelectorAll('[data-timeline-key]')].map((row, index) => [row, index]));
+    const index = geometryRows.get(this) ?? -1;
     const top = index < 0 ? 0 : index * 20 - pane.scrollTop;
     return { top, bottom: top + 20, height: 20 } as DOMRect;
   };
@@ -2046,6 +2259,37 @@ it('scrolls forward through evicted history with wheel, keyboard and scrollbar, 
   await downward('wheel'); // Empty forward page proves we reached the current tail.
   await append([{ seq: 401, time: T0 + 401, source: 'extension', kind: 'user_message', messageId: 'live-again', message: text('Live again') }]);
   expect(timeline.textContent).toContain('Live again');
+  geometryChanges.disconnect();
+});
+
+it('keeps admitting newer data when dense collapsed activity reaches the resident bound', async () => {
+  const rows = Array.from({ length: 400 }, (_, i) => toolCall(i + 1, `dense-${i}`));
+  const { w, live, append } = await boot(rows);
+  const api = (w as any).api;
+  api.getSession = async (_id: string, options: { from?: number; before?: number; limit: number }) => {
+    const eligible = live.events.filter(e => (options.from === undefined || e.seq >= options.from) && (options.before === undefined || e.seq < options.before));
+    const page = options.from === undefined ? eligible.slice(-options.limit) : eligible.slice(0, options.limit);
+    return { ok: true, data: { summary: summary(live.events), events: page, total: live.events.length,
+      nextFrom: page.reduce((next, e) => Math.max(next, e.seq + 1), options.from ?? 0) } };
+  };
+  const pane = w.document.getElementById('chatBody')!;
+  const timeline = w.document.getElementById('timeline')!;
+  Object.defineProperties(pane, { clientHeight: { value: 400 }, scrollHeight: { value: 400 } });
+  w.HTMLElement.prototype.getBoundingClientRect = function () {
+    return { top: 0, bottom: this.classList.contains('tool-group') ? 30 : 0,
+      height: this.classList.contains('tool-group') ? 30 : 0 } as DOMRect;
+  };
+  const group = timeline.querySelector('.tool-group');
+  for (let i = 0; i < 2; i++) {
+    pane.scrollTop = 0; pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 })); await settle();
+  }
+  expect(timeline.querySelectorAll('.ev-tool_call')).toHaveLength(320);
+  expect(timeline.querySelector('.tool-group')).toBe(group);
+  pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: 100 })); await settle();
+  await append([{ seq: 401, time: T0 + 401_000, source: 'extension', kind: 'user_message',
+    messageId: 'dense-live', message: text('New data at the resident bound') }]);
+  expect(timeline.textContent).toContain('New data at the resident bound');
+  expect(timeline.querySelectorAll('.ev').length).toBeLessThanOrEqual(320);
 });
 
 it.each(['older', 'newer'])('does not apply a %s-page response or scroll after switching to a new chat', async direction => {
@@ -2078,4 +2322,33 @@ it('clears a delivered check when later model activity arrives without a timer',
   await app.append([toolCall(2, 'next-tool')]);
   expect(app.w.document.querySelector('.input-receipt')).toBe(receipt);
   expect(receipt.hidden).toBe(true);
+});
+
+
+it('keeps a cancelled automatic draft at its creation time as later messages arrive', async () => {
+  const app = await boot([
+    { seq: 1, time: T0, source: 'extension', kind: 'user_message', messageId: 'before-draft', message: text('Original work') },
+    { seq: 2, time: T0 + 2000, source: 'extension', kind: 'user_message', messageId: 'after-draft', message: text('Later continuation') }
+  ]);
+  const { w, live } = app;
+  live.inputs.push({ id: 'retired-auto', sessionId: summary([]).id, conversationId: 'chat-b', text: 'Unused automatic instruction',
+    mode: 'auto', dueAt: T0 + 1000, createdAt: T0 + 1000, state: 'cancelled', owner: null, model: null, reasoningEffort: null,
+    finishOwner: { turnId: 'old-turn', periodic: false },
+    error: 'Automatic follow-up cancelled because its active turn or setting changed.' });
+  await app.append([]);
+  const timeline = w.document.getElementById('timeline')!;
+  const retired = timeline.querySelector<HTMLElement>('[data-input-id="retired-auto"]')!;
+  expect(retired).not.toBeNull();
+  expect(retired.querySelector('time')!.textContent).toBe(new Date(T0 + 1000).toLocaleString());
+  expect(w.document.getElementById('inputQueue')!.textContent).not.toContain('Unused automatic instruction');
+  const before = () => timeline.textContent!.indexOf('Unused automatic instruction') < timeline.textContent!.indexOf('Later continuation');
+  expect(before()).toBe(true);
+  await app.append([{ seq: 3, time: T0 + 3000, source: 'extension', kind: 'assistant_message', messageId: 'new-progress', message: text('New work continues'), final: false }]);
+  expect(timeline.querySelector('[data-input-id="retired-auto"]')).toBe(retired);
+  expect(before()).toBe(true);
+  expect(live.sent).toHaveLength(0);
+  retired.querySelector<HTMLButtonElement>('[title="Dismiss delivery notice"]')!.click();
+  await app.append([]);
+  expect(timeline.textContent).not.toContain('Unused automatic instruction');
+  expect(live.sent).toHaveLength(0);
 });

@@ -52,6 +52,8 @@ import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from '
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
 import { addProject, listProjects, removeProject } from './projects.js';
 import { hasSecret, isEncryptionAvailable, secureStorageStatus, setSecret } from './secrets.js';
+import { setupApiKeySlot } from '../shared/setup-profile.js';
+import { addSetupProfile, removeSetupProfile, switchSetupProfile } from './setup-profiles.js';
 import { bundledVersion, locateBinary } from './tunnel/locate.js';
 import { TUNNEL_ID_PATTERN } from './tunnel/index.js';
 import {
@@ -117,6 +119,8 @@ const settingsPatch = z.object({
   capabilities: capabilityPatch,
   readOnly: z.boolean(),
   tunnel: z.object({
+    profileId: z.string().max(64).optional(),
+    profileEpoch: z.number().int().nonnegative().optional(),
     pluginsTunnelId: z.string().max(128).refine(v => v === '' || TUNNEL_ID_PATTERN.test(v), 'Expected tunnel_ followed by 32 hex characters').optional(),
     kind: z.enum(['openai', 'cloudflared', 'manual']),
     tunnelId: z
@@ -228,6 +232,12 @@ type SettingsSnapshot = z.infer<typeof settingsPatch>;
  * the current main-process value. A field that differs was deliberately edited here and wins.
  */
 function mergeSettings(current: Config, base: SettingsSnapshot, wanted: SettingsSnapshot): SettingsSnapshot {
+  const tunnelEdited = (['tunnelId', 'desktopTunnelId', 'pluginsTunnelId'] as const)
+    .some(key => (base.tunnel[key] ?? '') !== (wanted.tunnel[key] ?? ''));
+  if (tunnelEdited && ((base.tunnel.profileId ?? 'default') !== (current.tunnel.profileId ?? 'default') ||
+      (base.tunnel.profileEpoch ?? 0) !== (current.tunnel.profileEpoch ?? 0))) {
+    throw new Error('Setup profile changed. Edit the tunnel ID in the selected profile again.');
+  }
   const pick = <T>(live: T, before: T, next: T): T => (Object.is(before, next) ? live : next);
   const capabilities = Object.fromEntries(
     CAPABILITIES.map((capability) => [
@@ -240,6 +250,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
     capabilities,
     readOnly: pick(current.readOnly, base.readOnly, wanted.readOnly),
     tunnel: {
+      ...current.tunnel,
         pluginsTunnelId: wanted.tunnel.pluginsTunnelId === undefined ? current.tunnel.pluginsTunnelId ?? ''
           : pick(current.tunnel.pluginsTunnelId ?? '', base.tunnel.pluginsTunnelId ?? '', wanted.tunnel.pluginsTunnelId),
       kind: pick(current.tunnel.kind, base.tunnel.kind, wanted.tunnel.kind),
@@ -354,7 +365,7 @@ async function buildState(): Promise<AppState> {
     platform: hostPlatformInfo(),
     loginStartupAvailable: supportsLoginStartup(process.platform, app.isPackaged),
     secureStorage: await secureStorageStatus(),
-    hasApiKey: await hasSecret('openaiApiKey'),
+    hasApiKey: await hasSecret(setupApiKeySlot(config.tunnel.profileId)),
     hasGoalKey: await hasSecret('openRouterApiKey'),
     hasCustomProviderKey: await hasSecret('customProviderApiKey'),
     resolvedBinary: resolvedBinary(config),
@@ -385,6 +396,22 @@ function handle<T>(channel: string, fn: (payload: unknown) => Promise<T>): void 
 }
 
 export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall: () => void): void {
+  handle('setup:profile', async payload => {
+    const request = z.discriminatedUnion('action', [
+      z.object({ action: z.literal('add'), name: z.string().trim().min(1).max(80) }),
+      z.object({ action: z.literal('select'), id: z.string().min(1).max(64) }),
+      z.object({ action: z.literal('remove'), id: z.string().min(1).max(64) })
+    ]).parse(payload);
+    await updateConfig(config => request.action === 'add'
+      ? addSetupProfile(config, request.name)
+      : request.action === 'remove' ? removeSetupProfile(config, request.id) : switchSetupProfile(config, request.id),
+    async () => {
+      // The committed profile owns the connection even if credential cleanup fails.
+      try { if (request.action === 'remove') await setSecret(setupApiKeySlot(request.id), ''); }
+      finally { await applySettings(); }
+    });
+    return buildState();
+  });
   registerPluginIpc(handle, getWindow);
   handle('usage:get', () => usageOverview());
   handle('state:get', async () => {
@@ -593,16 +620,21 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
    * travels inwards. Nothing reads a key back out over IPC; the state carries a boolean.
    */
   handle('secret:set', async (payload) => {
-    const { value, key } = z
+    const { value, key, profileId } = z
       .object({
         value: z.string().max(500),
+        profileId: z.string().min(1).max(64).optional(),
         key: z.enum(['openaiApiKey', 'openRouterApiKey', 'customProviderApiKey']).default('openaiApiKey')
       })
       .parse(payload);
     if (!(await isEncryptionAvailable())) {
       throw new Error('Secure OS credential storage is unavailable, so the key cannot be stored safely.');
     }
-    await setSecret(key, value);
+    const owner = profileId ?? 'default';
+    const config = getConfig();
+    if (key === 'openaiApiKey' && owner !== (config.tunnel.profileId ?? 'default') &&
+        !config.setupProfiles?.some(profile => profile.id === owner)) throw new Error('Setup profile not found');
+    await setSecret(key === 'openaiApiKey' ? setupApiKeySlot(owner) : key, value);
     const activeGoalKey = getConfig().goal.provider.kind === 'custom' ? 'customProviderApiKey' : 'openRouterApiKey';
     if (key === activeGoalKey) retireGoalDrafts();
     const what = key === 'openRouterApiKey' ? 'openrouter key' : key === 'customProviderApiKey' ? 'custom provider key' : 'api key';
@@ -663,7 +695,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('log:json', async () => formatLogAsJson());
   handle('clipboard:write', async (payload) => {
     const { text } = z.object({ text: z.string().max(1_000_000) }).parse(payload);
-    clipboard.writeText(text);
+    await clipboard.writeText(text);
     return true;
   });
 
@@ -810,8 +842,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('chatModels:request', async () => startChatModelDiscovery());
   handle('sessions:controls', async (payload) => sessionControlsFor(sessionIdArg.parse(payload).id));
   handle('sessions:automation', async (payload) => {
-    const { id, automation } = sessionIdArg.extend({ automation: z.enum(['off', 'goal', 'loop']) }).parse(payload);
-    return setSessionAutomation(id, automation);
+    const { id, automation, afterTurn } = sessionIdArg.extend({ automation: z.enum(['off', 'goal', 'loop']), afterTurn: z.boolean().optional() }).parse(payload);
+    return setSessionAutomation(id, automation, afterTurn);
   });
   handle('sessions:objective', async (payload) => {
     const { id, text, mode } = sessionIdArg.extend({ text: z.string().max(16000), mode: z.enum(['goal', 'loop']) }).parse(payload);
@@ -843,11 +875,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const { id, sourceSessionId } = z.object({ id: z.string().uuid(), sourceSessionId: z.string().min(8).max(64) }).parse(payload);
     return retryGoalBrowserHelper(sourceSessionId, id);
   });
-  handle('sessions:editInput', async (payload) => { const { id, text, afterTurn } = z.object({ id: z.string().uuid(), text: z.string().trim().min(1).max(16000), afterTurn: z.boolean().optional() }).parse(payload); return editQueuedInput(id, text, afterTurn); });
+  handle('sessions:editInput', async (payload) => { const { id, text, afterTurn } = z.object({ id: z.string().uuid(), text: inputArgs.shape.text, afterTurn: z.boolean().optional() }).parse(payload); return editQueuedInput(id, text, afterTurn); });
   handle('sessions:cancelInput', async (payload) => cancelDesktopInput(z.object({ id: z.string().uuid() }).parse(payload).id));
   handle('sessions:inputAutomation', async payload => {
-    const { id, mode } = z.object({ id: z.string().uuid(), mode: z.enum(['off', 'goal', 'loop']) }).parse(payload);
-    return setInputAutomation(id, mode);
+    const { id, mode, loopAfterTurn } = z.object({ id: z.string().uuid(), mode: z.enum(['off', 'goal', 'loop']), loopAfterTurn: z.boolean().optional() }).parse(payload);
+    return setInputAutomation(id, mode, loopAfterTurn);
   });
   handle('window:getZoom', async () => (getWindow()?.webContents.getZoomFactor() ?? UI_BASE_ZOOM) / UI_BASE_ZOOM);
   handle('window:zoom', async (payload) => {
@@ -1045,13 +1077,13 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       return !entry.sessionId && !entry.conversationId && !entry.finishOwner && entry.mode !== 'finish'
         ? prepareSessionPrompt(text, entry, limits) : text;
     },
-    applyAutomation: async (conversationId, automation, phase, objective) => {
+    applyAutomation: async (conversationId, automation, phase, objective, loopAfterTurn) => {
       // This message supersedes the old final; never pick that old final up merely
       // because the composer enabled Goal for the next turn.
       const mode = automation === 'off' ? goalSwitchFor(conversationId).mode : automation;
       // Reserve switch ordering immediately, before awaiting another ledger write.
       // A user Off arriving during persistence must remain later than this attempt.
-      const switchWrite = setGoalSwitchNow(conversationId, mode, automation !== 'off');
+      const switchWrite = setGoalSwitchNow(conversationId, mode, automation !== 'off', loopAfterTurn);
       const [held] = await Promise.all([switchWrite, setGoalReplyActiveNow(conversationId, false)]);
       // A fresh chat can finish before its send ACK arrives. Its newest final is
       // this message's own response, so it may be picked up after binding.

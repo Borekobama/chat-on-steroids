@@ -38,7 +38,7 @@ describe('CoS control service', () => {
     expect(response).toEqual({ status: 200, body: {
       apiVersion: '1', ready: true, capabilities: ['submit', 'status', 'result', 'input', 'cancel', 'codex_readonly']
     } });
-    expect((await import('node:fs/promises')).stat(socketPath).then(stat => stat.mode & 0o777)).resolves.toBe(0o600);
+    await expect((await import('node:fs/promises')).stat(socketPath).then(stat => stat.mode & 0o777)).resolves.toBe(0o600);
   });
 
   it.runIf(process.platform === 'darwin')('rejects malformed task admission before browser delivery', async () => {
