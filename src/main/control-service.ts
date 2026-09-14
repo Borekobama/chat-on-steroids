@@ -20,7 +20,7 @@ const API = '1';
 const MAX_BODY = 64 * 1024;
 const ID = /^[0-9a-f-]{36}$/i;
 
-type TaskState = 'queued' | 'delivering' | 'running' | 'awaiting_input' | 'recovering' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
+type TaskState = 'queued' | 'delivering' | 'running' | 'awaiting_input' | 'recovering' | 'cancelling' | 'delivery_failed' | 'succeeded' | 'failed' | 'cancelled';
 export type Task = {
   schemaVersion: 1; taskId: string; requestId: string; payloadHash: string;
   projectId: string | null; canonicalWorkspace: string | null; brief: string;
@@ -32,6 +32,9 @@ export type Task = {
   inputIds: string[];
   messages?: Array<{ messageId: string; payloadHash: string; inputId: string; text: string; dueAt: number }>;
   boundInputSeq?: number; boundTurnId?: string;
+  completionStatus?: 'succeeded' | 'failed'; completionSeq?: number; completionRecordedAt?: number;
+  failureReason?: string; deliveryState?: string;
+  lastEvent?: Record<string, unknown>; lastToolCall?: Record<string, unknown>;
 };
 type TaskInput = { requestId: string; projectId?: string | null; sessionId?: string | null; cwd?: string; brief: string; model?: string | null; effort?: string | null };
 type TaskMessage = { messageId: string; text: string };
@@ -56,6 +59,8 @@ let server: http.Server | null = null;
 let tasks: Task[] = [];
 let taskLock = Promise.resolve();
 let cancellationSweep: NodeJS.Timeout | null = null;
+const TERMINAL_STATES = new Set<TaskState>(['delivery_failed', 'succeeded', 'failed', 'cancelled']);
+const terminal = (state: TaskState): boolean => TERMINAL_STATES.has(state);
 
 const serial = <T>(fn: () => Promise<T>): Promise<T> => {
   const result = taskLock.then(fn, fn);
@@ -126,6 +131,29 @@ export function taskCompletionEvidence(events: SessionEvent[], taskId: string, i
   return null;
 }
 
+export function recoveredTaskCompletionEvidence(events: SessionEvent[], taskId: string, inputSeq: number,
+  inputDeliveredAt = Number.NEGATIVE_INFINITY): { seq: number; time: number; status: 'succeeded' | 'failed' } | null {
+  for (const event of events) {
+    if (event.kind !== 'tool_call' || event.seq <= inputSeq || event.call.tool !== 'session_finish' ||
+        event.call.outcome !== 'ok' || event.call.args.truncated || event.time <= inputDeliveredAt) continue;
+    try {
+      const args = JSON.parse(event.call.args.text) as { task_id?: unknown; status?: unknown };
+      if (args.task_id === taskId && (args.status === 'succeeded' || args.status === 'failed')) {
+        return { seq: event.seq, time: event.time, status: args.status };
+      }
+    } catch { /* Malformed recorder evidence cannot complete a task. */ }
+  }
+  return null;
+}
+
+function eventView(event: SessionEvent): Record<string, unknown> {
+  const view: Record<string, unknown> = { seq: event.seq, time: event.time, kind: event.kind };
+  if ('turnId' in event && event.turnId) view.turnId = event.turnId;
+  if (event.kind === 'turn_end') { view.outcome = event.outcome; if (event.detail) view.detail = event.detail; }
+  if (event.kind === 'tool_call') { view.tool = event.call.tool; view.outcome = event.call.outcome; }
+  return view;
+}
+
 async function body(req: http.IncomingMessage, maxBody = MAX_BODY): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = [];
   for await (const chunk of req) { size += (chunk as Buffer).length; if (size > maxBody) throw new Error('body_too_large'); chunks.push(chunk as Buffer); }
@@ -134,15 +162,14 @@ async function body(req: http.IncomingMessage, maxBody = MAX_BODY): Promise<unkn
 }
 function taskId(pathname: string): string | null { const match = pathname.match(/^\/v1\/tasks\/([^/]+)(?:\/([^/]+))?$/); return match?.[1] && validId(match[1]) ? match[1] : null; }
 async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): Promise<Task> {
-  if (['succeeded', 'failed', 'cancelled'].includes(task.state) && !task.cancellationBlocks?.length) return task;
-  const alreadyCompleted = task.state === 'succeeded' || task.state === 'failed';
+  const alreadyCompleted = task.completionStatus !== undefined;
   const activeInputId = task.inputIds.at(-1) ?? task.inputId;
   const row = (await hooks.listInputs()).find(input => input.id === activeInputId);
   if (row && !alreadyCompleted) {
     task.sessionId = row.deliveredSessionId ?? task.sessionId ?? null;
     if (row.state === 'queued') task.state = 'queued';
     else if (row.state === 'browser' || row.state === 'tool') task.state = 'delivering';
-    else if (row.state === 'failed') { task.state = 'failed'; task.outcome = row.error ?? 'input_failed'; }
+    else if (row.state === 'failed') { task.state = 'failed'; task.outcome = row.error ?? 'input_failed'; task.failureReason = task.outcome; }
     else if (row.state === 'cancelled' && task.state !== 'cancelling') { task.state = 'cancelled'; task.outcome = row.error ?? 'input_cancelled'; }
   }
   let exactTerminal = false;
@@ -151,6 +178,10 @@ async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): P
     if (session) {
       if (session.conversationId && !task.conversationIds.includes(session.conversationId)) task.conversationIds.push(session.conversationId);
       const events = await hooks.readEvents(task.sessionId, { from: task.boundInputSeq ?? 0 });
+      const lastEvent = events.at(-1);
+      const lastTool = events.findLast(event => event.kind === 'tool_call');
+      if (lastEvent) task.lastEvent = eventView(lastEvent);
+      if (lastTool) task.lastToolCall = eventView(lastTool);
       const binding = task.boundTurnId ? null : deliveredTurnId(events, activeInputId);
       if (binding) {
         task.boundInputSeq = binding.seq;
@@ -167,19 +198,33 @@ async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): P
       exactTerminal = end?.kind === 'turn_end';
       if (turnId) task.currentTurnId = !exactTerminal ? turnId : null;
       else if (task.currentTurnId && events.some(event => event.kind === 'turn_end' && event.turnId === task.currentTurnId)) task.currentTurnId = null;
-      const completion = inputSeq !== undefined && turnId && end?.kind === 'turn_end'
-        ? taskCompletionEvidence(events, task.taskId, inputSeq, turnId, end.seq,
-            binding?.time ?? events.find(event => event.kind === 'user_message' && event.seq === inputSeq)?.time ?? Number.NEGATIVE_INFINITY)
-        : null;
-      const final = inputSeq !== undefined && turnId ? events.findLast((event): event is Extract<typeof event, { kind: 'assistant_message' }> =>
-        event.kind === 'assistant_message' && event.seq > inputSeq &&
-        event.turnId === turnId && event.final && event.state === 'final') : undefined;
+      const deliveredAt = binding?.time ?? events.find(event => event.kind === 'user_message' && event.seq === inputSeq)?.time ?? Number.NEGATIVE_INFINITY;
+      const completion = recoveredTaskCompletionEvidence(events, task.taskId, inputSeq, deliveredAt);
+      if (completion) {
+        task.completionStatus = completion.status; task.completionSeq = completion.seq;
+        task.completionRecordedAt = completion.time;
+      }
+      const final = events.findLast((event): event is Extract<typeof event, { kind: 'assistant_message' }> =>
+        event.kind === 'assistant_message' && event.seq > inputSeq && event.final && event.state === 'final');
       if (final) task.finalText = final.message.text;
-      if (end?.kind === 'turn_end') {
+      if (task.completionStatus === 'failed') {
+        task.state = 'failed'; task.outcome = 'supervisor_failed'; task.failureReason = 'Supervisor reported task failure.';
+      }
+      else if (task.completionStatus === 'succeeded') {
+        if (final) { task.state = 'succeeded'; task.outcome = 'completed'; task.deliveryState = 'delivered'; task.failureReason = undefined; }
+        else if (Date.now() - (task.completionRecordedAt ?? Date.now()) >= 60_000) {
+          task.state = 'delivery_failed'; task.outcome = 'final_delivery_missing'; task.deliveryState = 'failed';
+          task.failureReason = 'Supervisor completed work, but no final assistant response was recorded within 60 seconds.';
+        } else { task.state = 'delivering'; task.outcome = 'completion_recorded'; task.deliveryState = 'pending'; }
+      }
+      else if (end?.kind === 'turn_end') {
         if (task.cancellationRequestedAt) task.state = 'cancelling';
-        else if (end.outcome !== 'completed') { task.state = 'failed'; task.outcome = end.outcome; }
-        else if (final && (completion?.status === 'succeeded' || completion?.status === 'failed')) {
-          task.state = completion.status; task.outcome = completion.status === 'succeeded' ? 'completed' : 'supervisor_failed'; task.currentTurnId = null;
+        else if (end.outcome !== 'completed') {
+          task.failureReason = end.detail ?? end.reason ?? end.outcome;
+          const laterActivity = events.some(event => event.seq > end.seq &&
+            (event.kind === 'tool_call' || event.kind === 'assistant_message' || event.kind === 'user_message'));
+          task.state = laterActivity || Date.now() - end.time < 60_000 ? 'recovering' : 'failed';
+          task.outcome = task.failureReason;
         }
         else task.state = 'awaiting_input';
       }
@@ -198,7 +243,7 @@ async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): P
     }
   }
   const undeliveredCancelled = !task.boundTurnId && (!row || row.state === 'cancelled' || row.state === 'failed');
-  if (!task.cancellationRequestedAt && hasOwnedProcess && ['succeeded', 'failed', 'cancelled'].includes(task.state)) {
+  if (!task.cancellationRequestedAt && hasOwnedProcess && terminal(task.state)) {
     task.state = 'running'; task.outcome = null;
   } else if (cancellationReachedTerminal(task.cancellationRequestedAt, exactTerminal || undeliveredCancelled, hasOwnedProcess,
     task.conversationIds.length > 0 && task.conversationIds.every(isChatBlocked))) {
@@ -267,7 +312,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
     const admitted = await serial(async () => {
       const prior = tasks.find(task => task.requestId === payload.requestId);
       if (prior) return { prior, task: null };
-      const leased = tasks.find(task => task.canonicalWorkspace === canonicalWorkspace && !['succeeded', 'failed', 'cancelled'].includes(task.state));
+      const leased = tasks.find(task => task.canonicalWorkspace === canonicalWorkspace && !terminal(task.state));
       if (leased) return { prior: leased, task: null };
       tasks.push(candidate); await saveTasks(); return { prior: null, task: candidate };
     });
@@ -290,17 +335,23 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
   const deadline = Date.now() + waitMs;
   do {
     await serial(async () => { await refresh(task); await saveTasks(); });
-    if (waitMs === 0 || task.eventCursor > originalCursor || ['awaiting_input', 'succeeded', 'failed', 'cancelled'].includes(task.state) || Date.now() >= deadline) break;
+    if (waitMs === 0 || task.eventCursor > originalCursor || task.state === 'awaiting_input' || terminal(task.state) || Date.now() >= deadline) break;
     await new Promise(resolve => setTimeout(resolve, Math.min(250, deadline - Date.now())));
   } while (true);
-  if (req.method === 'GET' && pathname.endsWith('/result')) return json(res, 200, { taskId: task.taskId, state: task.state, outcome: task.outcome, finalText: task.finalText, sessionId: task.sessionId, conversationIds: task.conversationIds });
+  if (req.method === 'GET' && pathname.endsWith('/result')) return json(res, 200, {
+    taskId: task.taskId, state: task.state, outcome: task.outcome, finalText: task.finalText,
+    failureReason: task.failureReason ?? null, deliveryState: task.deliveryState ?? null,
+    eventCursor: task.eventCursor, lastEvent: task.lastEvent ?? null, lastToolCall: task.lastToolCall ?? null,
+    sessionId: task.sessionId, conversationIds: task.conversationIds, turnId: task.currentTurnId,
+    workspace: task.canonicalWorkspace
+  });
   if (req.method === 'GET') return json(res, 200, { ...taskView(task), events: [] });
   if (req.method === 'POST' && pathname.endsWith('/input')) {
     const payload = await body(req) as Partial<TaskMessage>;
     if (!validId(payload.messageId) || typeof payload.text !== 'string' || !payload.text.trim() || payload.text.length > 16000 || !task.sessionId) return error(res, 400, 'invalid_input');
     const payloadHash = hash({ text: payload.text, projectId: task.projectId, sessionId: task.sessionId });
     const sent = await serial(async () => {
-      if (task.cancellationRequestedAt || ['succeeded', 'failed', 'cancelled'].includes(task.state)) return { terminal: true, prior: null, sent: null };
+      if (task.cancellationRequestedAt || terminal(task.state)) return { terminal: true, prior: null, sent: null };
       const prior = task.messages?.find(message => message.messageId === payload.messageId);
       if (prior) {
         if (prior.payloadHash === payloadHash && !(await listInputs()).some(input => input.id === prior.inputId)) {
@@ -322,7 +373,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
   }
   if (req.method === 'POST' && pathname.endsWith('/cancel')) {
     await serial(async () => {
-      if (['succeeded', 'failed', 'cancelled'].includes(task.state)) return;
+      if (terminal(task.state)) return;
       task.cancellationRequestedAt ??= Date.now(); task.state = 'cancelling'; await saveTasks();
       await Promise.all(task.inputIds.map(inputId => cancelDesktopInput(inputId).catch(() => false)));
       if (task.sessionId && task.currentTurnId) await stopSessionTurn(task.sessionId, task.currentTurnId).catch(() => undefined);
@@ -362,7 +413,7 @@ export async function startControlService(userDataDir: string): Promise<string> 
     void sendDesktopInput(input).catch(() => undefined);
   }
   for (const task of tasks) for (const message of task.messages ?? []) {
-    if (inputs.some(input => input.id === message.inputId) || task.cancellationRequestedAt || ['succeeded', 'failed', 'cancelled'].includes(task.state)) continue;
+    if (inputs.some(input => input.id === message.inputId) || task.cancellationRequestedAt || terminal(task.state)) continue;
     const input = inputArgs.parse({ id: message.inputId, projectId: task.projectId, sessionId: task.sessionId, text: message.text, mode: 'auto', dueAt: message.dueAt, model: null, reasoningEffort: null, automation: 'off' });
     void sendDesktopInput(input).catch(() => undefined);
   }

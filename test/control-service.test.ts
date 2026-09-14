@@ -4,7 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { initDurableStore } from '../src/main/durable.js';
-import { beginControlTaskFollowup, cancellationReachedTerminal, deliveredTurnId, refreshControlTaskForTests, startControlService, stopControlService, taskCompletionEvidence, workspaceLeaseView, type ControlRefreshHooks, type Task } from '../src/main/control-service.js';
+import { beginControlTaskFollowup, cancellationReachedTerminal, deliveredTurnId, recoveredTaskCompletionEvidence, refreshControlTaskForTests, startControlService, stopControlService, taskCompletionEvidence, workspaceLeaseView, type ControlRefreshHooks, type Task } from '../src/main/control-service.js';
 import { readonlyCodexCommand, readonlyCodexEnvironment, readonlySeatbeltProfile, validateReadonlyRequest } from '../src/main/control-readonly.js';
 import type { SessionEvent } from '../src/shared/session.js';
 const blocked = vi.hoisted(() => new Set<string>());
@@ -100,6 +100,13 @@ describe('CoS control service', () => {
     expect(taskCompletionEvidence([finish(6, 'turn-1', 'task-1', 'succeeded', 200)], 'task-1', 5, 'turn-1', 7, 200)).toBeNull();
   });
 
+  it('recovers exact task completion after a provider retry changes turns', () => {
+    const finish = { kind: 'tool_call', seq: 8, time: 300, call: { tool: 'session_finish', outcome: 'ok',
+      args: { truncated: false, text: JSON.stringify({ task_id: 'task-1', status: 'succeeded' }) } } } as SessionEvent;
+    expect(recoveredTaskCompletionEvidence([finish], 'task-1', 2, 200)).toEqual({ seq: 8, time: 300, status: 'succeeded' });
+    expect(recoveredTaskCompletionEvidence([finish], 'wrong-task', 2, 200)).toBeNull();
+  });
+
   const task = (overrides: Partial<Task> = {}): Task => ({
     schemaVersion: 1, taskId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', requestId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', payloadHash: 'hash',
     projectId: 'project', canonicalWorkspace: '/workspace', brief: 'brief', requestedModel: null, requestedEffort: null,
@@ -144,6 +151,44 @@ describe('CoS control service', () => {
     const cancelling = task({ cancellationRequestedAt: 5 });
     await expect(refreshControlTaskForTests(cancelling, hooks(events, true))).resolves.toMatchObject({ state: 'cancelling' });
     await expect(refreshControlTaskForTests(cancelling, hooks(events, false))).resolves.toMatchObject({ state: 'cancelled', outcome: 'cancelled' });
+  });
+
+  it('keeps a provider failure recoverable and accepts later completion and final output', async () => {
+    const taskId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const events = [
+      { kind: 'user_message', seq: 1, time: 100, inputId: 'input-1', inputDelivery: 'confirmed', turnId: 'failed-turn' },
+      { kind: 'turn_end', seq: 2, time: 150, turnId: 'failed-turn', outcome: 'failed', detail: 'Connection interrupted' },
+      { kind: 'tool_call', seq: 3, time: 200, call: { tool: 'read', outcome: 'ok', args: { truncated: false, text: '{}' } } },
+      { kind: 'tool_call', seq: 4, time: 250, call: { tool: 'session_finish', outcome: 'ok', args: { truncated: false, text: JSON.stringify({ task_id: taskId, status: 'succeeded' }) } } },
+      { kind: 'assistant_message', seq: 5, time: 300, turnId: 'retry-turn', final: true, state: 'final', message: { text: 'recovered result' } }
+    ] as SessionEvent[];
+    await expect(refreshControlTaskForTests(task({ taskId, state: 'failed' }), hooks(events))).resolves.toMatchObject({
+      state: 'succeeded', outcome: 'completed', finalText: 'recovered result', completionSeq: 4,
+      lastToolCall: { seq: 4, tool: 'session_finish' }
+    });
+  });
+
+  it('reports provider failure detail and last safe event diagnostics', async () => {
+    const events = [
+      { kind: 'user_message', seq: 1, time: 1, inputId: 'input-1', inputDelivery: 'confirmed', turnId: 'failed-turn' },
+      { kind: 'turn_end', seq: 2, time: 2, turnId: 'failed-turn', outcome: 'failed', detail: 'Connection interrupted' }
+    ] as SessionEvent[];
+    await expect(refreshControlTaskForTests(task(), hooks(events))).resolves.toMatchObject({
+      state: 'failed', outcome: 'Connection interrupted', failureReason: 'Connection interrupted',
+      lastEvent: { seq: 2, kind: 'turn_end', outcome: 'failed', detail: 'Connection interrupted' }
+    });
+  });
+
+  it('separates recorded completion from missing final delivery', async () => {
+    const taskId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const events = [
+      { kind: 'user_message', seq: 1, time: 1, inputId: 'input-1', inputDelivery: 'confirmed', turnId: 'exact-turn' },
+      { kind: 'tool_call', seq: 2, time: 2, turnId: 'exact-turn', call: { tool: 'session_finish', outcome: 'ok', args: { truncated: false, text: JSON.stringify({ task_id: taskId, status: 'succeeded' }) } } },
+      { kind: 'turn_end', seq: 3, time: 3, turnId: 'exact-turn', outcome: 'completed' }
+    ] as SessionEvent[];
+    await expect(refreshControlTaskForTests(task({ taskId }), hooks(events))).resolves.toMatchObject({
+      state: 'delivery_failed', outcome: 'final_delivery_missing', deliveryState: 'failed', completionSeq: 2
+    });
   });
 
   it('releases only cancellation-owned blocks after exact turn termination', async () => {
