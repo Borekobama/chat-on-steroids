@@ -140,6 +140,7 @@ import { findSessionByConversation } from '../session/store.js';
 import {
   adoptAgent,
   fail,
+  failIdentity,
   formatFileInfo,
   friendlyError,
   guard,
@@ -948,7 +949,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           const asking = await execSession('write_stdin');
           if (execOwnershipDenied(input.session_id, asking)) {
             return fail(
-              `write_stdin failed: session ${input.session_id} is not proven to belong to this durable Chat On Steroids session. A completed process may already have delivered its output and been retired. Check earlier tool results before deciding whether any work remains; an unavailable session id alone is not a reason to rerun the command.`
+              `write_stdin failed: session ${input.session_id} is not proven to belong to this durable Chat On Steroids session. A completed process may already have delivered its output and been retired. This refusal concerns this process id, not Read-only mode or permission to edit files or launch other authorized work. Check earlier tool results before deciding whether any work remains; an unavailable session id alone is not a reason to rerun the command.`
             );
           }
           // Both sides of the wait. An empty poll blocks for seconds by design, and a caller
@@ -1072,17 +1073,17 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
   const summaryFinishSchema = z.object({ summary: z.string().min(1).max(1000) });
   const astraFinishExposed = reg.ctx.exposedFinishTool ?? getConfig().ui.finishTool === true;
   const finishSchema = astraFinishExposed ? z.union([summaryFinishSchema, taskFinishSchema]) : taskFinishSchema;
-  reg.register('session_finish', {
+  reg.register('session_finish', toolDeclaration('session_finish', () => ({
     description: astraFinishExposed
       ? 'A task_id/status form records Codex-launched CoS task completion immediately. For Astra only, when a user prompt explicitly requests it, a summary form receives queued user instructions and can hold the turn for at most 25 seconds.'
       : 'Record Codex-launched CoS task completion immediately with the exact task_id and succeeded/failed status.',
     inputSchema: finishSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
-  }, async (input) => {
+  }), astraFinishExposed ? 'astra-control' : 'control'), async (input) => {
     if ('task_id' in input) return { content: [{ type: 'text' as const, text: `RECORDED: ${input.task_id} ${input.status}. End this turn with matching COS_TASK_RESULT marker.` }] };
     if (!getConfig().ui.finishTool) return { content: [{ type: 'text' as const, text: 'RELEASED: The user disabled finish hold. You may write your final answer.' }] };
     const caller = currentCaller();
-    if (!caller.sessionId || !caller.conversationId) return fail('Exact session identity is required');
+    if (!caller.sessionId || !caller.conversationId) return failIdentity('Exact session identity is required');
     if (goalWorkerChat(caller.conversationId)) return fail('Session finish hold is not applicable to workers or decision helpers. Workers report with agents action=finish; decision helpers answer normally.');
     return guard('session_finish', async () => ({ content: [{ type: 'text', text: await announceSessionFinish(caller.sessionId!, input.summary) }] }));
   });

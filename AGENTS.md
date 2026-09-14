@@ -21,7 +21,7 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Source alignment: **2026-09-13**, including current working-tree changes. App/extension **2.1.0**,
+Source alignment: **2026-09-14**, including current working-tree changes. App/extension **2.1.11**,
 bridge protocol **13** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
@@ -340,6 +340,9 @@ new clean shape; current config still governs every call. Each registrar refuses
 there is no merged hidden dispatch. Plugin exposure follows its separate dynamic manager.
 Disabled-tool guidance names Read-only when it masks a write, otherwise the actual permission
 label. A permission change takes effect at the live guard without requiring a new chat.
+Core instructions distinguish operation-specific identity, process-id and output-limit failures
+from Read-only mode. A terminal ownership refusal names that process scope; it does not imply
+a global write restriction or authorize replaying an already completed job.
 
 `tool-declarations.ts` caches immutable declarations/JSON conversion. SDK servers and handler
 closures remain request-local, and child calls obtain a fresh live context. Avoid caching the
@@ -446,6 +449,18 @@ headerless call has no exact proof to await and lands Unattributed immediately. 
 open at admission; calls sharing a request serialize in admission order and each resolved
 session serializes its writes. Different chats must not wait behind one global grace timer.
 Already-proven calls await their own recording; unresolved recordings may settle after response.
+
+After a local identity refusal, `kernel.ts` appends one **Identity recovered** notice to an
+eligible outer tool result once exact request/conversation/session proof is available. Refusal
+sites mark their result explicitly (`failIdentity` or `IdentityLostError`); arbitrary error
+text cannot trigger it. An earlier request qualifies only after its own proof names the same
+conversation and local session epoch. Successful unattributed work alone creates no notice.
+The bounded process-local record retains up to 2,000 request ids and eight tool names each;
+restart/server reset drops this advisory history. The existing response publication suppresses
+parallel/repeated offers and permits re-offer after local transport failure. A full text budget
+defers the appendix. Nested calls record refusals but only the outer result delivers notices,
+including Core's structured supplemental context. Current blocked, compacting, superseded and
+inactive-worker restrictions veto delivery; the notice never grants permission or repeats work.
 
 `allowUnattributedCalls` permits ordinary tools and code mode without chat attribution,
 including computer use, approved file edits, shell commands and external plugin tools.
@@ -588,6 +603,9 @@ so use its accessors rather than creating both `Path` and `PATH`. Preserve inher
 override an explicit reachable toolchain. `exec-hints.ts` repairs only provable narrow shell
 mismatches and otherwise abstains. Ambiguous globs/control flow keep original command semantics.
 Search exit 1 can mean no matches; git/build/mutation failure must not be relabeled success.
+The shell's virtual-path diagnostic excludes an exact approved native POSIX spelling, even
+when `/Users` collides with a `users` alias. This classification never rewrites command text
+or grants filesystem permission; genuine virtual paths retain their native-path guidance.
 
 `cmds` runs sequential sections in **one shell**, preserving cwd/environment. Continue after
 ordinary nonzero exits and report section exits plus the first nonzero aggregate status. Random
@@ -788,6 +806,12 @@ receipts may settle a cancelled wait; that does not authorize a second message. 
 and history publication are independent: a recorder failure retries canonical history, not
 transport. Queued unclaimed input follows its durable session to the successor; already handed
 claims keep their original exact document until their outcome resolves.
+
+Confirmed terminal input receipts stop owning history retries after their exact local session
+directory is positively absent under an available history root. The outbox durably retires them
+before startup origin repair, wrapped-text migration or checkpoint materialization. Corrupt
+metadata, inaccessible storage, unbound/ambiguous sends and active receipts remain retained;
+combined deliveries retire together. A stale delivered receipt cannot recreate deleted history.
 
 Tool input is offered in queue order within one bounded response. Emit one user-instruction
 heading, each authored message followed by its normalized images, then one batch reminder.
@@ -1518,7 +1542,13 @@ narrow. Goal stops at the requested outcome; Loop raises the quality of the same
 recursively shrinking to the latest detail or repeating settled reports. Verbatim old defaults
 live in `shared/goal-prompt-history.ts` only for exact-match migration; custom wording is preserved.
 API model discovery is bounded and cached by endpoint/key; a list entry does not prove an
-execution succeeded. Secrets remain in the main process's encrypted store. Custom endpoints
+execution succeeded. The API reasoning picker uses OpenRouter's per-model `reasoning` metadata,
+including supported efforts, mandatory reasoning and the default effort. Absent effort metadata
+does not imply support; an explicit null list accepts the gateway's efforts. The selected model's
+metadata accompanies every catalogue page, even when its row is on a later page. Saved unsupported
+values stay visible until the user changes them or selects another model. Custom endpoints retain
+manual effort selection. Exact effort values, including Max and Extra high, pass through the API
+request; the browser-helper reasoning setting remains separate. Secrets remain in the main process's encrypted store. Custom endpoints
 receive the explicitly assembled reference context; local recording is not a promise that
 Goal API requests stay on the device.
 
@@ -1526,8 +1556,11 @@ The driver context includes canonical authored user messages, stable assistant i
 and final text. **Interim messages remain included when Thinking failed leaves no final answer**:
 both the ChatGPT helper and API Loop receive the original task, subsequent user corrections and
 canonical interim text once, in chronology. Missing hidden thinking is not permission to drop
-public interim prose; app status/error notices are not model-authored work. Tool rows are opt-in (`includeToolCalls`, default Off); finish-control calls do
-not recursively dominate the reference. Read user-reference history separately so assistant/tool
+public interim prose; app status/error notices are not model-authored work. Goal/Loop and finish
+decisions never include recorded tool arguments/results, even on older installs with the tool
+preference enabled. `includeToolCalls` now controls handoff briefs only (default Off). The saved
+Loop task is supplied in full as a separate instruction on every decision, outside history
+selection; newer answers and history limits cannot replace it. Read user-reference history separately so assistant
 traffic cannot evict middle corrections before selection. Preserve original task/steering and
 committed handoff provenance under the message budget; user references have a larger per-message
 allowance and explicit clipping. Exact same-session outbox `finishOwner` identities label known
@@ -1661,6 +1694,11 @@ App-owned external/local links cross their validated main-process route.
 English and Simplified Chinese are explicit UI translations (`i18n.ts`, `locales/zh-CN.json`),
 with the selected locale in `cos.ui.language`. Changing language repaints owned labels while
 retaining drafts/selections; never translate authored messages, provider text or file paths.
+Bindings live only in a WeakMap keyed by their DOM node. Language changes walk the current
+document, including hidden panels and bound text nodes. Never retain or periodically dereference
+an index of every past label: WeakRef sweeps keep detached trees alive during allocation-heavy
+repaints. `scripts/verify-renderer-label-memory.cjs` checks real Chromium collection under repeated
+row replacement; ordinary language tests preserve controls, drafts and authored values.
 Authored prose uses automatic text direction; shell/code remain LTR with logical layout edges.
 Theme and layout preferences do not change backend authority.
 Settings places ChatGPT model defaults second and Workers & recovery third, after Continuation
@@ -1693,10 +1731,13 @@ installation directories remain valid; no operating-system long-path setting is 
 
 Enabled installations restore/connect in the background and remain available while idle; there
 is no idle-eviction/restart loop. Disable/uninstall revokes exposure synchronously before slow
-shutdown. Accept bounded validated schemas (up to 64 tools, bounded schema bytes), preserve
+shutdown. Accept bounded validated schemas (up to 256 upstream tools and 250,000 schema bytes), preserve
 upstream names, and fail closed on collisions, including retained disabled-name claims. A
 cached unauthorized schema is not live exposure. External servers retain their own OS/account
 permissions; the app's approved-path wrapper is not an OS sandbox around a third-party process.
+Refresh observations allow the registrar's one additional code-mode tool. Legacy 64-tool
+snapshots (plus optional code mode) can enroll only as an exact declaration subset of the
+current Plugins publication; refresh completion still requires the complete current catalog.
 
 Remote OAuth uses endpoint-scoped encrypted credentials and SDK registration/PKCE/refresh.
 Only explicit sign-in opens the browser/loopback authorization flow; ordinary reconnect does
