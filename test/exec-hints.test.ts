@@ -113,7 +113,7 @@ describe('a non-zero exit that is a result rather than a failure', () => {
     expect(nonZeroExitIsBenign(`${BOUND_RG} -n "Max" $root | Select-Object -First 160`, 1, output)).toBe(true);
   });
 
-  it('keeps matches from valid paths when one ripgrep path is missing', () => {
+  it('keeps a partially answered search classified as failed when a requested path is unreadable', () => {
     const output = [
       'Process exited with code 2',
       'Output:',
@@ -121,10 +121,10 @@ describe('a non-zero exit that is a result rather than a failure', () => {
       'src/main.ts:9:export const found = true;'
     ].join('\n');
     const command = `${BOUND_RG} -n found src/missing.ts src/main.ts`;
-    expect(nonZeroExitIsBenign(command, 2, output)).toBe(true);
-    const note = benignExitNote(command, 'powershell', 2, output);
-    expect(note).toMatch(/not a failed search/);
-    expect(note).toContain('src/missing.ts');
+    expect(nonZeroExitIsBenign(command, 2, output)).toBe(false);
+    expect(nonZeroExitIsBenign(command, 2, output.replace(
+      'The system cannot find the file specified. (os error 2)', 'Access is denied. (os error 5)'
+    ))).toBe(false);
   });
 
   it('keeps diagnostic-only, multi-statement, and bare ripgrep exit 2 as failures', () => {
@@ -333,6 +333,18 @@ describe('a non-zero exit that is a result rather than a failure', () => {
     ].join('\n');
     expect(nonZeroExitIsBenign('Write-Output hi && rg foo', 1, parserError)).toBe(false);
     expect(nonZeroExitIsBenign('rg foo || Write-Output no', 1, parserError)).toBe(false);
+  });
+
+  it.each([
+    'zsh:1: no matches found: missing/*.ts',
+    'zsh: no matches found: missing/*.ts',
+    '/bin/bash: line 1: /bin/rg: No such file or directory',
+    'sh: 1: cannot create /missing/file: Directory nonexistent',
+    '-zsh: permission denied: /bin/rg',
+    'dash: 1: /bin/rg: not found'
+  ])('never exempts POSIX shell refusal: %s', (diagnostic) => {
+    expect(nonZeroExitIsBenign('/bin/rg needle missing/*.ts', 1, diagnostic)).toBe(false);
+    expect(nonZeroExitIsBenign('/bin/rg needle sample.txt', 1, '')).toBe(true);
   });
 
   it('never exempts a search the shell could not even find', () => {
@@ -916,11 +928,11 @@ const WORKER_2_IMPORT_SWEEP =
   'connection\\.js\'|connection\\.js\\"" test src | Select-Object -First 200';
 
 describe('repairing a bash-style escaped quote', () => {
-  it('re-quotes the argument PowerShell would have refused, keeping the backslash', () => {
+  it('re-quotes a regex without embedded native quotes', () => {
     const repaired = repairPowerShellQuoting(WORKER_2_SYMBOL_SWEEP, 'powershell');
     expect(repaired.cmd).toContain(
       "rg -n 'connection:|connectBtn|connect-button|connecting|disconnect|applySettings|" +
-        "saveSettings|onState|state === ''starting|state === \\\"starting' src/main/ipc.ts"
+        "saveSettings|onState|state === ''starting|state === \\x22starting' src/main/ipc.ts"
     );
     // The statements that had nothing to do with the broken quote are untouched.
     expect(repaired.cmd).toContain("echo '--- connection diff ---'; git diff -- src/main/connection.ts");
@@ -930,8 +942,8 @@ describe('repairing a bash-style escaped quote', () => {
   it('repairs every broken argument on the line and leaves the rest of it alone', () => {
     const repaired = repairPowerShellQuoting(WORKER_2_IMPORT_SWEEP, 'powershell');
     expect(repaired.cmd).toBe(
-      "rg -n 'from ''../src/main/connection|from \\\"../src/main/connection|" +
-        "connection\\.js''|connection\\.js\\\"' test src | Select-Object -First 200"
+      "rg -n 'from ''../src/main/connection|from \\x22../src/main/connection|" +
+        "connection\\.js''|connection\\.js\\x22' test src | Select-Object -First 200"
     );
   });
 
@@ -952,7 +964,7 @@ describe('repairing a bash-style escaped quote', () => {
     }
 
     expect(repairPowerShellQuoting(recorded[4] as string, 'powershell').cmd).toBe(
-      String.raw`rg -n 'from [''\"][^''\"]*fsops\.js[''\"]' src/main --glob '!out/**'`
+      String.raw`rg -n 'from [''\x22][^''\x22]*fsops\.js[''\x22]' src/main --glob '!out/**'`
     );
   });
 
@@ -1281,11 +1293,12 @@ describe('hinting at a search path that does not exist', () => {
     'src/main/workspace.ts:67: export function workspaceKey(): string | null {'
   ].join('\n');
 
-  it('says the other matches are still a complete answer', () => {
+  it('preserves useful matches without claiming the requested search was complete', () => {
     const hints = execRecoveryHints('rg -n "workspaceKey" src/main/codex/workspace.ts src/main/workspace.ts', PARTIAL);
     expect(hints).toHaveLength(1);
     expect(hints[0]).toContain('does not exist');
-    expect(hints[0]).toContain('complete answer for the paths that do');
+    expect(hints[0]).toContain('incomplete');
+    expect(hints[0]).not.toContain('complete answer');
   });
 
   it('does not take over the unexpanded-glob case, which is a different error', () => {

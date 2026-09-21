@@ -1,0 +1,75 @@
+{
+  "schema_version": 2,
+  "role": "worker",
+  "objective": "Integrate upstream Chat On Steroids v2.1.0 commit 1517d66dac1e7452f63b7452c88479c92a554768 into the current fork HEAD ff5d1fa44d250bc7a38e896ac4052b3cc9419be3 in /Users/berke/Downloads/Projects/chat-on-steroids. Read the complete AGENTS.md before changing anything. Perform a real semantic merge of the full upstream release, not cherry-picks. Use git merge --no-commit against the exact peeled commit and leave the final result uncommitted for supervisor review. Preserve the untracked .supervisor-shunt directory and do not add it to Git. Preserve all current custom behavior and tests: protected local control service, workspace lease evidence, fixed-purpose read-only scout/reviewer broker with one native macOS seatbelt, private canonical runtime/CODEX_HOME, read-only auth access, Shunt transport compatibility, model-independent task_id/status session_finish, exact completion binding, final messages recorded after turn_end, and the user-facing intent that CoS owns reasoning while Luna xhigh implements. Adopt upstream 2.1.0 ownership fixes in full, especially reliable queued follow-ups, active MCP ownership, resume/recovery ownership, completed-chat recovery, setup/sidebar improvements, dependency updates, process cleanup, and release deadline fixes. Resolve conflicts semantically. Trial merge-tree reports textual conflicts in THIRD-PARTY-NOTICES.txt, test/code-mode-mcp.test.ts, and test/plugins-manager.test.ts. Do not hand-merge generated notice inventory: take source/lock/catalog/script changes as appropriate and regenerate notices with repository scripts. Closely inspect overlapping changes in src/main/session/input.ts, src/main/bridge.ts, src/main/mcp/kernel.ts, src/main/mcp/tools-core.ts, src/main/ipc.ts, src/main/index.ts, AGENTS.md, plus adjacent tests. Do not discard either upstream ownership fixes or custom control-task invariants. Update package/version resources coherently to 2.1.0, including package.json/package-lock.json, src/main/version.ts, and extension/manifest.json as required by repository conventions. Preserve unrelated working-tree state. Do not install, publish, commit, push, edit installed runtime/config, or launch nested Shunt agents. Run at least git diff --check, npm run typecheck, focused custom control/broker/completion tests, and focused upstream queue/recovery tests that you can identify from the merge. Return the exact merge/conflict decisions, changed files, verification commands/results, any unresolved blocker, and anything the supervisor should inspect independently.",
+  "cwd": "/Users/berke/Downloads/Projects/chat-on-steroids",
+  "files": [
+    "AGENTS.md",
+    "package.json",
+    "package-lock.json",
+    "src/**",
+    "extension/**",
+    "scripts/**",
+    "docs/**",
+    "test/**",
+    "THIRD-PARTY-NOTICES.txt",
+    "CHANGELOG.md",
+    "README.md",
+    "CONTRIBUTING.md",
+    "CONTRIBUTORS.md"
+  ],
+  "ownership": {
+    "write": [
+      "AGENTS.md",
+      "package.json",
+      "package-lock.json",
+      "src/**",
+      "extension/**",
+      "scripts/**",
+      "docs/**",
+      "test/**",
+      "THIRD-PARTY-NOTICES.txt",
+      "CHANGELOG.md",
+      "README.md",
+      "CONTRIBUTING.md",
+      "CONTRIBUTORS.md"
+    ],
+    "read_extra": [
+      ".gitignore",
+      "electron-builder.yml",
+      "vitest.config.ts",
+      "tsconfig.json"
+    ]
+  },
+  "verified_interfaces": [
+    "upstream v2.1.0 full-release behavior",
+    "protected local control service and workspace lease evidence",
+    "single-seatbelt read-only Supervisor Shunt broker with private CODEX_HOME and immutable auth reference",
+    "model-independent session_finish task completion with exact completion binding",
+    "final assistant recording after turn_end",
+    "queued follow-up, MCP ownership, continuation and recovery ownership"
+  ],
+  "constraints": [
+    "Use exactly the requested repository and exact merge target commit.",
+    "Do not add or modify .supervisor-shunt artifacts except reading this contract.",
+    "No nested Shunt or CoS worker agents.",
+    "No Goal or Loop.",
+    "No release publishing, app installation, commit, or push.",
+    "Regenerate generated notices from repository scripts rather than hand-editing inventory.",
+    "Preserve unrelated work and custom control-task invariants while taking upstream ownership fixes."
+  ],
+  "verification": [
+    ["git", "diff", "--check"],
+    ["npm", "run", "typecheck"],
+    ["npx", "vitest", "run", "test/control-service.test.ts", "test/control-readonly-live.test.ts", "test/session-finish.test.ts"],
+    ["npx", "vitest", "run", "test/session-input.test.ts", "test/input-delivery-integration.test.ts", "test/continuation.test.ts", "test/resume.test.ts", "test/bridge.test.ts"]
+  ],
+  "previous_failure": null,
+  "return_contract": {
+    "summary": true,
+    "files_changed": true,
+    "verification": true,
+    "unexpected_findings": true,
+    "needs_supervisor_decision": true
+  }
+}

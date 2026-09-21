@@ -50,6 +50,7 @@ const {
 } = await import('../src/main/agents.js');
 const {
   AUTOMATIC_HANDOVER_TTL_MS,
+  CONTINUATION_PRO_WRITING_TTL_MS,
   CONTINUATION_TTL_MS,
   abortContinuation,
   abortContinuationSourceBeforeSendNow,
@@ -84,6 +85,10 @@ const { recordChatObservations, resetRecorderForTests, sessionForConversation } 
 const { resetWorkspaces, setWorkspaceFor, workspaceEntries } = await import('../src/main/workspace.js');
 const {
   goalObjectiveFor,
+  goalPendingReplyFor,
+  goalSwitchFor,
+  restoreGoalReplies,
+  setGoalSwitchNow,
   resetGoalStateForTests,
   setGoalObjective
 } = await import('../src/main/goal.js');
@@ -408,6 +413,9 @@ describe('committing', () => {
     expect(before).toBe(sessionId);
     setWorkspaceFor(`chat:${CHAT_A}`, { virtual: '/workspace/project', real: dir });
     setGoalObjective(CHAT_A, 'finish the overnight release');
+    await setGoalSwitchNow(CHAT_A, 'loop', true, true);
+    restoreGoalReplies({ version: 1, savedAt: Date.now(), replies: [{ conversationId: CHAT_A,
+      sessionId, replyId: 'source-final', turnId: 'source-turn', eventSeq: 1, acceptedAt: Date.now(), state: 'pending' }] });
     await claimContinuationNow(token, 'tab-1');
     const committedHandoffId = continuationForSession(sessionId)?.handoffId;
 
@@ -424,6 +432,12 @@ describe('committing', () => {
     expect(workspaceEntries().map((held) => held.key)).toEqual([`chat:${CHAT_B}`]);
     expect(goalObjectiveFor(CHAT_A)).toBe('');
     expect(goalObjectiveFor(CHAT_B)).toBe('finish the overnight release');
+    expect(goalSwitchFor(CHAT_B)).toMatchObject({ enabled: true, mode: 'loop', afterTurn: true });
+    expect(goalSwitchFor(CHAT_A).own).toBe(false);
+    expect(goalPendingReplyFor(CHAT_A)).toBeNull();
+    expect(goalPendingReplyFor(CHAT_B)).toBeNull();
+    await restoreContinuations(snapshotContinuations());
+    expect(goalSwitchFor(CHAT_B)).toMatchObject({ enabled: true, mode: 'loop', afterTurn: true });
   });
 
   it('refuses a chat B that is not a distinct conversation', async () => {
@@ -1133,6 +1147,43 @@ describe('a brief that cannot be the whole handoff', () => {
  * clears would make every unrelated new chat wait.
  */
 describe('the window in which a replacement chat is expected', () => {
+  it('keeps an early destination observation with the original session after a slow resume commit', async () => {
+    const { sessionId, token } = await readyContinuation();
+    const destination = '92929292-1111-4222-8333-444444444444';
+    await claimContinuationNow(token, 'slow-resume-command');
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const create = vi.spyOn(store, 'createSession');
+    const gate = vi.spyOn(await import('../src/main/session/resume-gate.js'), 'resumeOpeningChat');
+    const observation = sessionForConversation(destination);
+    await vi.waitFor(() => expect(gate.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await vi.advanceTimersByTimeAsync(6_000);
+
+    // The command still owns its sixty-second claim. Five seconds without its ACK
+    // cannot authorize a second durable session for the destination.
+    expect(resumeOpeningChat()).toBe(true);
+    expect(await commitContinuation(token, destination)).toBe(true);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await observation).toBe(sessionId);
+    expect(create).not.toHaveBeenCalled();
+    expect((await store.findSessionByConversation(destination))?.id).toBe(sessionId);
+  });
+
+  it.each(['abort', 'expiry'] as const)('releases unrelated new recording when the resume claim ends by %s', async reason => {
+    const { token } = await readyContinuation();
+    await claimContinuationNow(token, 'unfinished-resume-command');
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const unrelated = reason === 'abort' ? '93939393-1111-4222-8333-444444444444' : '94949494-1111-4222-8333-444444444444';
+    const gate = vi.spyOn(await import('../src/main/session/resume-gate.js'), 'resumeOpeningChat');
+    const observation = sessionForConversation(unrelated);
+    await vi.waitFor(() => expect(gate.mock.calls.length).toBeGreaterThanOrEqual(2));
+    if (reason === 'abort') abortContinuation(token, 'cancelled before destination');
+    await vi.advanceTimersByTimeAsync(reason === 'expiry' ? RESUME_CLAIM_WINDOW_MS + 100 : 100);
+    const sessionId = await observation;
+    expect(sessionId).toBeTruthy();
+    expect((await getSession(sessionId!))?.conversationId).toBe(unrelated);
+    expect(resumeOpeningChat()).toBe(false);
+  });
+
   it('is armed by a claim and cleared by the commit', async () => {
     expect(resumeOpeningChat()).toBe(false);
     const { sessionId, token } = await readyContinuation();
@@ -1556,6 +1607,77 @@ describe('an exact handoff response owns its waiting deadline', () => {
       vi.setSystemTime(Date.now() + CONTINUATION_TTL_MS);
       expect(continuationByToken(opened.token)?.state).toBe('aborted');
       expect(await bindContinuationSourceMessageNow(opened.token, 'exact-user-message', 1000)).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([
+    { name: 'a pro effort selection', model: 'gpt-6', effort: 'pro', pro: true },
+    { name: 'a pro model slug', model: 'gpt-5.6-pro', effort: null, pro: true },
+    { name: 'an ordinary model', model: 'gpt-5.6-sol', effort: 'high', pro: false },
+    { name: 'an unobserved selection', model: null, effort: null, pro: false }
+  ] as const)('keeps a writing manual ticket alive past ten minutes only for a frozen Pro selection ($name)', async ({ model, effort, pro }) => {
+    vi.useFakeTimers();
+    try {
+      const session = await createSession({ title: 'writing deadline identity', conversationId: CHAT_A });
+      if (model !== null) await store.observeSessionModel(session.id, CHAT_A, model, 10, effort ?? undefined);
+      const opened = await openContinuationNow(session.id, CHAT_A);
+      await beginContinuationSourceSendNow(opened.token);
+      await dispatchContinuationSourceSendNow(opened.token);
+      expect(await bindContinuationSourceMessageNow(opened.token, 'exact-user-message')).toBe(true);
+
+      // Pro reasoning is not visible transcript growth, so nothing renews this clock while the
+      // model thinks. Only the frozen Pro identity earns the longer writing deadline.
+      vi.setSystemTime(Date.now() + CONTINUATION_TTL_MS + 1);
+      expect(continuationByToken(opened.token)?.state).toBe(pro ? 'awaiting-summary' : 'aborted');
+
+      // The longer clock is still a clock: a genuinely silent ticket expires.
+      vi.setSystemTime(Date.now() + CONTINUATION_PRO_WRITING_TTL_MS);
+      expect(continuationForSession(session.id)).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('restores a Pro ticket still inside its writing window instead of dropping it as ancient', async () => {
+    vi.useFakeTimers();
+    try {
+      const session = await createSession({ title: 'pro restore', conversationId: CHAT_A });
+      await store.observeSessionModel(session.id, CHAT_A, 'gpt-5.6-pro', 10);
+      const opened = await openContinuationNow(session.id, CHAT_A);
+      await beginContinuationSourceSendNow(opened.token);
+      await dispatchContinuationSourceSendNow(opened.token);
+      await bindContinuationSourceMessageNow(opened.token, 'exact-user-message');
+
+      // Past twice the ordinary manual TTL: the restore-time retention window used to drop
+      // this record silently even though the live sweep would still have kept it.
+      vi.setSystemTime(Date.now() + CONTINUATION_TTL_MS * 2 + 1);
+      const snapshot = snapshotContinuations();
+      resetContinuationsForTests();
+      await restoreContinuations(snapshot);
+      expect(continuationByToken(opened.token)?.state).toBe('awaiting-summary');
+
+      // Past the Pro writing clock after restore, it expires on the same terms as live.
+      vi.setSystemTime(Date.now() + CONTINUATION_PRO_WRITING_TTL_MS);
+      expect(continuationByToken(opened.token)?.state).toBe('aborted');
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('returns a captured Pro brief to the ordinary clock for the app-paced phases', async () => {
+    vi.useFakeTimers();
+    try {
+      const session = await createSession({ title: 'pro captured', conversationId: CHAT_A });
+      await store.observeSessionModel(session.id, CHAT_A, 'gpt-5.6-pro', 10);
+      const opened = await openContinuationNow(session.id, CHAT_A);
+      await beginContinuationSourceSendNow(opened.token);
+      await dispatchContinuationSourceSendNow(opened.token);
+      await bindContinuationSourceMessageNow(opened.token, 'exact-user-message');
+      // Twenty minutes of invisible Pro reasoning must not lose the ticket.
+      vi.setSystemTime(Date.now() + 20 * 60_000);
+      expect(continuationByToken(opened.token)?.state).toBe('awaiting-summary');
+
+      expect(await attachSummary(opened.token, SAMPLE_BRIEF)).not.toBeNull();
+      expect(continuationByToken(opened.token)?.state).toBe('awaiting-chat');
+      // Opening the replacement is app-paced work; the ordinary ten-minute clock is back.
+      vi.setSystemTime(Date.now() + CONTINUATION_TTL_MS + 1);
+      expect(continuationByToken(opened.token)?.state).toBe('aborted');
     } finally { vi.useRealTimers(); }
   });
 });

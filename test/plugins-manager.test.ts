@@ -77,6 +77,7 @@ afterEach(async () => {
   await removeTempDir(dir);
 });
 describe('external plugin authority', () => {
+<<<<<<< HEAD
   it('refuses local plugin sources before installation or subprocess launch in production mode', async () => {
     const production = new PluginManager();
     await production.initialize(dir);
@@ -84,6 +85,88 @@ describe('external plugin authority', () => {
       .rejects.toThrow('Local plugins are disabled');
     expect(production.snapshot().plugins).toEqual([]);
     await production.close();
+=======
+  it('classifies an unknown Plugins name without dispatching or implying a disabled Core permission', async () => {
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const outcome = vi.fn();
+    const result = await manager.call('read', { path: 'example.txt' }, outcome);
+    expect(JSON.stringify(result)).toContain('UNKNOWN_TOOL');
+    expect(JSON.stringify(result)).toContain('current Plugins catalog');
+    expect(JSON.stringify(result)).not.toContain('PLUGIN_DISABLED');
+    expect(JSON.stringify(result)).toContain('This call was not dispatched.');
+    expect(result.isError).toBe(true);
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('uses exposure conflicts for refused calls even while either claimant is disabled', async () => {
+    const first = (await manager.install({ name: 'First integration', source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const second = (await manager.install({ name: 'Second integration', source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[1]!;
+    expect(manager.tools()).toEqual([]);
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const refused = async () => JSON.stringify(await manager.call('Echo.Mixed', { value: 'must not dispatch' }));
+    expect(await refused()).toContain('PLUGIN_NOT_EXPOSED');
+    expect(await refused()).toContain('conflicting declarations');
+    await manager.setEnabled(first.id, false);
+    expect(await refused()).toContain('PLUGIN_NOT_EXPOSED');
+    await manager.setEnabled(first.id, true);
+    await manager.setToolEnabled(second.id, 'Echo.Mixed', false);
+    expect(await refused()).toContain('PLUGIN_NOT_EXPOSED');
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('reports the existing schema-limit issue while a published neighbor remains callable', async () => {
+    const tools = Array.from({ length: 3 }, (_, index) => ({
+      name: `large_${index}`, description: 'x'.repeat(100000), inputSchema: { type: 'object' },
+    }));
+    await fs.writeFile(entry, fixture.replace(/const tools=.*?;\n/, `const tools=${JSON.stringify(tools)};\n`));
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    expect(manager.tools().map(tool => tool.name)).toEqual(['large_0', 'large_1']);
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const refused = JSON.stringify(await manager.call('large_2'));
+    expect(refused).toContain('PLUGIN_NOT_EXPOSED');
+    expect(refused).toContain('schema size limit');
+    expect(refused).toContain('This call was not dispatched.');
+    expect(upstream).not.toHaveBeenCalled();
+    expect((await manager.call('large_0', { value: 'published neighbor' })).isError).not.toBe(true);
+    expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a server failure distinct from a disabled tool on subsequent cached calls', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const upstream = vi.spyOn(Client.prototype, 'callTool').mockRejectedValueOnce(new Error('private transport details'));
+    expect(JSON.stringify(await manager.call('Echo.Mixed', { value: 'first' }))).toContain('PLUGIN_CALL_FAILED');
+    expect(manager.snapshot().plugins[0]?.status).toBe('error');
+    const outcome = vi.fn();
+    const next = JSON.stringify(await manager.call('Echo.Mixed', { value: 'second' }, outcome));
+    expect(next).toContain('PLUGIN_UNAVAILABLE');
+    expect(next).toContain('Restart this plugin');
+    expect(next).not.toContain('Refresh the Plugins connector');
+    expect(next).not.toContain('private transport details');
+    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(outcome).toHaveBeenCalledWith('tool_rejected');
+    await manager.setEnabled(row.id, false);
+    const disabled = JSON.stringify(await manager.call('Echo.Mixed', { value: 'third' }));
+    expect(disabled).toContain('PLUGIN_DISABLED');
+    expect(disabled).toContain('Enable');
+    expect(disabled).toContain('This call was not dispatched.');
+    expect(disabled).not.toContain('Restart this plugin');
+    expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves accepted protocol results and treats upstream error text only as execution output', async () => {
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const exact = { content: [{ type: 'text' as const, text: 'safe result' }], structuredContent: { value: 'safe result' }, _meta: { fixture: 'kept' } };
+    upstream.mockResolvedValueOnce(exact);
+    expect(await manager.call('Echo.Mixed', { value: 'safe result' })).toEqual(exact);
+    const upstreamError = { ...exact, isError: true, content: [{ type: 'text' as const, text: 'PLUGIN_DISABLED is merely upstream text' }] };
+    upstream.mockResolvedValueOnce(upstreamError);
+    const outcome = vi.fn();
+    expect(await manager.call('Echo.Mixed', { value: 'error text' }, outcome)).toEqual(upstreamError);
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_execution_error');
+    expect(upstream).toHaveBeenCalledTimes(2);
+>>>>>>> origin/main
   });
 
   it('keeps Windows package data below MAX_PATH across installation and replacement', async () => {
@@ -155,7 +238,11 @@ describe('external plugin authority', () => {
       expect(manager.tools().map(tool => tool.name)).toEqual(['Echo.Revised']);
       disabled = manager.setToolEnabled(row.id, 'Echo.Revised', false);
       expect(manager.tools()).toEqual([]);
-      expect((await manager.call('Echo.Mixed', { value: 'never admitted' })).isError).toBe(true);
+      const upstream = vi.spyOn(Client.prototype, 'callTool');
+      const refused = JSON.stringify(await manager.call('Echo.Mixed', { value: 'never admitted' }));
+      expect(refused).toContain('UNKNOWN_TOOL');
+      expect(refused).toContain('This call was not dispatched.');
+      expect(upstream).not.toHaveBeenCalled();
     } finally {
       releaseSave();
       unsubscribe();
@@ -197,6 +284,54 @@ describe('external plugin authority', () => {
     expect(manager.tools()).toEqual([]);
     await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('needs-auth'));
     expect(fetcher).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled();
+    const outcome = vi.fn();
+    const refused = JSON.stringify(await manager.call('Echo.Mixed', { value: 'unavailable' }, outcome));
+    expect(refused).toContain('PLUGIN_NEEDS_AUTH');
+    expect(refused).toContain('Sign in');
+    expect(refused).toContain('This call was not dispatched.');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(fetcher).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled();
+  });
+  it('reports authenticating without dispatching or starting another sign-in', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    await manager.configure(row.id, { source: { kind: 'remote', url: 'https://oauth.example/mcp', auth: 'oauth' } });
+    let began!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { began = resolve; });
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const signIn = vi.spyOn(PluginOAuth.prototype, 'signIn').mockImplementation(async () => { began(); await pending; });
+    await manager.authenticate(row.id); await started;
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const refused = JSON.stringify(await manager.call('Echo.Mixed'));
+    expect(refused).toContain('PLUGIN_AUTHENTICATING');
+    expect(refused).toContain('Finish the current sign-in');
+    expect(refused).toContain('This call was not dispatched.');
+    expect(signIn).toHaveBeenCalledTimes(1);
+    expect(upstream).not.toHaveBeenCalled();
+    await manager.cancelAuthentication(row.id); release();
+  });
+
+  it('distinguishes shutdown and startup failure while rejecting the requested tool exactly once', async () => {
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    await manager.close();
+    let outcome = vi.fn();
+    const closing = JSON.stringify(await manager.call('Echo.Mixed', {}, outcome));
+    expect(closing).toContain('PLUGIN_UNAVAILABLE: Plugins are shutting down.');
+    expect(closing).toContain('This call was not dispatched.');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(upstream).not.toHaveBeenCalled();
+
+    const file = path.join(dir, 'state', 'plugins.json');
+    const stored = JSON.parse(await fs.readFile(file, 'utf8'));
+    stored[0].launch.command = 'cos-nonexistent-runtime';
+    await fs.writeFile(file, JSON.stringify(stored));
+    manager = new PluginManager(); await manager.initialize(dir);
+    outcome = vi.fn();
+    const failed = JSON.stringify(await manager.call('Echo.Mixed', {}, outcome));
+    expect(failed).toContain('PLUGIN_START_FAILED');
+    expect(failed).toContain('This call was not dispatched.');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(upstream).not.toHaveBeenCalled();
   });
   it('keeps needs-auth and unpublishes cached tools after an authenticated call retires its expired connection', async () => {
     const endpoint = 'https://oauth.example/mcp';
@@ -419,15 +554,22 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     const upstreamOutcome = vi.fn();
     expect((await manager.call(tool.name, { value: 'error' }, upstreamOutcome)).isError).toBe(true);
     expect(upstreamOutcome).toHaveBeenCalledExactlyOnceWith('tool_execution_error');
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
     await manager.setToolEnabled(row.id, 'Echo.Mixed', false);
     expect(manager.tools()).toEqual([]);
-    expect((await manager.call(tool.name, { value: 'blocked' })).isError).toBe(true);
+    const toolDisabled = JSON.stringify(await manager.call(tool.name, { value: 'blocked' }));
+    expect(toolDisabled).toContain('PLUGIN_DISABLED');
+    expect(toolDisabled).toContain('This call was not dispatched.');
+    expect(upstream).not.toHaveBeenCalled();
     await manager.setToolEnabled(row.id, 'Echo.Mixed', true);
     await manager.setEnabled(row.id, false);
     expect(manager.tools()).toEqual([]);
     const blockedOutcome = vi.fn();
-    expect((await manager.call(tool.name, {}, blockedOutcome)).isError).toBe(true);
+    const pluginDisabled = JSON.stringify(await manager.call(tool.name, {}, blockedOutcome));
+    expect(pluginDisabled).toContain('PLUGIN_DISABLED');
+    expect(pluginDisabled).toContain('This call was not dispatched.');
     expect(blockedOutcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(upstream).not.toHaveBeenCalled();
   });
   it('seals credentials separately and redacts echoed credentials and recordable values', async () => {
     const result = await manager.install({

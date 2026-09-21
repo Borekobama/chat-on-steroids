@@ -1,0 +1,1 @@
+{"schema_version": 1, "role": "worker", "status": "failed", "blockers": ["Codex worker failed (1): 2026-09-13T12:48:04.920576Z  WARN codex_core::agents_md: project doc exceeds remaining budget; truncating path=file:///Users/berke/Downloads/Projects/chat-on-steroids/AGENTS.md remaining_bytes=32768"]}

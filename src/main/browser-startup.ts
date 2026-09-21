@@ -6,8 +6,8 @@ import { getConfig } from './config.js';
 let waking: { lastSeenAt: number | null; selected: string; work: Promise<void>; failed: boolean; finished: boolean } | null = null;
 /** One browser startup per absence episode, shared by authored sends, discovery and owed recovery. */
 export async function wakeBrowserUrl(url: string, retry = false, backgroundStartup = false,
-  authority?: { current(): boolean }): Promise<void> {
-  if (authority && !authority.current()) return;
+  authority?: { current(): boolean | Promise<boolean> }): Promise<void> {
+  if (authority && !await authority.current()) return;
   const browser = await bridgeStatus();
   const managed = getConfig().ui.managedBrowser === true;
   if (!managed && browserWakeConnected()) { waking = null; return; }
@@ -16,6 +16,7 @@ export async function wakeBrowserUrl(url: string, retry = false, backgroundStart
   // suspended. Only process absence permits an OS launch; forwarding a URL to
   // an existing Chrome process can activate it even with minimized startup flags.
   const prior = waking;
+<<<<<<< HEAD
   // Managed URLs always go through an explicit --user-data-dir launch. A personal extension
   // connection or browser process cannot satisfy that ownership boundary.
   const absent = managed || await isPreferredBrowserRunning() === false;
@@ -25,6 +26,15 @@ export async function wakeBrowserUrl(url: string, retry = false, backgroundStart
   // the exact recovery meanwhile; a missing socket alone never proves Chrome exited.
   if (authority && !authority.current()) return;
   if (!managed && browserWakeConnected()) { waking = null; return; }
+=======
+  const absent = await isPreferredBrowserRunning() === false;
+  // The process query yields. Off, a collected reply or a new navigation can revoke
+  // the exact recovery meanwhile; a missing socket alone never proves Chrome exited.
+  if (authority && !await authority.current()) return;
+  // Both the process probe and durable recovery validation may yield.
+  if (selected !== (getConfig().ui.chatBrowser ?? 'chrome')) return;
+  if (browserWakeConnected()) { waking = null; return; }
+>>>>>>> origin/main
   if (!absent) return;
   if (retry && waking === prior && (waking?.failed || waking?.finished)) waking = null;
   // Until the extension registers, another explicit send belongs to the same startup.

@@ -1,0 +1,1 @@
+{"schema_version": 1, "role": "worker", "status": "failed", "blockers": ["Codex worker failed (1): Not inside a trusted directory and --skip-git-repo-check was not specified."]}

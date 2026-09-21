@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "role": "worker",
+  "objective": "Correct the existing CoS read-only broker patch; do not redesign unrelated code. The current policy is NOT acceptable because readonlySeatbeltProfile grants global file-read*, and runReadonlyCodex leaves CODEX_HOME unset while HOME points at the real home. Fix the OS boundary so the child can read only what it needs: the canonical project workspace, its private broker runtime/CODEX_HOME, the shipped Codex executable/application/system runtime files required to execute and establish TLS, and the existing ~/.codex/auth.json as a read-only credential reference. It must not gain general read access to unrelated user home files, and it must not write/rename/unlink the real auth file or real ~/.codex. Create a private 0700 CODEX_HOME inside the broker runtime and reference auth without copying or logging credential bytes. Keep writes limited to that runtime. Preserve network needed for Codex, and keep the single whole-process macOS seatbelt with no nested seatbelt. Strengthen tests so they fail if the policy contains an unconditional allow file-read*, if HOME/CODEX_HOME can direct state to real ~/.codex, or if source workspace write is permitted. Also ensure timeout cleanup owns the child process tree if needed. Keep the endpoint fixed-purpose and all current validation. Run focused tests/typecheck/diff check. Return success only if these requirements are actually met; otherwise name the exact blocker. Do not spawn agents.",
+  "cwd": "/Users/berke/Downloads/Projects/chat-on-steroids",
+  "files": [
+    "src/main/control-readonly.ts",
+    "src/main/control-service.ts",
+    "test/control-service.test.ts"
+  ],
+  "ownership": {
+    "write": [
+      "src/main/control-readonly.ts",
+      "src/main/control-service.ts",
+      "test/control-service.test.ts"
+    ],
+    "read_extra": [
+      "AGENTS.md",
+      "src/main/exec.ts",
+      "src/main/codex/unified-exec.ts",
+      "src/main/config.ts"
+    ]
+  },
+  "verified_interfaces": [
+    "single macOS seatbelt",
+    "Projects workspace read-only",
+    "private per-run CODEX_HOME",
+    "real auth readable but immutable",
+    "fixed control socket operation"
+  ],
+  "constraints": [
+    "Preserve unrelated changes and the useful parts of the prior patch.",
+    "No broad user-home reads.",
+    "No secret copy/log.",
+    "No generic command broker.",
+    "No nested seatbelt.",
+    "No installed runtime/config edits."
+  ],
+  "verification": [
+    [
+      "npx",
+      "vitest",
+      "run",
+      "test/control-service.test.ts"
+    ],
+    [
+      "npx",
+      "tsc",
+      "--noEmit"
+    ],
+    [
+      "git",
+      "diff",
+      "--check"
+    ]
+  ],
+  "previous_failure": {
+    "error": "Supervisor review rejected the first patch because its seatbelt used unconditional (allow file-read*) and it did not use a private per-run CODEX_HOME, violating Projects-only and read-only credential requirements."
+  },
+  "return_contract": {
+    "summary": true,
+    "files_changed": true,
+    "verification": true,
+    "unexpected_findings": true,
+    "needs_supervisor_decision": true
+  }
+}

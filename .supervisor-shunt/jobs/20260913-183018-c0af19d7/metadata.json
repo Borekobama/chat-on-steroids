@@ -1,0 +1,9 @@
+{
+  "job_id": "20260913-183018-c0af19d7",
+  "parent_host": "chatgpt_cos",
+  "parent_model": "gpt-5.6-sol",
+  "parent_effort": "high",
+  "transport": "codex_exec",
+  "role": "worker",
+  "model": "gpt-5.6-luna"
+}

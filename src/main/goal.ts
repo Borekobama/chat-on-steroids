@@ -55,21 +55,21 @@ import { logInfo, logWarn } from './logger.js';
 import { getSecret } from './secrets.js';
 import { findSessionByConversation, getSession, readEvents, readHandoff, readRecentEvents, turnHasMcpCall } from './session/store.js';
 import { foldProgress } from '../shared/session.js';
-import { isAstraModel, isProModel } from '../shared/chat-models.js';
+import { supportsFinishAutomation } from '../shared/finish.js';
 
-/** Pro Loop defaults to finish-only; an exact chat switch may allow browser continuation. */
+/** A finish-only preference has authority only while the finish tool is available. */
 export async function astraFinishOnly(sessionId: string, conversationId: string): Promise<boolean> {
   const session = await getSession(sessionId);
   const selection = session?.selectedModel;
-  return session?.conversationId === conversationId && selection?.conversationId === conversationId &&
-    (isAstraModel(selection.model, selection.reasoningEffort) ||
-      (goalSwitchFor(conversationId).mode === 'loop' && isProModel(selection.model, selection.reasoningEffort))) &&
+  return getConfig().ui.finishTool === true && session?.conversationId === conversationId && selection?.conversationId === conversationId &&
+    supportsFinishAutomation(goalSwitchFor(conversationId).mode, selection.model, selection.reasoningEffort) &&
     !loopAfterTurnFor(conversationId);
 }
-/** Opt-in continuation uses the same durable switch as the existing Loop driver. */
+/** The saved loopAfterTurn preference now serves both Goal and Loop. Disabling
+ * finish makes after-turn effective without overwriting the user's preference. */
 export function loopAfterTurnFor(conversationId: string): boolean {
   const control = goalSwitchFor(conversationId);
-  return control.enabled && control.mode === 'loop' && control.afterTurn;
+  return control.enabled && (control.afterTurn || getConfig().ui.finishTool !== true);
 }
 import { resumeBootstrapMatches, resumeBootstrapText } from './session/handoff.js';
 import {
@@ -411,6 +411,8 @@ interface GoalReplyObligation {
   silenceSourceTurnId?: string;
   silencePro?: boolean;
   listenUntil?: number;
+  /** A native Stop is claimed once for this final, including across app restart. */
+  recoveryStopClaimed?: true;
   conversationId: string;
   sessionId: string;
   replyId: string;
@@ -481,7 +483,8 @@ export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
       !raw.replyId ||
       !raw.turnId ||
       !Number.isSafeInteger(raw.eventSeq) ||
-      raw.eventSeq < 1 ||
+      raw.eventSeq < 0 ||
+      (raw.eventSeq === 0 && raw.replyId !== `turn:${raw.turnId}`.slice(0, 200)) ||
       !Number.isSafeInteger(raw.acceptedAt) ||
       raw.acceptedAt <= 0 ||
       (raw.state !== 'pending' && raw.state !== 'handled')
@@ -495,6 +498,7 @@ export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
         { silenceSourceTurnId: raw.silenceSourceTurnId.slice(0, 200) } : {}),
       ...(Number.isSafeInteger(raw.listenUntil) && raw.listenUntil! > 0 ? { listenUntil: raw.listenUntil } : {}),
       ...(raw.silencePro === true ? { silencePro: true } : {}),
+      ...(raw.recoveryStopClaimed === true ? { recoveryStopClaimed: true } : {}),
       ...(raw.explicitActivation === true ? { explicitActivation: true } : {}),
       eventSeq: raw.eventSeq,
       acceptedAt: raw.acceptedAt,
@@ -526,9 +530,16 @@ export function goalDraftBusy(conversationId: string): boolean {
   return draft.stage === 'sending' || draft.stage === 'answering';
 }
 
+/** Reloading the source cannot repair a settled settings/transport refusal. */
+export function goalDraftNeedsIntervention(conversationId: string): boolean {
+  const draft = drafts.get(conversationId);
+  return draft?.stage === 'failed' && draft.turnId === goalReplies.get(conversationId)?.turnId &&
+    !retryableGoalFailure(draft.error ?? '');
+}
+
 export function goalPendingReplyFor(
   conversationId: string
-): Pick<GoalReplyObligation, 'replyId' | 'turnId' | 'eventSeq' | 'acceptedAt' | 'silenceSourceTurnId' | 'silencePro' | 'listenUntil'> | null {
+): Pick<GoalReplyObligation, 'replyId' | 'turnId' | 'eventSeq' | 'acceptedAt' | 'silenceSourceTurnId' | 'silencePro' | 'listenUntil' | 'explicitActivation'> | null {
   const reply = goalReplies.get(conversationId);
   // Expiry is read here as well as pruned on write, because the ledger is only pruned when
   // something writes to it. A chat reopened after the window must not be offered work the
@@ -536,6 +547,7 @@ export function goalPendingReplyFor(
   if (reply && Date.now() - reply.acceptedAt >= GOAL_REPLY_TTL_MS) return null;
   return reply?.state === 'pending'
     ? { replyId: reply.replyId, turnId: reply.turnId, eventSeq: reply.eventSeq, acceptedAt: reply.acceptedAt,
+      ...(reply.explicitActivation ? { explicitActivation: true as const } : {}),
       ...(reply.silenceSourceTurnId ? { silenceSourceTurnId: reply.silenceSourceTurnId } : {}),
       ...(reply.listenUntil ? { listenUntil: reply.listenUntil } : {}),
       ...(reply.silencePro ? { silencePro: true } : {}) }
@@ -893,7 +905,9 @@ export function goalSwitchFor(conversationId: string): { enabled: boolean; mode:
 
 /** One authority for finish generation and the lifetime of its queued instruction. */
 export function automaticFinishEnabled(conversationId: string): boolean {
-  return getConfig().ui.finishAction === 'goal' || goalSwitchFor(conversationId).enabled;
+  // Finish is another boundary of this chat's Goal/Loop, not a separate grant.
+  // A legacy global finish action must never arm a chat whose effective mode is Off.
+  return goalSwitchFor(conversationId).enabled;
 }
 
 /** Chat identity, not a user preference: helper transcripts must never become Goal sources. */
@@ -978,13 +992,14 @@ export async function setGoalSwitchNow(
       afterTurn: afterTurn ?? before?.afterTurn ?? false, at: Date.now() });
     try {
       await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
-      return { enabled: next.enabled, mode: next.mode };
     } catch (error) {
       goalSwitches.delete(conversationId);
       if (before) goalSwitches.set(conversationId, before);
       writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
       throw error;
     }
+    notifyGoalChange();
+    return { enabled: next.enabled, mode: next.mode };
   });
 }
 
@@ -1156,13 +1171,10 @@ export async function ackGoalDraftNow(
 }
 
 /**
- * Retires every outstanding generation when Goal authority/settings are revoked or replaced.
- *
- * Disabling Goal, changing the model/reasoning, or replacing its credential must affect work
- * that is already in flight, not only the next draft. Each entry stays as a spent tombstone so
- * a reload cannot re-draft the same finished ChatGPT turn after the cancellation.
+ * Revoke attempts made under replaced settings; pending source work survives.
+ * Only an explicit master Off also discharges all automatic reply obligations.
  */
-export function retireGoalDrafts(): number {
+export function retireGoalDrafts(retireReplies = false): number {
   let retired = 0;
   for (const draft of drafts.values()) {
     if (draft.acknowledged) continue;
@@ -1173,8 +1185,13 @@ export function retireGoalDrafts(): number {
     draft.reply = '';
     retired += 1;
   }
-  for (const reply of goalReplies.values()) reply.state = 'handled';
-  if (goalReplies.size > 0) persistGoalRepliesSoon();
+  // A settings/key replacement revokes prepared text, not the source obligation.
+  // Removing the attempt permits that same source to use the corrected settings.
+  drafts.clear();
+  if (retireReplies) {
+    for (const reply of goalReplies.values()) reply.state = 'handled';
+    if (goalReplies.size > 0) persistGoalRepliesSoon();
+  }
   return retired;
 }
 
@@ -1300,7 +1317,7 @@ export async function withdrawSilenceGoalReplyNow(conversationId: string, replyI
 export async function deferSilenceGoalReplyNow(conversationId: string, turnId: string, listenUntil?: number,
   prepared?: { token: string; clientId: string }): Promise<boolean> {
   const reply = goalReplies.get(conversationId);
-  if (!reply || reply.state !== 'pending' || reply.turnId !== turnId || (!reply.silenceSourceTurnId && !prepared)) return false;
+  if (!reply || reply.state !== 'pending' || reply.turnId !== turnId) return false;
   if (prepared) {
     const draft = drafts.get(conversationId);
     if (!draft || draft.token !== prepared.token || draft.clientId !== prepared.clientId ||
@@ -1320,6 +1337,16 @@ export async function deferSilenceGoalReplyNow(conversationId: string, turnId: s
   try { await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies()); }
   catch (error) { persistGoalRepliesSoon(); throw error; }
   return goalReplies.get(conversationId) === reply;
+}
+
+/** The existing reply ledger owns the one busy wait and the irreversible Stop claim. */
+export async function claimGoalRecoveryStopNow(conversationId: string, replyId: string, acceptedAt: number): Promise<boolean> {
+  const reply = goalReplies.get(conversationId);
+  if (!reply || reply.replyId !== replyId || reply.acceptedAt !== acceptedAt || reply.state !== 'pending' || !goalArmedFor(conversationId) ||
+      !reply.listenUntil || reply.listenUntil > Date.now() || reply.recoveryStopClaimed) return false;
+  reply.recoveryStopClaimed = true;
+  await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+  return goalReplies.get(conversationId) === reply && reply.state === 'pending' && goalArmedFor(conversationId);
 }
 
 export function resetGoalStateForTests(): void {
@@ -1440,10 +1467,8 @@ function settle(draft: GoalDraft, stage: GoalStage, error: string | null = null)
   draft.error = error;
   draft.settledAt = Date.now();
   notifyGoalChange();
-  // A terminal browser-helper failure cannot be repaired by reloading the source chat.
-  // Retire this exact automatic pickup, retaining its visible failure and objective.
-  // A deliberate retry or new final may still start work; stale browser replay may not.
-  if (stage === 'failed' && error?.startsWith('goal_browser_') && !retryableGoalFailure(error)) handleGoalReply(draft.conversationId, draft.turnId);
+  // A failed helper has not answered the source. Keep its debt; the failed draft
+  // retains the transport's retry/ambiguity fence until a deliberate retry or change.
 }
 
 /**
@@ -1757,7 +1782,7 @@ async function run(draft: GoalDraft): Promise<void> {
  * the standing switch, which is how a run started from "add specific loop" could open — and
  * then continue — as a Goal.
  */
-/** Finish asks the existing Loop driver for the next instruction; its caller owns delivery. */
+/** Finish uses the selected Goal/Loop driver; its caller owns delivery and hold release. */
 export async function draftFastFollowup(sessionId: string, signal: AbortSignal = AbortSignal.timeout(180000), preparedMessages?: ChatMessage[], publish?: GoalRequest['publish'], mode: GoalMode = 'loop'): Promise<string | null> {
   const backend = goalBackendFor(mode);
   const settings = getConfig().goal;

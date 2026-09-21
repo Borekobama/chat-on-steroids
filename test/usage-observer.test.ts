@@ -9,23 +9,37 @@ function harness() {
   class Clock extends Date { static override now() { return now; } }
   let response: unknown;
   let nextBodyGate: Promise<void> | null = null;
+  const timers = new Map<number, { at: number; run: () => void }>();
+  let timerId = 0;
   const listeners = new Map<string, Array<{ handler: (event: unknown) => void; once: boolean }>>();
   const document = { readyState: 'loading' };
-  const window = {
+  class Socket {
+    static OPEN = 1;
+    handlers: Array<(event: { data: string }) => void> = [];
+    constructor(readonly url: string) {}
+    addEventListener(type: string, listener: (event: { data: string }) => void) { if (type === 'message') this.handlers.push(listener); }
+    receive(data: unknown) { for (const listener of this.handlers) listener({ data: JSON.stringify(data) }); }
+  }
+  const window: any = {
+    WebSocket: Socket,
     fetch: (..._args: unknown[]) => Promise.resolve(response),
     postMessage: (data: unknown) => posts.push(JSON.parse(JSON.stringify(data))),
     addEventListener: (type: string, handler: (event: unknown) => void, options?: { once?: boolean }) => {
       const rows = listeners.get(type) ?? [];
       rows.push({ handler, once: options?.once === true });
       listeners.set(type, rows);
-    }
+    },
+    removeEventListener: (type: string, handler: (event: unknown) => void) => listeners.set(type, (listeners.get(type) || []).filter(row => row.handler !== handler))
   };
   const dispatch = (type: string, event: unknown) => {
     const rows = listeners.get(type) ?? [];
     listeners.set(type, rows.filter(row => !row.once));
     for (const row of rows) row.handler(event);
   };
-  runInNewContext(script, { window, document, location: { origin: 'https://chatgpt.com' }, URL, Date: Clock, TextDecoder, setTimeout, clearTimeout });
+  const evaluate = (source = script) => runInNewContext(source, { window, document, location: { origin: 'https://chatgpt.com' }, URL, Date: Clock, TextDecoder,
+    setTimeout: (run: () => void, ms: number) => { timers.set(++timerId, { at: now + ms, run }); return timerId; },
+    clearTimeout: (id: number) => timers.delete(id) });
+  evaluate();
   async function feed(data: unknown, url = 'https://chatgpt.com/backend-api/wham/usage', init: Record<string, unknown> = {}) {
     let done: () => void = () => {};
     const inspected = new Promise<void>(resolve => { done = resolve; });
@@ -64,8 +78,29 @@ function harness() {
   }
   return {
     posts,
+    evaluate,
+    observer: () => window.__cosUsageObserver,
+    markLegacy: () => { window.__cosUsageObserver.dispose(); window.__cosUsageObserver = true; },
+    needsReload: () => window.__cosUsageObserverNeedsReload === true,
+    nativeSocket: Socket,
+    socket: (url = 'wss://ws.chatgpt.com/ws') => new window.WebSocket(url),
     feed,
     feedSse,
+    openSse: async () => {
+      let resolve: (value: unknown) => void = () => {};
+      let cancelled = false, clones = 0;
+      const reader = {
+        read: () => new Promise(done => { resolve = done; }),
+        cancel: async () => { cancelled = true; resolve({ done: true }); }
+      };
+      response = { url: 'https://chatgpt.com/backend-api/f/conversation', ok: true,
+        headers: { get: () => 'text/event-stream' },
+        clone: () => { clones++; return { body: { getReader: () => reader } }; } };
+      await window.fetch('/backend-api/f/conversation', { method: 'POST' });
+      return { push: (data: unknown) => resolve({ done: false, value: new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`) }),
+        get cancelled() { return cancelled; }, get clones() { return clones; } };
+    },
+    hide: () => dispatch('pagehide', {}),
     replaceFetch: (wrapExisting = false) => {
       const previous = window.fetch;
       const replacement = (...args: unknown[]) => wrapExisting ? previous(...args) : Promise.resolve(response);
@@ -75,12 +110,172 @@ function harness() {
     ready: () => { document.readyState = 'interactive'; dispatch('DOMContentLoaded', {}); },
     currentFetch: () => window.fetch,
     holdNextBody: () => { let release = () => {}; nextBodyGate = new Promise<void>(resolve => { release = resolve; }); return () => release(); },
-    advance: (ms: number) => { now += ms; },
+    advance: (ms: number) => { now += ms; for (const [id, timer] of timers) if (timer.at <= now) { timers.delete(id); timer.run(); } },
     request: (source: unknown = window, origin = 'https://chatgpt.com') => dispatch('message', { source, origin, data: { type: 'cos-usage-request' } })
   };
 }
 
 describe('MAIN-world usage projection', () => {
+  it('keeps one current observer and refreshes a provider-replaced wrapper without extra active readers', async () => {
+    const h = harness(), current = h.observer(), fetch = h.currentFetch();
+    h.evaluate(); expect(h.observer()).toBe(current); expect(h.currentFetch()).toBe(fetch);
+    h.replaceFetch(true); expect(current.current()).toBe(false);
+    h.evaluate(); expect(current.current()).toBe(true);
+    const stream = await h.openSse(); expect(stream.clones).toBe(1);
+    h.observer().dispose(); expect(stream.cancelled).toBe(true);
+    h.evaluate(); expect(h.observer()).not.toBe(current); expect(h.observer().current()).toBe(true);
+  });
+  it('retires a versioned observer across replacement while preserving provider wrappers and native sockets', async () => {
+    const h = harness(), old = h.observer(), socket = h.socket();
+    h.replaceFetch(true);
+    h.evaluate(script.replace('const OBSERVER_VERSION = 2;', 'const OBSERVER_VERSION = 3;'));
+    expect(old.current()).toBe(false); expect(h.observer().version).toBe(3);
+    const stream = await h.openSse(); expect(stream.clones).toBe(1); h.hide();
+    expect(socket).toBeInstanceOf(h.nativeSocket);
+    const id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await h.feedSse([`data: {"conversation_id":"${id}","metadata":{"request_id":"wfr_replaced"}}\n\n`]);
+    expect(h.posts.filter(row => row.requestIds?.includes('wfr_replaced'))).toHaveLength(1);
+  });
+  it('requires a fresh document for a legacy observer without a disposal handle', () => {
+    const h = harness(); h.markLegacy(); const before = h.currentFetch();
+    h.evaluate(); expect(h.needsReload()).toBe(true); expect(h.currentFetch()).toBe(before);
+  });
+  it('reads complete identity in the native f/conversation/resume stream without admitting arbitrary endpoints', async () => {
+    const h = harness(), id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const frame = [`data: {"conversation_id":"${id}","metadata":{"request_id":"wfr_resume"}}\n\n`];
+    await h.feedSse(frame, { method: 'POST' }, 'https://chatgpt.com/backend-api/f/conversation/resume');
+    expect(h.posts.map(row => row.requestIds)).toEqual([['wfr_resume']]);
+    await h.feedSse(frame, { method: 'POST' }, 'https://chatgpt.com/backend-api/other/conversation/resume');
+    expect(h.posts).toHaveLength(1);
+  });
+  it('retains self-contained explicit root delta identity when a socket handoff has no encoding prologue', async () => {
+    const h = harness(), conversation_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const frame = (request_id: string) => `event: delta\ndata: ${JSON.stringify({ p: '', o: 'add', c: 0,
+      v: { conversation_id, message: { metadata: { request_id } } } })}\n\n`;
+    await h.feedSse([frame('wfr_explicit_http')]);
+    h.socket().receive([{ type: 'message', payload: { type: 'conversation-turn-stream', payload: {
+      type: 'stream-item', conversation_id, turn_id: 'handoff', stream_item_id: 'first', parent_stream_item_id: 'http-last',
+      encoded_item: frame('wfr_explicit_handoff')
+    } } }]);
+    expect(h.posts.map(row => row.requestIds)).toEqual([['wfr_explicit_http'], ['wfr_explicit_handoff']]);
+  });
+  it('reads complete messages with inherited v1 delta headers before any cache or later status event', async () => {
+    const h = harness(), conversation_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const delta = (value: unknown) => `event: delta\ndata: ${JSON.stringify(value)}\n\n`;
+    await h.feedSse(['event: delta_encoding\ndata: "v1"\n\n',
+      delta({ p: '', o: 'add', c: 0, v: { conversation_id, message: { metadata: {} } } }),
+      delta({ c: 1, v: { conversation_id, message: { metadata: { request_id: 'wfr_early_shell' }, content: { parts: ['NEVER_PROJECT_CONTENT'] } } } }),
+      delta({ v: { conversation_id, message: { metadata: { request_id: 'wfr_next_shell' } } } })]);
+    expect(h.posts.map(row => row.requestIds)).toEqual([['wfr_early_shell'], ['wfr_next_shell']]);
+    expect(JSON.stringify(h.posts)).not.toContain('NEVER_PROJECT_CONTENT');
+  });
+  it('never treats an inherited nested delta as a root or stitches partial identity fields', async () => {
+    const h = harness(), conversation_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const delta = (value: unknown) => `event: delta\ndata: ${JSON.stringify(value)}\n\n`;
+    const value = { conversation_id, message: { metadata: { request_id: 'wfr_not_root' } } };
+    await h.feedSse(['event: delta_encoding\ndata: "v1"\n\n',
+      delta({ p: '/message/content', o: 'add', v: {} }), delta({ v: value }),
+      delta({ p: '', o: 'add', v: { conversation_id } }),
+      delta({ p: '/message/metadata/request_id', o: 'add', v: 'wfr_partial' })]);
+    expect(h.posts).toEqual([]);
+    await h.feedSse(['event: delta_encoding\ndata: "future"\n\n', delta({ p: '', o: 'add', v: value })]);
+    expect(h.posts).toEqual([]);
+    await h.feedSse([delta({ v: value })]); // A different HTTP response owns no prior headers.
+    expect(h.posts).toEqual([]);
+  });
+  it('decodes linked socket stream items separately for each native turn and rejects missing predecessors', () => {
+    const h = harness(), socket = h.socket(), conversation_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const send = (turn_id: string, stream_item_id: string, parent_stream_item_id: string | null, encoded_item: string) => socket.receive([
+      { type: 'message', payload: { type: 'conversation-turn-stream', payload: {
+        type: 'stream-item', conversation_id, turn_id, stream_item_id, parent_stream_item_id, encoded_item
+      } } }
+    ]);
+    const delta = (value: unknown) => `event: delta\ndata: ${JSON.stringify(value)}\n\n`;
+    const value = (request_id: string) => ({ conversation_id, message: { metadata: { request_id } } });
+    send('turn-a', 'a0', null, 'event: delta_encoding\ndata: "v1"\n\n');
+    send('turn-a', 'a1', 'a0', delta({ v: value('wfr_socket_early') }));
+    send('turn-a', 'a1', 'a0', delta({ v: value('wfr_duplicate') }));
+    send('turn-b', 'b1', null, delta({ v: value('wfr_foreign_turn') }));
+    send('turn-a', 'a3', 'missing', delta({ v: value('wfr_missing_parent') }));
+    expect(h.posts.map(row => row.requestIds)).toEqual([['wfr_socket_early']]);
+  });
+  it('joins a UUID request from a complete root-add event, including socket delivery, without copying content', async () => {
+    const h = harness(), conversation_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', request_id = '11111111-2222-4333-8444-555555555555';
+    const frame = `data: ${JSON.stringify({ p: '', o: 'add', v: { conversation_id, message: { metadata: { request_id }, content: { parts: ['PRIVATE_TEST_TEXT'] } } } })}\n\n`;
+    await h.feedSse([frame.slice(0, 73), frame.slice(73)]);
+    expect(h.posts).toEqual([{ type: 'cos-request-origin', conversationId: conversation_id, requestIds: [request_id], observedAt: expect.any(Number) }]);
+    h.socket().receive([{ type: 'message', payload: { type: 'conversation-turn-stream', payload: {
+      type: 'stream-item', conversation_id, encoded_item: frame.replace(request_id, '66666666-2222-4333-8444-555555555555')
+    } } }]);
+    expect(h.posts[1]?.requestIds).toEqual(['66666666-2222-4333-8444-555555555555']);
+    expect(JSON.stringify(h.posts)).not.toContain('PRIVATE_TEST_TEXT');
+  });
+  it('does not join partial root patches or quoted UUID request metadata', async () => {
+    const h = harness(), conversation_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', request_id = '11111111-2222-4333-8444-555555555555';
+    for (const event of [
+      { p: '/message', o: 'add', v: { conversation_id, metadata: { request_id } } },
+      { p: '', o: 'replace', v: { conversation_id, metadata: { request_id } } },
+      { p: '', o: 'add', v: { conversation_id, message: { content: { metadata: { request_id } } } } },
+      { p: '', o: 'add', v: { conversation_id } },
+      { p: '/metadata', o: 'add', v: { request_id } }
+    ]) await h.feedSse([`data: ${JSON.stringify(event)}\n\n`]);
+    expect(h.posts).toEqual([]);
+  });
+  it('observes the Pro socket handoff with exact inner/outer conversation proof and shares HTTP deduplication', async () => {
+    const h = harness(), socket = h.socket();
+    expect(socket).toBeInstanceOf(h.nativeSocket);
+    const conversation_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const frame = `data: ${JSON.stringify({ conversation_id, message: { metadata: { request_id: 'wfr_socket' } } })}\n\n`;
+    const envelope = [{ type: 'message', payload: { type: 'conversation-turn-stream', payload: {
+      type: 'stream-item', conversation_id, encoded_item: frame
+    } } }];
+    socket.receive(envelope); socket.receive(envelope);
+    expect(h.posts).toHaveLength(1);
+    await h.feedSse([frame]);
+    expect(h.posts).toHaveLength(1);
+    h.request(); expect(h.posts).toHaveLength(2);
+  });
+  it('rejects foreign sockets, contradictory envelopes and request IDs hidden in model text', () => {
+    const h = harness(), socket = h.socket();
+    const conversation_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const envelope = (value: unknown, owner = conversation_id) => [{ type: 'message', payload: {
+      type: 'conversation-turn-stream', payload: { type: 'stream-item', conversation_id: owner,
+        encoded_item: `data: ${JSON.stringify(value)}\n\n` }
+    } }];
+    const value = { conversation_id, message: { metadata: { request_id: 'wfr_exact' } } };
+    h.socket('wss://chatgpt.com.evil.test/ws').receive(envelope(value));
+    socket.receive(envelope(value, '11111111-2222-3333-4444-555555555555'));
+    socket.receive(envelope({ conversation_id, message: { content: JSON.stringify(value) } }));
+    socket.receive(envelope(value).concat(Array(33).fill({})));
+    expect(h.posts).toHaveLength(0);
+  });
+  it('listens beyond five minutes, deduplicates and replays bounded ID evidence, then cancels at fifteen minutes', async () => {
+    const h = harness();
+    const stream = await h.openSse();
+    h.advance(6 * 60_000);
+    expect(stream.cancelled).toBe(false);
+    const event = { conversation_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', metadata: { request_id: 'wfr_late' } };
+    stream.push(event);
+    await Promise.resolve(); await Promise.resolve();
+    expect(h.posts).toHaveLength(1);
+    stream.push(event);
+    await Promise.resolve(); await Promise.resolve();
+    expect(h.posts).toHaveLength(1);
+    h.request();
+    expect(h.posts).toHaveLength(2);
+    expect(h.posts[1]).toEqual(h.posts[0]);
+    h.advance(9 * 60_000);
+    expect(stream.cancelled).toBe(true);
+    h.hide(); h.request();
+    expect(h.posts).toHaveLength(2);
+  });
+  it('bounds concurrent response clones and releases them on page exit', async () => {
+    const h = harness();
+    const a = await h.openSse(), b = await h.openSse(), c = await h.openSse();
+    expect([a.clones, b.clones, c.clones]).toEqual([1, 1, 0]);
+    h.hide();
+    expect(a.cancelled && b.cancelled).toBe(true);
+  });
   it('retains supported model counts without requiring a reset timestamp', async () => {
     const h = harness();
     await h.feed({ model_limits: [{ model_slug: 'model-a', remaining: 3 }, { model_slug: 'model-b', remaining: 0, resets_after: 'invalid' }, { model_slug: 'unknown' }] });

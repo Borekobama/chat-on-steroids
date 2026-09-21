@@ -1,0 +1,64 @@
+{
+  "schema_version": 2,
+  "role": "worker",
+  "objective": "Implement the CoS half of the read-only Supervisor Shunt transport. Read AGENTS.md first. Add a narrow operation to the existing owner-only Unix control service that runs exactly one read-only Codex scout/reviewer request from the CoS app process, so macOS uses one seatbelt boundary rather than trying to nest a second boundary inside the existing model command sandbox. The operation must be purpose-specific: no caller-supplied executable, shell command, or arbitrary argv. Validate role is scout/reviewer, canonical workspace is inside ~/Downloads/Projects, model/reasoning are bounded and valid, prompt/body/output are bounded, and any output schema is a canonical regular JSON file inside Projects. Resolve the shipped Codex executable from trusted CoS configuration/application state. Apply one native Codex macOS sandbox around the whole child process: source workspace is readable and not writable, only a broker-created 0700 per-run runtime/output directory is writable, required network remains available, and real ~/.codex/auth.json is readable but cannot be modified or unlinked. Do not copy or log credential bytes. The currently selected named Projects profile is writable and no named read-only profile exists, so investigate the supported sandbox-state mechanism or another native Codex single-seatbelt construction. The agent's own generated command sandbox must not add a second seatbelt when the whole process is already constrained. Return only bounded final output and exact usage/event material needed by Shunt; clean broker-owned temp state. Preserve existing control task API semantics. Add focused tests for validation, fixed command/policy construction, and containment invariants. Do not edit installed runtime/config or arsenal. Do not spawn agents.",
+  "cwd": "/Users/berke/Downloads/Projects/chat-on-steroids",
+  "files": [
+    "src/main/control-service.ts",
+    "src/main/control-readonly.ts",
+    "test/control-service.test.ts"
+  ],
+  "ownership": {
+    "write": [
+      "src/main/control-service.ts",
+      "src/main/control-readonly.ts",
+      "test/control-service.test.ts"
+    ],
+    "read_extra": [
+      "AGENTS.md",
+      "src/main/codex/unified-exec.ts",
+      "src/main/exec.ts",
+      "src/main/config.ts",
+      "src/main/version.ts",
+      "src/shared/types.ts"
+    ]
+  },
+  "verified_interfaces": [
+    "protected Unix control socket",
+    "Projects-only workspace ceiling",
+    "native Codex read-only sandbox boundary",
+    "existing task submit/status/input/cancel API"
+  ],
+  "constraints": [
+    "Preserve unrelated changes.",
+    "Expose no generic direct command broker.",
+    "No credential copying or logging.",
+    "Use one macOS seatbelt boundary.",
+    "No installed app/runtime/config edits.",
+    "Keep source changes inside owned files."
+  ],
+  "verification": [
+    [
+      "npm",
+      "test",
+      "--",
+      "--run",
+      "test/control-service.test.ts"
+    ],
+    [
+      "npm",
+      "run",
+      "typecheck"
+    ]
+  ],
+  "previous_failure": {
+    "error": "The initial cross-repository worker launch failed before model execution because the common Projects parent is not a Git repository."
+  },
+  "return_contract": {
+    "summary": true,
+    "files_changed": true,
+    "verification": true,
+    "unexpected_findings": true,
+    "needs_supervisor_decision": true
+  }
+}

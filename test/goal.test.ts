@@ -102,7 +102,9 @@ afterEach(() => {
   globalThis.fetch = realFetch;
 });
 
-it('persists Pro Loop delivery across toggles and restart without granting Goal browser continuation', async () => {
+it('preserves the Astra delivery preference across Goal/Loop, restart and finish-setting changes', async () => {
+  const config = (await import('../src/main/config.js')).getConfig();
+  await saveConfig({ ...config, ui: { ...config.ui, finishTool: true } });
   const id = 'pro-loop-delivery-test';
   const session = await createSession({ conversationId: id });
   await observeSessionModel(session.id, id, 'gpt-6-pro', Date.now(), 'pro');
@@ -118,6 +120,14 @@ it('persists Pro Loop delivery across toggles and restart without granting Goal 
   await goal.setGoalSwitchNow(id, 'loop', true);
   expect(goal.loopAfterTurnFor(id)).toBe(true);
   await goal.setGoalSwitchNow(id, 'goal', true);
+  expect(await goal.astraFinishOnly(session.id, id)).toBe(false);
+  await goal.setGoalSwitchNow(id, 'goal', true, false);
+  expect(await goal.astraFinishOnly(session.id, id)).toBe(true);
+  await saveConfig({ ...config, ui: { ...config.ui, finishTool: false } });
+  expect(await goal.astraFinishOnly(session.id, id)).toBe(false);
+  expect(goal.loopAfterTurnFor(id)).toBe(true);
+  expect(goal.goalSwitchFor(id).afterTurn).toBe(false);
+  await saveConfig({ ...config, ui: { ...config.ui, finishTool: true } });
   expect(await goal.astraFinishOnly(session.id, id)).toBe(true);
 });
 
@@ -1087,7 +1097,7 @@ describe('one draft per generation', () => {
     expect(goal.goalViewFor('c-ack-running')).toBeNull();
   });
 
-  it('stops every in-flight request when Goal authority is revoked and keeps the generation spent', async () => {
+  it('stops every in-flight request on master Off and discharges its pending work', async () => {
     const session = await createSession({ title: 'goal revoke', conversationId: 'c-goal-revoke' });
     await appendEvent(session.id, {
       time: 1_000,
@@ -1114,12 +1124,11 @@ describe('one draft per generation', () => {
     const first = goal.startGoalDraft({ sessionId: session.id, conversationId: 'c-goal-revoke', turnId: 'g-revoke' });
     await entered;
     expect(opened.signal?.aborted).toBe(false);
-    expect(goal.retireGoalDrafts()).toBe(1);
+    expect(goal.retireGoalDrafts(true)).toBe(1);
     expect(opened.signal?.aborted).toBe(true);
     expect(goal.goalViewFor('c-goal-revoke')).toBeNull();
 
-    const retried = goal.startGoalDraft({ sessionId: session.id, conversationId: 'c-goal-revoke', turnId: 'g-revoke' });
-    expect(retried.token).toBe(first.token);
+    expect(goal.ackGoalDraft('c-goal-revoke', first.token)).toBe(false);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(calls).toBe(1);
   });
@@ -1693,6 +1702,37 @@ describe('a chat driven towards a specific goal', () => {
     });
   });
 
+  it.each([false, true])('preserves pending source debt across settings invalidation and restart (master Off: %s)', async off => {
+    const conversationId = 'settings-pending-source';
+    const session = await createSession({ title: 'Goal settings', conversationId });
+    await appendEvent(session.id, { source: 'extension', kind: 'user_message', time: Date.now(),
+      message: { text: 'Finish the original task', chars: 24, truncated: false } });
+    await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id, replyId: 'turn:source-turn',
+      turnId: 'source-turn', eventSeq: 0, blocked: false });
+    const original = goal.goalPendingReplyFor(conversationId);
+    expect(original).not.toBeNull();
+    globalThis.fetch = (async () => decision('continue', 'Finish the remaining task')) as never;
+    const first = goal.startGoalDraft({ conversationId, sessionId: session.id, turnId: 'source-turn' });
+    await settled(conversationId);
+    goal.retireGoalDrafts(off);
+    expect(goal.ackGoalDraft(conversationId, first.token)).toBe(false);
+    goal.restoreGoalReplies(goal.snapshotGoalReplies());
+    expect(goal.goalPendingReplyFor(conversationId)).toEqual(off ? null : original);
+    if (!off) {
+      const next = goal.startGoalDraft({ conversationId, sessionId: session.id, turnId: 'source-turn' });
+      expect(next.token).not.toBe(first.token);
+      expect((await settled(conversationId)).stage).toBe('ready');
+    }
+  });
+
+  it('rejects zero-sequence restore records without an exact provisional turn identity', () => {
+    goal.restoreGoalReplies({ version: 1, savedAt: Date.now(), replies: [{
+      conversationId: 'invalid-provisional', sessionId: 'session', replyId: 'unproved-final',
+      turnId: 'source-turn', eventSeq: 0, acceptedAt: Date.now(), state: 'pending'
+    }] });
+    expect(goal.goalPendingReplyFor('invalid-provisional')).toBeNull();
+  });
+
   it('upgrades a decided provisional turn to the stable reply without reopening it', async () => {
     const conversationId = 'c-reply-provisional-upgrade';
     const turnId = 'g-reply-provisional-upgrade';
@@ -1717,6 +1757,8 @@ describe('a chat driven towards a specific goal', () => {
     const decided = await settled(conversationId);
     expect(decided.stage).toBe('no-reply');
     expect(goal.ackGoalDraft(conversationId, decided.token)).toBe(true);
+    goal.restoreGoalReplies(goal.snapshotGoalReplies());
+    expect(goal.snapshotGoalReplies().replies).toContainEqual(expect.objectContaining({ conversationId, state: 'handled', eventSeq: 0 }));
 
     // Fiber can publish the stable assistant id after the provider decision. It strengthens
     // the tombstone's identity; it does not turn the already-decided message back into work.
@@ -2456,7 +2498,9 @@ it('publishes actual opening response deltas before one validated final result',
   expect(await result).toMatchObject({ reply: goal.humanReply('Inspect then implement') });
 });
 
-it('never owes or generates a browser continuation for Astra even with Goal armed', async () => {
+it('keeps Astra Goal finish-only while the finish tool is enabled and after-turn is not selected', async () => {
+  const config = (await import('../src/main/config.js')).getConfig();
+  await saveConfig({ ...config, ui: { ...config.ui, finishTool: true } });
   const conversationId = 'aaaaaaaa-1111-4222-8333-123456789abc';
   const session = await createSession({ conversationId, title: 'Astra finish-only' });
   await observeSessionModel(session.id, conversationId, 'gpt-6-pro', Date.now());
@@ -2468,6 +2512,31 @@ it('never owes or generates a browser continuation for Astra even with Goal arme
   goal.beginGoalDraft(conversationId, draft.token);
   await vi.waitFor(() => expect(goal.goalViewFor(conversationId)?.stage).toBe('no-reply'));
   expect(fetch).not.toHaveBeenCalled();
+});
+
+it.each(['goal', 'loop'] as const)('runs Astra %s through its ordinary decision after a turn when finish is disabled or after-turn is selected', async mode => {
+  const config = (await import('../src/main/config.js')).getConfig();
+  for (const finishTool of [false, true]) {
+    await saveConfig({ ...config, ui: { ...config.ui, finishTool } });
+    const conversationId = `astra-${mode}-${finishTool}`;
+    const session = await createSession({ conversationId });
+    await observeSessionModel(session.id, conversationId, 'gpt-6-pro', Date.now());
+    await goal.setGoalSwitchNow(conversationId, mode, true, finishTool);
+    await appendEvent(session.id, { kind: 'user_message', source: 'extension', time: Date.now(),
+      message: { text: 'Finish the requested checks', chars: 27, truncated: false } });
+    await recordLoopMcpProof(session.id, 'astra-turn');
+    await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id, replyId: 'astra-final', turnId: 'astra-turn', eventSeq: 10, blocked: false });
+    expect(goal.goalPendingReplyFor(conversationId)?.replyId).toBe('astra-final');
+    const fetcher = vi.fn(async (_url: unknown, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      expect(body.messages[0].content).toBe(mode === 'goal' ? config.goal.prompt : config.goal.loopPrompt);
+      return decision(mode === 'goal' ? 'stop' : 'continue', mode === 'loop' ? 'Continue the requested checks' : '');
+    });
+    globalThis.fetch = fetcher as typeof fetch;
+    goal.startGoalDraft({ conversationId, sessionId: session.id, turnId: 'astra-turn' });
+    expect((await settled(conversationId)).stage).toBe(mode === 'goal' ? 'no-reply' : 'ready');
+    expect(fetcher).toHaveBeenCalledOnce();
+  }
 });
 
 describe('a custom OpenAI-compatible provider', () => {

@@ -28,7 +28,7 @@ vi.mock('electron', () => ({
     encryptStringAsync: vi.fn(async (value: string) => Buffer.from(value, 'utf8')),
     decryptStringAsync: vi.fn(async (buffer: Buffer) => ({ result: buffer.toString('utf8'), shouldReEncrypt: false }))
   },
-  app: { getPath: () => '', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false }
+  app: { on: vi.fn(), getPath: () => '', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false }
 }));
 
 // This suite owns IPC behavior, not Electron's packaged-vs-checkout path discovery.
@@ -37,7 +37,7 @@ vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: vi.fn(async (
 
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, resetSecretsCacheForTests } = await import('../src/main/secrets.js');
-const { appendEvent, createSession, initSessionStore, rebindSession, resetSessionStoreForTests } = await import('../src/main/session/store.js');
+const { appendEvent, createSession, initSessionStore, rebindSession, resetSessionStoreForTests, upsertMessageEvent } = await import('../src/main/session/store.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const { pendingCommands, resetBridgeForTests, setBrowserOpener, startBridge, stopBridge } = await import(
   '../src/main/bridge.js'
@@ -84,6 +84,60 @@ const renameRoot = (payload: unknown): Promise<any> => handlers.get('roots:renam
 const removeRoot = (payload: unknown): Promise<any> => handlers.get('roots:remove')!(null, payload) as Promise<any>;
 const sessionEvents = (payload: unknown): Promise<any> => handlers.get('sessions:events')!(null, payload) as Promise<any>;
 const sessionList = (): Promise<any> => handlers.get('sessions:list')!(null, undefined) as Promise<any>;
+
+it('saves port choices, merges stale snapshots and serializes concurrent port edits', async () => {
+  const ports = await import('../src/main/bridge-ports.js');
+  const bridge = await import('../src/main/bridge.js');
+  const selection = vi.spyOn(ports, 'bridgePortSelection').mockReturnValue({ candidates: [0], overridden: false });
+  try {
+    const base = getConfig();
+    const results = await Promise.all([8767, 8768].map(browserBridgePort => save({ ...base, ui: { ...base.ui, browserBridgePort } }, base)));
+    expect(results.every(result => result.ok)).toBe(true);
+    const active = bridge.bridgePort();
+    expect(await save({ ...base, ui: { ...base.ui, theme: 'light' } }, base)).toMatchObject({ ok: true });
+    expect(getConfig().ui).toMatchObject({ browserBridgePort: 8768, theme: 'light' });
+    expect(bridge.bridgePort()).toBe(active);
+  } finally { selection.mockRestore(); }
+});
+
+it('rejects occupied port edits through Settings IPC and preserves the old bridge and disk', async () => {
+  const http = await import('node:http');
+  const ports = await import('../src/main/bridge-ports.js');
+  const bridge = await import('../src/main/bridge.js');
+  await startBridge(); const old = bridge.bridgePort();
+  const blocker = http.createServer();
+  await new Promise<void>(resolve => blocker.listen(0, '127.0.0.1', resolve));
+  const selection = vi.spyOn(ports, 'bridgePortSelection').mockReturnValue({ candidates: [(blocker.address() as { port: number }).port], overridden: false });
+  try {
+    const base = getConfig(); const disk = await fs.readFile(path.join(dir, 'config.json'), 'utf8');
+    expect(await save({ ...base, ui: { ...base.ui, browserBridgePort: 8767 } }, base)).toMatchObject({ ok: false });
+    expect(getConfig()).toBe(base); expect(bridge.bridgePort()).toBe(old);
+    expect(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).toBe(disk);
+  } finally { selection.mockRestore(); await new Promise<void>(resolve => blocker.close(() => resolve())); }
+});
+
+it('enforces the environment override for explicit edits while accepting unrelated saves', async () => {
+  const base = getConfig();
+  // vitest.config.ts supplies the real CLF_BRIDGE_PORTS=0 override.
+  const result = await save({ ...base, ui: { ...base.ui, browserBridgePort: 8767 } }, base);
+  expect(result).toMatchObject({ ok: false, error: expect.stringContaining('CLF_BRIDGE_PORTS') });
+  expect(getConfig().ui.browserBridgePort).toBe('auto');
+  const unrelated = await save({ ...base, ui: { ...base.ui, theme: 'light' } }, base);
+  expect(unrelated).toMatchObject({ ok: true, data: { bridge: { portOverridden: true } } });
+});
+
+it('persists arbitrary colors through Settings IPC and preserves concurrent per-field edits', async () => {
+  const { defaultAppearance } = await import('../src/shared/appearance.js');
+  const base = getConfig();
+  const appearance = defaultAppearance(); appearance.dark.sidebar = '#fa89c2'; appearance.font = 'serif';
+  expect(await save({ ...base, ui: { ...base.ui, appearance } }, base)).toMatchObject({ ok: true });
+  const nextAppearance = defaultAppearance(); nextAppearance.dark.accent = '#4a6be2';
+  expect(await save({ ...base, ui: { ...base.ui, appearance: nextAppearance } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.appearance).toMatchObject({ font: 'serif', dark: { sidebar: '#fa89c2', accent: '#4a6be2' } });
+  const current = getConfig();
+  expect(await save({ ...current, ui: { ...current.ui, appearance: { ...current.ui.appearance, fontSize: 100 } } }, current)).toMatchObject({ ok: false });
+  expect(getConfig().ui.appearance).toEqual(current.ui.appearance);
+});
 
 it('switches setup IDs and encrypted key ownership without changing shared settings', async () => {
   const { getSecret } = await import('../src/main/secrets.js');
@@ -150,6 +204,35 @@ it('rejects stale profile tunnel edits after A to B to A while accepting unrelat
   expect(getConfig().setupProfiles).toHaveLength(1);
 });
 
+it.each([true, false])('forwards canonical input commitment even when a legacy writer proposes recording=%s', async recording => {
+  const input = await import('../src/main/session/input.js');
+  const store = await import('../src/main/session/store.js');
+  const previous = await readDurable('session-input');
+  const session = await createSession({ title: 'Input commitment fixture', conversationId: 'input-commitment-fixture' });
+  const id = '30000000-0000-4000-8000-000000000001';
+  try {
+    await saveConfig({ ...getConfig(), sessions: { ...getConfig().sessions, record: recording } });
+    await writeDurableNow('session-input', [{ id, sessionId: session.id, text: 'Delivered fixture', mode: 'auto', model: null,
+      reasoningEffort: null, dueAt: 100, createdAt: 100, state: 'sent', owner: null, conversationId: 'input-commitment-fixture',
+      messageId: `input:${id}`, offeredAt: 200, deliveredAt: 300, historyRecorded: false,
+      toolImages: [{ name: 'invalid.webp', dataUrl: 'data:image/webp;base64,YQ==' }] }]);
+    input.resetInputForTests();
+    const result = await handlers.get('sessions:outbox')!(null, undefined) as any;
+    expect(result.ok).toBe(true);
+    const row = result.data[0];
+    expect(getConfig().sessions).toMatchObject({ record: true, retainDays: 0 });
+    expect(row.historyAnchored).toBe(true);
+    expect(row.historyRecorded).not.toBe(true);
+    expect((await readDurable<any[]>('session-input'))![0].historyAnchored).toBe(true);
+    const canonical = (await store.readEvents(session.id)).filter(event => event.kind === 'user_message');
+    expect(canonical).toHaveLength(1);
+    expect(canonical[0]).toMatchObject({ inputId: id, time: 200 });
+  } finally {
+    await writeDurableNow('session-input', previous ?? []);
+    input.resetInputForTests();
+  }
+});
+
 it('validates dropped file count and stages arbitrary native file types', async () => {
   const drop = (payload: unknown) => handlers.get('sessions:dropFiles')!(null, payload) as Promise<any>;
   expect(await drop({ files: [] })).toMatchObject({ ok: false });
@@ -207,7 +290,7 @@ it('round-trips Goal controls and cannot revive old periodic input when Off canc
     await store.observeSessionModel(session.id, 'periodic-settings-chat', 'gpt-6-astra', Date.now());
     const row = await outbox.enqueueInput({ id: 'f0f00014-1111-4111-8111-111111111111', sessionId: session.id,
       text: 'Pending automatic instruction', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null },
-      { turnId: 'periodic-turn', periodic: false, userRequested: true });
+      { turnId: 'periodic-turn', periodic: false, mode: 'goal', userRequested: true });
     // Seed an old-version row; current code deliberately refuses new periodic input.
     await writeDurableNow('session-input', [{ ...row, finishOwner: { turnId: 'periodic-turn', periodic: true } }]);
     outbox.resetInputForTests();
@@ -352,8 +435,32 @@ beforeEach(async () => {
   });
 });
 
+it('keeps origin history navigation separate from live revision cursors over IPC', async () => {
+  const session = await createSession({ title: 'History cursors' });
+  const message = { kind: 'assistant_message' as const, source: 'extension' as const, time: 10,
+    messageId: 'review', message: { text: 'Detailed review', truncated: false, chars: 15 }, final: true };
+  const first = await upsertMessageEvent(session.id, message);
+  await appendEvent(session.id, { kind: 'note', source: 'app', time: 20, message: { text: 'Later work', truncated: false, chars: 10 } });
+  const revision = await upsertMessageEvent(session.id, { ...message, renderedHtml: { text: '<p>Detailed review</p>', truncated: false, chars: 22 } });
+  const read = (options: object) => handlers.get('sessions:events')!(null, { id: session.id, ...options }) as Promise<any>;
+  const tail = await read({ limit: 1 });
+  expect(tail.ok).toBe(true);
+  expect(tail.data.events[0].kind).toBe('note');
+  const older = await read({ before: tail.data.events[0].seq, limit: 1 });
+  expect(older.data.events[0]).toMatchObject({ kind: 'assistant_message', origin: first.event.seq, seq: revision.event.seq });
+  const newer = await read({ after: first.event.seq, limit: 1 });
+  expect(newer.data.events[0].kind).toBe('note');
+  const delta = await read({ from: revision.event.seq, limit: 1 });
+  expect(delta.data.events[0].messageId).toBe('review');
+  expect(delta.data.nextFrom).toBe(revision.event.seq + 1);
+});
+
 describe('explicit settings replace the published tool contract', () => {
+<<<<<<< HEAD
   it.each(['finish', 'command', 'session'] as const)('updates %s in real endpoint publication after its setting is disabled', async kind => {
+=======
+  it.each(['finish', 'command'] as const)('withdraws %s from real endpoint publication after its setting is disabled', async kind => {
+>>>>>>> origin/main
     const { startMcpServer } = await import('../src/main/mcp/server.js');
     const { effectiveCapabilities } = await import('../src/main/config.js');
     const { publishPluginSurface, pluginRefreshPublications, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
@@ -366,18 +473,26 @@ describe('explicit settings replace the published tool contract', () => {
     };
     try {
       const before = snapshot();
-      const tool = kind === 'finish' ? 'session_finish' : kind === 'command' ? 'exec_command' : kind;
+      const tool = kind === 'finish' ? 'session_finish' : 'exec_command';
       expect(before.tools.map(row => row.name)).toContain(tool);
+      expect(before.tools.map(row => row.name)).not.toContain('session');
       const current = getConfig();
-      const patch = { ...current, ...(kind === 'finish' ? { ui: { ...current.ui, finishTool: false } } : kind === 'command' ? { capabilities: { ...current.capabilities, command: false } } : { sessions: { ...current.sessions, record: false } }) };
+      const patch = { ...current, ...(kind === 'finish'
+        ? { ui: { ...current.ui, finishTool: false } }
+        : { capabilities: { ...current.capabilities, command: false } }) };
       expect((await save(patch)).ok).toBe(true);
       const after = snapshot();
+<<<<<<< HEAD
       if (kind === 'finish') {
         const finish = after.tools.find(row => row.name === tool)!;
         expect(finish).toBeDefined();
         expect(JSON.stringify(finish.inputSchema)).toContain('task_id');
         expect(JSON.stringify(finish.inputSchema)).not.toContain('summary');
       } else expect(after.tools.map(row => row.name)).not.toContain(tool);
+=======
+      expect(after.tools.map(row => row.name)).not.toContain(tool);
+      expect(after.tools.map(row => row.name)).not.toContain('session');
+>>>>>>> origin/main
       expect(after.schemaId).not.toBe(before.schemaId);
       const saved = getConfig();
       expect((await save({ ...saved, ui: { ...saved.ui, theme: 'dark' } })).ok).toBe(true);
@@ -430,7 +545,7 @@ describe('turning multi-agent mode off', () => {
     const reply = await save(settings({ record: false, multiAgent: false }));
     expect(reply.ok, reply.error).toBe(true);
     expect(await readDurable<any>('ipc-swarm')).toMatchObject({
-      version: 6,
+      version: 7,
       runId: null,
       primeConversationId: null,
       agents: [],
@@ -740,9 +855,9 @@ describe('settings writes from more than one UI', () => {
     expect(reply.ok, reply.error).toBe(true);
     expect(getConfig().ui.theme).toBe('dark');
     expect(nativeTheme.themeSource).toBe('dark');
-    expect(currentWindow.setBackgroundColor).toHaveBeenCalledWith('#0e0e11');
+    expect(currentWindow.setBackgroundColor).toHaveBeenCalledWith('#181818');
     if (process.platform === 'win32') expect(currentWindow.setTitleBarOverlay).toHaveBeenCalledWith({
-      height: 36, color: '#1a2129', symbolColor: '#b8c0c5'
+      height: 36, color: '#00000000', symbolColor: '#ffffff'
     });
     expect(getConfig().goal.enabled).toBe(false);
   });

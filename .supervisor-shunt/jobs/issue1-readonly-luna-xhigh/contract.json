@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "role": "worker",
+  "objective": "Implement issue 1 across Chat On Steroids and Supervisor Shunt: make read-only Shunt scout/reviewer transport work under --parent-host chatgpt_cos with real OS containment. The current CoS-parent transport is already inside a Projects-only macOS seatbelt and nested `codex sandbox` fails with `sandbox_apply: Operation not permitted`; therefore use the existing protected CoS Unix control service as a narrow broker if needed. The broker must expose only a fixed read-only Codex-role operation, never arbitrary command/argv execution. It must validate the workspace stays under ~/Downloads/Projects, use one macOS seatbelt boundary that makes the source workspace read-only, allow writes only to a private per-run 0700 runtime/output area, keep real ~/.codex/auth.json readable but not writable/unlinkable without copying or logging secrets, and preserve network needed by Codex. Prefer native Codex permission profile/sandbox state mechanisms over a custom policy if supported. Shunt must call that broker only for chatgpt_cos + read-only roles; writable worker behavior remains the existing verified outer Projects-only path. Preserve existing pending xhigh edits in config/default.toml, agents/templates/luna-worker.toml, supervisor_shunt/workers.py exactly. Add focused tests on both sides for validation/protocol/command construction and negative cases. Do not edit installed app/runtime/config or arsenal. Do not spawn agents.",
+  "cwd": "/Users/berke/Downloads/Projects",
+  "files": [
+    "chat-on-steroids/src/main/control-service.ts",
+    "chat-on-steroids/test/control-service.test.ts",
+    "skills/supervisor-shunt/supervisor_shunt/transport/codex_exec.py",
+    "skills/supervisor-shunt/tests/integration/test_codex_exec_transport.py",
+    "skills/supervisor-shunt/supervisor_shunt/web.py"
+  ],
+  "ownership": {
+    "write": [
+      "chat-on-steroids/src/main/control-service.ts",
+      "chat-on-steroids/test/control-service.test.ts",
+      "skills/supervisor-shunt/supervisor_shunt/transport/codex_exec.py",
+      "skills/supervisor-shunt/tests/integration/test_codex_exec_transport.py",
+      "skills/supervisor-shunt/supervisor_shunt/web.py"
+    ],
+    "read_extra": [
+      "chat-on-steroids/AGENTS.md",
+      "chat-on-steroids/src/main/codex/unified-exec.ts",
+      "chat-on-steroids/src/main/exec.ts",
+      "chat-on-steroids/src/main/config.ts",
+      "skills/supervisor-shunt/supervisor_shunt/cli.py",
+      "skills/supervisor-shunt/tests/unit/test_run_role.py"
+    ]
+  },
+  "verified_interfaces": [
+    "CoS control Unix socket remains owner-only and gains no arbitrary command primitive",
+    "Shunt chatgpt_cos read-only transport reaches only the read-only broker",
+    "writable Shunt workers continue using the existing outer Projects-only seatbelt",
+    "Codex auth remains a read-only reference; no secret bytes copied/logged"
+  ],
+  "constraints": [
+    "Read chat-on-steroids/AGENTS.md before editing and preserve all unrelated dirty work.",
+    "There is no AGENTS.md in supervisor-shunt.",
+    "Do not change the user-pending xhigh edits.",
+    "No nested Shunt agents; no model substitution; no installed runtime edits.",
+    "Do not rely on prompting or post-hoc git checks as containment.",
+    "Use one writer only; keep changes within owned files."
+  ],
+  "verification": [
+    [
+      "python3",
+      "-m",
+      "unittest",
+      "skills/supervisor-shunt/tests/integration/test_codex_exec_transport.py"
+    ],
+    [
+      "npm",
+      "test",
+      "--",
+      "--run",
+      "test/control-service.test.ts"
+    ]
+  ],
+  "previous_failure": null,
+  "return_contract": {
+    "summary": true,
+    "files_changed": true,
+    "verification": true,
+    "unexpected_findings": true,
+    "needs_supervisor_decision": true
+  }
+}
