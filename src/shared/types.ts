@@ -124,7 +124,7 @@ export interface TunnelSettings {
   binaryPath: string;
 }
 
-export const CHAT_BROWSERS = ['chrome', 'edge', 'brave', 'helium'] as const;
+export const CHAT_BROWSERS = ['chrome', 'edge', 'brave'] as const;
 export type ChatBrowser = (typeof CHAT_BROWSERS)[number];
 
 export interface UiPrefs {
@@ -150,10 +150,6 @@ export interface UiPrefs {
   privacyScreenshots: boolean;
   /** Browser for app-originated launches; connected source tabs retain placement ownership. */
   chatBrowser?: ChatBrowser;
-  /** Use an isolated CoS-owned browser profile for integration tasks. */
-  managedBrowser?: boolean;
-  /** Launch the managed browser in modern headless mode. */
-  browserHeadless?: boolean;
   /** Explicit choice, never inherited from the OS: the window looks how you left it. */
   theme: 'light' | 'dark';
   appearance?: import('./appearance.js').AppearanceSettings;
@@ -315,27 +311,12 @@ export interface McpSettings {
   instructions: string;
 }
 
-<<<<<<< HEAD
-export interface ArtifactSettings {
-  /** Per-file byte ceiling enforced before, during and after the download stream. */
-  maxFileBytes: number;
-}
-
-export interface CommandSandboxSettings {
-  enabled: boolean;
-  codexPath: string;
-  permissionProfile: string;
-}
-
-=======
->>>>>>> origin/main
 export interface Config {
   /** Inactive setups only. Keys remain in encrypted secret slots addressed by profile ID. */
   setupProfiles?: Array<{ id: string; name: string; tunnelId: string; desktopTunnelId: string; pluginsTunnelId: string }>;
   roots: Root[];
   capabilities: Capabilities;
   readOnly: boolean;
-  commandSandbox: CommandSandboxSettings;
   tunnel: TunnelSettings;
   ui: UiPrefs;
   sessions: SessionSettings;

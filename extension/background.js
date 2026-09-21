@@ -1059,9 +1059,6 @@ async function call(path, init = {}, retried = false) {
   }
   const { timeoutMs = REQUEST_TIMEOUT_MS, ...rest } = init;
   try {
-    let managed = false;
-    try { managed = (await chrome.storage.local.get('cosManagedProfile')).cosManagedProfile === true; }
-    catch { /* Older test/host shims may not expose profile-local storage. */ }
     const response = await fetchBounded(
       `http://127.0.0.1:${found.port}${path}`,
       {
@@ -1070,7 +1067,6 @@ async function call(path, init = {}, retried = false) {
         headers: {
           ...(init.body ? { 'content-type': 'application/json' } : {}),
           ...versionHeaders(),
-          ...(managed ? { 'x-cos-managed-profile': '1' } : {}),
           authorization: `Bearer ${token}`
         }
       },
@@ -1108,20 +1104,6 @@ async function call(path, init = {}, retried = false) {
     forgetPort();
     return { ok: false, status: 0, error: detail };
   }
-}
-
-async function managedProfileMode() {
-  try {
-    const stored = await chrome.storage.local.get('cosManagedProfile');
-    if (stored.cosManagedProfile === true) return true;
-    const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
-    const managed = tabs.some(tab => {
-      try { return new URL(tab.pendingUrl || tab.url || '').searchParams.get('cos-managed-profile') === '1'; }
-      catch { return false; }
-    });
-    if (managed) await chrome.storage.local.set({ cosManagedProfile: true });
-    return managed;
-  } catch { return false; }
 }
 
 /**
@@ -1176,11 +1158,7 @@ async function pairOnce(intent = connectionEpoch, reconnect = false) {
       method: 'POST',
       cache: 'no-store',
       headers: { 'content-type': 'application/json', ...versionHeaders() },
-<<<<<<< HEAD
-      body: JSON.stringify({ ...(reconnect ? { reconnect: true } : {}), ...(await managedProfileMode() ? { managed: true } : {}) })
-=======
       body: JSON.stringify(reconnect ? { reconnect: true } : { reuse: true })
->>>>>>> origin/main
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || typeof data.token !== 'string') {
@@ -1766,7 +1744,6 @@ async function reconcileBackgroundWindow(policy) {
   if (policy.background !== true) return;
   const managed = new Set((Array.isArray(policy.managedConversations) ? policy.managedConversations : []).map(cleanConversationId).filter(Boolean));
   const inputIds = new Set((Array.isArray(policy.inputs) ? policy.inputs : []).map(input => input?.id).filter(id => typeof id === 'string'));
-  const disposableSetup = tab => policy.managedBrowser === true && /^(?:chrome|helium):\/\/setup\/?$/i.test(tab.pendingUrl || tab.url || '');
   const owns = tab => {
     if (managed.has(conversationForTab(tab))) return true;
     try {
@@ -1781,7 +1758,6 @@ async function reconcileBackgroundWindow(policy) {
   };
   return inBackgroundWindow(async () => {
     let window = await storedBackgroundWindow();
-    let adopted = false;
     const tabs = await chrome.tabs.query({});
     const owned = tabs.filter(tab => Number.isInteger(tab.id) && Number.isInteger(tab.windowId) && owns(tab));
     if (!window) {
@@ -1789,16 +1765,13 @@ async function reconcileBackgroundWindow(policy) {
       // containing one managed conversation is not authority over its other tabs.
       const ids = [...new Set(owned.map(tab => tab.windowId))].sort((a, b) => a - b);
       for (const id of ids) {
-        if (tabs.some(tab => tab.windowId === id && !owns(tab) && !disposableSetup(tab))) continue;
+        if (tabs.some(tab => tab.windowId === id && !owns(tab))) continue;
         try { window = await chrome.windows.get(id); } catch { continue; }
         await chrome.storage.session.set({ chatBackgroundWindow: id });
-        adopted = true;
         break;
       }
     }
     if (!window || !Number.isInteger(window.id)) return false;
-    const setupTabs = tabs.filter(tab => tab.windowId === window.id && Number.isInteger(tab.id) && disposableSetup(tab));
-    if (setupTabs.length) await chrome.tabs.remove(setupTabs.map(tab => tab.id));
     for (const tab of owned) {
       if (tab.windowId === window.id) continue;
       // The app's policy is conversation/command scoped; re-read after every
@@ -1809,7 +1782,6 @@ async function reconcileBackgroundWindow(policy) {
         await chrome.tabs.move(current.id, { windowId: window.id, index: -1 });
       } catch { /* A closing/navigating tab is reconsidered by the next ordinary status pass. */ }
     }
-    if (adopted) await chrome.windows.update(window.id, { state: 'minimized', focused: false });
     return true;
   });
 }

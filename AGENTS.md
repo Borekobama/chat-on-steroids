@@ -334,16 +334,9 @@ still checks live policy. Schema visibility is never the security boundary.
 | Plugins — `chat-on-steroids-plugins` | Enabled external tools with their upstream names and schemas, plus code-mode `exec` when that composition name is available. |
 
 `read` needs read/browse/metadata as appropriate; images need read; patch checks each hunk's
-<<<<<<< HEAD
-create/edit/move/delete permission; command controls both terminal tools; downloads need
-`saveArtifact`. Recording controls `session` and `update_plan`; multi-agent controls `agents`.
-`session_finish` always retains its exact `task_id`/`status` arm for control-task bookkeeping;
-the finish setting controls only its Astra summary/hold arm. Windows publishes four observation methods under
-=======
 create/edit/move/delete permission; command controls both terminal tools.
 Recording controls `update_plan`; multi-agent controls `agents`;
 the finish setting controls `session_finish`. Windows publishes four observation methods under
->>>>>>> origin/main
 screen access, nine input/launch methods under control, and clipboard methods under their own
 permissions. Multiline `type_text` additionally requires clipboard write. macOS `computer`
 registration can exist for control or clipboard access; each action rechecks its own permission.
@@ -1117,10 +1110,8 @@ republish an old enqueue-time model as a fresh observed switch.
 ### Astra's finish boundary
 
 `shared/chat-models.ts` recognizes exact Astra/Pro identities; substring guesses are forbidden.
-The finish setting exposes the Astra summary/hold arm of `session_finish` and requests it in
-executor prompts only under the applicable Astra policy. Its separate `task_id`/`status` arm is
-always published for exact CoS control-task completion and does not consume a finish checkpoint.
-Workers still use `agents action=finish`.
+`session_finish` is exposed by the finish setting and requested in executor prompts only under
+the applicable Astra policy. Workers still use `agents action=finish`.
 
 `shared/finish.ts::finishInstruction()` is the single prompt for browser and tool delivery:
 complete implementation first, call when roughly the configured 3/5 minutes of final checking

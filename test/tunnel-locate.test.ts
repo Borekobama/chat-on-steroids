@@ -64,21 +64,6 @@ describe('tunnel binary location', () => {
     expect(path.normalize(locateBinary('tunnel-client', selected)!)).toBe(path.normalize(selected));
   });
 
-<<<<<<< HEAD
-  it('uses valid sibling client for another explicit tunnel executable, but rejects invalid matching selection', async () => {
-    const selectedRoot = await mkdtemp(path.join(os.tmpdir(), 'clf-tunnel-sibling-'));
-    roots.push(selectedRoot);
-    const client = path.join(selectedRoot, tunnelExecutableName('tunnel-client'));
-    const cloudflared = path.join(selectedRoot, tunnelExecutableName('cloudflared'));
-    await executable(client, 'client');
-    await executable(cloudflared, 'cloudflared');
-    expect(path.normalize(locateBinary('cloudflared', client)!)).toBe(path.normalize(cloudflared));
-    if (process.platform !== 'win32') {
-      await chmod(cloudflared, 0o644);
-      resetTunnelLocatorCacheForTests();
-      expect(locateBinary('cloudflared', cloudflared)).toBeNull();
-    }
-=======
   it('does not replace an invalid explicit selection with an available PATH binary', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'clf-tunnel-explicit-'));
     roots.push(root);
@@ -98,7 +83,6 @@ describe('tunnel binary location', () => {
     await executable(client, 'client');
     await executable(sibling, 'cloudflared');
     expect(locateBinary('cloudflared', client)).toBe(sibling);
->>>>>>> origin/main
   });
 
   it('constructs native common-location fallbacks without leaking Windows paths onto POSIX', () => {

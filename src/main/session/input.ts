@@ -88,7 +88,6 @@ const entrySchema = inputArgs.extend({
   deliveredSessionId: z.string().min(8).max(64).nullable().optional(),
   messageId: z.string().min(1).max(256).optional(),
   deliveredAt: z.number().optional(),
-  browserRetryAt: z.number().optional(),
   stagesApplied: z.boolean().optional(),
   historyRecorded: z.boolean().optional(),
   /** Canonical message exists even when optional image assets could not be saved. */
@@ -427,20 +426,11 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
     // rows are ambiguous and cannot safely be reclassified from today's activity.
     if (row.state === 'queued' && row.mode === 'auto' && !row.opening && !row.finishOwner && !row.silenceBoundary &&
         (row.transportIntent === 'browser' || (!row.transportIntent && !row.sessionId)) &&
-<<<<<<< HEAD
-        Date.now() - Math.max(row.browserRetryAt ?? row.createdAt, row.dueAt) >= 60_000) {
-      if (row.browserRetryAt === undefined) return { ...row, browserRetryAt: Date.now() };
-      return { ...row, state: 'failed', error: 'Not sent: the browser did not pick up this message after one automatic retry.' };
-    }
-    // Native preparation bounds include the 60s upload and 15s picker hydration.
-    // Once Send is authorized, its 30s receipt + 15s fresh-route wait are the entire tail.
-=======
         Date.now() - Math.max(row.createdAt, row.dueAt) >= 60_000)
       return { ...row, state: 'failed', error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
     // Preparation can expire before Send. Once authorized, this exact claim owns
     // the uncertain outcome until receipt or explicit cancellation, regardless of
     // how long ChatGPT takes to assign its durable conversation identity.
->>>>>>> origin/main
     const companion = current.find(other => other.id === row.companionInputId);
     if (row.state === 'browser' && row.sendAuthorizedAt === undefined && row.requiresAuthorization === true &&
         Date.now() - (row.offeredAt ?? row.createdAt) >= (row.attachments?.length || companion?.attachments?.length ? 720_000 : row.images?.length || companion?.images?.length ? 120_000 : 60_000)) {

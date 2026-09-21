@@ -3,8 +3,6 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createServer } from 'node:http';
 import { Client } from '@modelcontextprotocol/client';
-import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
-import { getMcpConfigForManifest, vAny } from '@anthropic-ai/mcpb/browser';
 import { zipSync, strToU8 } from 'fflate';
 import sharp from 'sharp';
 import { makeTempDir, removeTempDir } from './helpers.js';
@@ -25,46 +23,15 @@ import { PluginOAuth, PluginNeedsAuth } from '../src/main/plugins/oauth.js';
 import * as pluginInstaller from '../src/main/plugins/installer.js';
 import * as exposureModule from '../src/main/plugins/exposure.js';
 import * as durableModule from '../src/main/durable.js';
-import { setEnvValue } from '../src/main/env.js';
-import type { LocalPluginTransportFactory } from '../src/main/plugins/manager.js';
 
 const fixture = `const readline=require('node:readline');
 const tools=[{name:'Echo.Mixed',description:'Echo fixture',inputSchema:{type:'object',properties:{value:{type:'string'}},required:['value'],additionalProperties:false},annotations:{readOnlyHint:true,destructiveHint:false,openWorldHint:false},outputSchema:{type:'object',properties:{value:{type:'string'}},required:['value']}}];
 readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;let result;if(m.method==='initialize')result={protocolVersion:'2025-11-25',capabilities:{tools:{}},serverInfo:{name:'CoS test fixture',version:'1'}};else if(m.method==='tools/list')result={tools};else if(m.method==='tools/call')result={content:[{type:'text',text:process.env.TEST_SECRET||m.params.arguments.value}],structuredContent:{value:m.params.arguments.value},isError:m.params.arguments.value==='error'};else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`;
 let dir: string, manager: PluginManager, entry: string;
-const localTransport: LocalPluginTransportFactory = async ({ launch: installed, directory, dataDirectory, config, secrets: credentials, catalogId }) => {
-  let launch = { command: installed.command, args: installed.args, env: {} as Record<string, string> };
-  if (installed.manifest) {
-    const manifest = vAny.McpbManifestSchema.parse(installed.manifest);
-    const cfg = await getMcpConfigForManifest({
-      manifest,
-      extensionPath: directory,
-      systemDirs: {},
-      userConfig: { ...config, ...credentials },
-      pathSeparator: path.sep,
-      logger: { log: () => {}, warn: () => {}, error: () => {} },
-    });
-    if (typeof cfg?.command !== 'string') throw new Error('MCPB requires unsupported configuration/runtime setup');
-    launch = { command: cfg.command, args: cfg.args ?? [], env: cfg.env ?? {} };
-    const packagedPath = async (value: string): Promise<string> => {
-      if (path.isAbsolute(value) || value.startsWith('-')) return value;
-      const candidate = path.resolve(directory, value);
-      if (!candidate.startsWith(path.resolve(directory) + path.sep)) return value;
-      try { await fs.access(candidate); return candidate; } catch { return value; }
-    };
-    launch.args = await Promise.all(launch.args.map(packagedPath));
-    if (manifest.server.type === 'binary') launch.command = await packagedPath(launch.command);
-  }
-  const env = pluginInstaller.pluginEnvironment();
-  if (catalogId === 'playwright') setEnvValue(env, 'PLAYWRIGHT_MCP_CODEGEN', 'none');
-  for (const [key, value] of Object.entries({ ...config, ...credentials, ...launch.env })) setEnvValue(env, key, value);
-  if (catalogId === 'memory') setEnvValue(env, 'MEMORY_FILE_PATH', path.join(dataDirectory, 'memory.json'));
-  return new StdioClientTransport({ command: launch.command, args: launch.args, cwd: dataDirectory, env, stderr: 'ignore', maxBufferSize: 16 * 1024 * 1024 });
-};
 beforeEach(async () => {
   dir = await makeTempDir('plugins-test-');
   initDurableStore(dir);
-  manager = new PluginManager(undefined, localTransport);
+  manager = new PluginManager();
   await manager.initialize(dir);
   entry = path.join(dir, 'server.cjs');
   await fs.writeFile(entry, fixture);
@@ -77,15 +44,6 @@ afterEach(async () => {
   await removeTempDir(dir);
 });
 describe('external plugin authority', () => {
-<<<<<<< HEAD
-  it('refuses local plugin sources before installation or subprocess launch in production mode', async () => {
-    const production = new PluginManager();
-    await production.initialize(dir);
-    await expect(production.install({ source: { kind: 'command', command: process.execPath, args: [entry] } }))
-      .rejects.toThrow('Local plugins are disabled');
-    expect(production.snapshot().plugins).toEqual([]);
-    await production.close();
-=======
   it('classifies an unknown Plugins name without dispatching or implying a disabled Core permission', async () => {
     const upstream = vi.spyOn(Client.prototype, 'callTool');
     const outcome = vi.fn();
@@ -166,7 +124,6 @@ describe('external plugin authority', () => {
     expect(await manager.call('Echo.Mixed', { value: 'error text' }, outcome)).toEqual(upstreamError);
     expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_execution_error');
     expect(upstream).toHaveBeenCalledTimes(2);
->>>>>>> origin/main
   });
 
   it('keeps Windows package data below MAX_PATH across installation and replacement', async () => {
@@ -194,7 +151,7 @@ describe('external plugin authority', () => {
     await expect(fs.stat(directories[0]!)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(fs.stat(directories[1]!)).resolves.toBeDefined();
     await manager.close();
-    manager = new PluginManager(undefined, localTransport);
+    manager = new PluginManager();
     await manager.initialize(dir);
     await vi.waitFor(() => expect(manager.snapshot().plugins[0]?.status).toBe('ready'), { timeout: 10_000 });
     expect(manager.snapshot().plugins[0]?.id).toBe(row.id);
@@ -268,7 +225,7 @@ describe('external plugin authority', () => {
     await manager.install({ catalogId: 'memory' });
     expect(manager.snapshot().plugins[0]!.license).toContain('Apache-2.0');
     await manager.close();
-    manager = new PluginManager(undefined, localTransport);
+    manager = new PluginManager();
     await manager.initialize(dir);
     expect(manager.snapshot().plugins[0]!.license).toContain('Apache-2.0');
   });
@@ -279,7 +236,7 @@ describe('external plugin authority', () => {
     expect(manager.snapshot().plugins[0]!).toMatchObject({ status: 'needs-auth', tools: [expect.objectContaining({ published: false })] });
     expect(manager.tools()).toEqual([]);
     await manager.restart(row.id); await manager.close();
-    const open = vi.fn(); manager = new PluginManager(open, localTransport);
+    const open = vi.fn(); manager = new PluginManager(open);
     await manager.initialize(dir);
     expect(manager.tools()).toEqual([]);
     await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('needs-auth'));
@@ -619,7 +576,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     const row = (await manager.install({ catalogId: 'playwright' })).plugins[0]!;
     expect((await manager.call('Echo.Mixed', { value: 'probe' })).content).toEqual([{ type: 'text', text: 'none' }]);
     await manager.close();
-    manager = new PluginManager(undefined, localTransport);
+    manager = new PluginManager();
     await manager.initialize(dir);
     await vi.waitFor(() => expect(manager.tools()).toHaveLength(1));
     expect((await manager.call('Echo.Mixed', { value: 'probe' })).content).toEqual([{ type: 'text', text: 'none' }]);
@@ -683,7 +640,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         },
       ]),
     );
-    manager = new PluginManager(undefined, localTransport);
+    manager = new PluginManager();
     await expect(manager.initialize(dir)).resolves.toBeUndefined();
     expect(manager.snapshot().plugins).toEqual([]);
   });
@@ -727,7 +684,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
       .plugins[0]!;
     await manager.setEnabled(row.id, false);
     await manager.close();
-    manager = new PluginManager(undefined, localTransport);
+    manager = new PluginManager();
     await manager.initialize(dir);
     expect(manager.snapshot().plugins[0]!.id).toBe(row.id);
     expect(manager.snapshot().plugins[0]!.status).toBe('disabled');
@@ -736,7 +693,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   it('retains exact upstream names while restoring enabled servers in the background', async () => {
     const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
     await manager.close();
-    manager = new PluginManager(undefined, localTransport);
+    manager = new PluginManager();
     await manager.initialize(dir);
     await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('ready'), { timeout: 10_000 });
     expect(manager.snapshot().plugins[0]!.tools[0]!.exposedName).toBe('Echo.Mixed');
@@ -810,7 +767,7 @@ describe('enabled plugin process ownership', () => {
     await manager.close();
     let release!: (value: string) => void;
     vi.mocked(getSecret).mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
-    manager = new PluginManager(undefined, localTransport); await manager.initialize(dir);
+    manager = new PluginManager(); await manager.initialize(dir);
     try {
       await vi.waitFor(() => expect(manager.snapshot().plugins.find(row => row.id === h.row.id)!.status).toBe('ready'));
       const result = await Promise.race([manager.call('Echo.Mixed', { value: 'ready peer' }), new Promise(resolve => setTimeout(() => resolve('blocked'), 200))]);
@@ -829,7 +786,7 @@ describe('enabled plugin process ownership', () => {
     await manager.close();
     let releaseSecret!: (value: string) => void;
     vi.mocked(getSecret).mockImplementationOnce(() => new Promise(resolve => { releaseSecret = resolve; }));
-    manager = new PluginManager(undefined, localTransport);
+    manager = new PluginManager();
     await manager.initialize(dir);
     expect(manager.snapshot().plugins[0]!.status).toBe('connecting');
     expect(manager.tools().map(tool => tool.name)).toEqual(['Echo.Mixed']);
@@ -838,7 +795,7 @@ describe('enabled plugin process ownership', () => {
     await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('ready'));
     await manager.setEnabled(h.row.id, false);
     const before = await h.pids();
-    await manager.close(); manager = new PluginManager(undefined, localTransport); await manager.initialize(dir);
+    await manager.close(); manager = new PluginManager(); await manager.initialize(dir);
     expect(manager.snapshot().plugins[0]!.status).toBe('disabled');
     expect(manager.tools()).toEqual([]);
     expect(await h.pids()).toEqual(before);
@@ -846,7 +803,7 @@ describe('enabled plugin process ownership', () => {
   it('restores installed enabled servers and preserves a process across long gaps between calls', async () => {
     const h = await trackedFixture();
     expect(alive((await h.pids())[0]!.pid)).toBe(true);
-    await manager.close(); manager = new PluginManager(undefined, localTransport); await manager.initialize(dir);
+    await manager.close(); manager = new PluginManager(); await manager.initialize(dir);
     expect(manager.tools().map(tool => tool.name)).toEqual(['Echo.Mixed']);
     // Restoring a real Node child on a loaded Windows runner is not a one-second contract.
     // Await the same ready postcondition before fake time tests process retention.
@@ -945,7 +902,7 @@ describe('enabled plugin process ownership', () => {
     stored[0].catalog = [{ name: 'unvalidated' }];
     stored[0].tools = [{ name: 'Echo.Mixed', exposedName: 'old_hashed_name', enabled: true }];
     await fs.writeFile(file, JSON.stringify(stored));
-    manager = new PluginManager(undefined, localTransport); await manager.initialize(dir);
+    manager = new PluginManager(); await manager.initialize(dir);
     expect(manager.tools()).toEqual([]);
     await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('ready'));
     expect(manager.tools().map(tool => tool.name)).toEqual(['Echo.Mixed']);

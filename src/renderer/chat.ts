@@ -3266,11 +3266,7 @@ function applyAutoCompactHint(config: Config): void {
  * expire by age.
  */
 const CHAT_INPUTS = [
-<<<<<<< HEAD
-  'chatBrowser', 'managedBrowser', 'browserHeadless',
-=======
   'chatBrowser', 'browserBridgePort',
->>>>>>> origin/main
   'goalIncludeToolCalls',
   'planBackend',
   'finishTool', 'finishLeadMinutes', 'workerModel', 'workerReasoning', 'backgroundChats', 'browserOnly', 'autoRefreshPlugins',

@@ -21,7 +21,7 @@ import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { effectiveCapabilities, defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
+import { effectiveCapabilities, defaultConfig } from '../src/main/config.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
 import { friendlyError } from '../src/main/mcp/kernel.js';
@@ -60,7 +60,7 @@ import {
 } from '../src/main/codex/ownership.js';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
 import { locateRipgrep } from '../src/main/ripgrep.js';
-import { IS_WINDOWS, makeSandboxShim, makeTempDir, removeTempDir, writeTree } from './helpers.js';
+import { IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
 
 // ---------------------------------------------------------------- transport
 
@@ -245,10 +245,6 @@ function allCaps(): Capabilities {
 
 beforeAll(async () => {
   base = await makeTempDir('clf-mcp-');
-  initConfigPath(base);
-  const sandbox = await makeSandboxShim(base);
-  const saved = defaultConfig();
-  await saveConfig({ ...saved, commandSandbox: { enabled: true, codexPath: sandbox, permissionProfile: 'projects-only' } });
   // This suite calls real tools, and calling a tool records it. Recording is on by
   // default now, so without a directory of its own the recorder wrote session folders
   // into the process's working directory — which for a test run is the repository.
@@ -598,11 +594,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-<<<<<<< HEAD
-    expect(names).toEqual(['agents', 'apply_patch', 'download_artifact', 'exec', 'exec_command', 'read', 'session', 'session_finish', 'update_plan', 'view_image', 'write_stdin']);
-=======
     expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'update_plan', 'view_image', 'write_stdin']);
->>>>>>> origin/main
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
@@ -817,13 +809,8 @@ describe('surface boundaries', () => {
     const desktopTools = toolList(await desktop('tools/list'));
 
     // Each populated surface includes code mode; find and the shell exec pair remain exclusive.
-<<<<<<< HEAD
-    expect(coreTools).toHaveLength(11);
-    expect(desktopTools).toHaveLength(IS_WINDOWS ? 16 : 3);
-=======
     expect(coreTools).toHaveLength(8);
     expect(desktopTools).toHaveLength(BROWSER_TOOLS.length + (IS_WINDOWS ? 16 : process.platform === 'darwin' ? 3 : 1));
->>>>>>> origin/main
 
     // And the size, which is what a discovery pull actually costs the model on every
     // conversation that touches the connector. The ceilings sit just above what the
@@ -1052,7 +1039,7 @@ describe('capability gating', () => {
     ctx.caps = effectiveCapabilities(config);
     ctx.readOnly = true;
 
-    expect(toolNames(await core('tools/list'))).toEqual(['exec', 'find', 'read', 'session_finish', 'view_image']);
+    expect(toolNames(await core('tools/list'))).toEqual(['exec', 'find', 'read', 'view_image']);
   });
 
   it('offers apply_patch only when a writing permission is on', async () => {
@@ -1254,8 +1241,9 @@ describe('capability gating', () => {
 
   it('always offers read, because that is what the app is for', async () => {
     ctx.caps = withCaps({ browse: false, search: false, read: false, metadata: false });
-    // Task completion remains available without filesystem capabilities.
-    expect(toolNames(await core('tools/list'))).toEqual(['exec', 'session_finish']);
+    // Nothing is registered when every reading permission is off — but the snapshot is
+    // monotonic, so a surface that started with reading on keeps it and refuses instead.
+    expect(toolNames(await core('tools/list'))).toEqual([]);
   });
 });
 
@@ -3544,6 +3532,7 @@ describe('exec sessions belong to the chat that opened them', () => {
 
     expect(textOf(blocked)).toMatch(/Background session \d+ completed/);
     expect(textOf(blocked)).toContain('owed-');
+
     const admitted = await asChat(blockedRequest, 'exec_command', {
       cmd: IS_WINDOWS ? "Write-Output 'admitted-after-drain'" : "printf '%s\\n' admitted-after-drain",
       workdir: '/workspace',

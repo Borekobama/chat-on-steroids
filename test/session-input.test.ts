@@ -494,22 +494,13 @@ describe('durable user input ownership', () => {
     await acknowledgeBrowserInput(second.id, 'second-owner', binding.conversationId);
     expect(automate.mock.calls.at(-1)?.[1]).toBe('off');
   });
-<<<<<<< HEAD
-  it('retries then expires a legacy initial browser attempt while retaining an intentional after-turn wait', async () => {
-=======
   it('migrates a legacy initial browser attempt while retaining an intentional after-turn wait', async () => {
->>>>>>> origin/main
     const stale = await seedLegacyInput(input({ sessionId: null }));
     const after = await seedLegacyInput(input({ mode: 'after-turn' }));
     now += 600001;
     binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'fresh-end', time: now };
     expect(await pendingBrowserInputs()).toContainEqual({ id: after.id, conversationId: binding.conversationId });
-<<<<<<< HEAD
-    now += 60000;
-    expect((await listInputs()).find(row => row.id === stale.id)).toMatchObject({ state: 'failed' });
-=======
     expect((await listInputs()).find(row => row.id === stale.id)).toMatchObject({ state: 'queued', opening: true, sessionId: stale.id });
->>>>>>> origin/main
     resetInputForTests();
     expect(await claimBrowserInput(stale.id, 'after-restart', null)).toMatchObject({ id: stale.id, state: 'browser' });
   });
@@ -1446,28 +1437,14 @@ it('admits active direct injections independently across chats and preserves all
   expect(await offerToolInput(sessionId, 'conversation-a', 'tool-a', now)).toHaveLength(2);
   expect(await offerToolInput('session-two', 'conversation-b', 'tool-b', now)).toHaveLength(1);
 });
-<<<<<<< HEAD
-it('retries an unclaimed ordinary initial browser attempt once before failing', async () => {
-  const row = await enqueueInput(input({ sessionId: null, dueAt: now + 120000 }));
-  expect(row.transportIntent).toBe('browser');
-=======
 it('keeps a migrated legacy initial browser attempt queued past its old startup deadline', async () => {
   const row = await seedLegacyInput(input({ sessionId: null, dueAt: now + 120000 }));
->>>>>>> origin/main
   now += 179999;
   resetInputForTests();
   expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe('queued');
   now++;
-<<<<<<< HEAD
-  expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'queued', browserRetryAt: now });
-  expect(changed).toHaveBeenCalled();
-  now += 60000;
-  expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed', error: expect.stringContaining('automatic retry') });
-  expect(await claimBrowserInput(row.id, 'late', null)).toBeNull();
-=======
   expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'queued', opening: true, sessionId: row.id });
   expect(await claimBrowserInput(row.id, 'late', null)).toMatchObject({ id: row.id, state: 'browser' });
->>>>>>> origin/main
 });
 it('never times out an intentional after-turn wait or a finish stage', async () => {
   binding.activeTurnId = 'active';

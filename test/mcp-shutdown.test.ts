@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import * as filesystem from '../src/main/codex/filesystem.js';
+import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import { once } from 'node:events';
@@ -9,7 +10,6 @@ import { validateNewRoot } from '../src/main/sandbox.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
 import { initSessionStore, resetSessionStoreForTests, unsetSessionRootForTests } from '../src/main/session/store.js';
-import { makeTempDir } from './helpers.js';
 
 let dir = '';
 let endpoint: McpEndpoint | null = null;
@@ -26,10 +26,6 @@ afterEach(async () => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-<<<<<<< HEAD
-it('drains an accepted MCP mutation before closing its response socket', async () => {
-  dir = await makeTempDir('clf-mcp-drain-');
-=======
 it.each(['idle TCP', 'partial headers', 'partial body'])('disconnect retires %s without waiting for HTTP timeouts', async (kind) => {
   dir = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-mcp-unaccepted-'));
   initConfigPath(dir);
@@ -55,7 +51,6 @@ it.each(['idle TCP', 'partial headers', 'partial body'])('disconnect retires %s 
 
 it.each([false, true])('drains an accepted mutation, with final-shutdown escalation=%s', async (forceShutdown) => {
   dir = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-mcp-drain-'));
->>>>>>> origin/main
   initConfigPath(dir);
   initSessionStore(dir);
   initDurableStore(dir);
@@ -144,7 +139,7 @@ it.each([false, true])('drains an accepted mutation, with final-shutdown escalat
   }
 });
 it('does not put a force-close deadline on an ordinary endpoint stop', async () => {
-  dir = await makeTempDir('clf-mcp-graceful-stop-');
+  dir = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-mcp-graceful-stop-'));
   initConfigPath(dir);
   initSessionStore(dir);
   initDurableStore(dir);

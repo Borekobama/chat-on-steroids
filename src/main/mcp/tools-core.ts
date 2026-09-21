@@ -57,14 +57,7 @@ import {
   forgetExecOwner,
   MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION,
   noteExecAttended,
-<<<<<<< HEAD
-  noteExecOwner,
-  reserveExecOwner,
-  provenConversation,
-  provenSession
-=======
   noteExecOwner
->>>>>>> origin/main
 } from '../codex/ownership.js';
 import {
   UnifiedExecError,
@@ -108,7 +101,6 @@ import {
   withExecNotes
 } from '../exec-hints.js';
 import { childEnv } from '../exec.js';
-import { prependPath } from '../env.js';
 import { locateRipgrep } from '../ripgrep.js';
 import { ensureDevToolchain } from '../toolchain.js';
 import {
@@ -232,8 +224,6 @@ function execChildEnvironment(): NodeJS.ProcessEnv {
   // fail to find the very rg binary the app ships. Extend the shared environment only with the
   // dev-toolchain discovery that is specific to this surface.
   const env = childEnv();
-  const codexPath = getConfig().commandSandbox.codexPath;
-  if (nodePath.isAbsolute(codexPath)) prependPath(env, nodePath.dirname(codexPath));
   const added = ensureDevToolchain(env);
   if (added.length > 0 && !toolchainLogged) {
     toolchainLogged = true;
@@ -818,12 +808,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             // separate registry. Clear any stale row at the allocation boundary so a recycled
             // id cannot briefly authorize its previous chat before this call publishes the new owner.
             forgetExecOwner(processId);
-            reserveExecOwner(processId, owner);
 
-<<<<<<< HEAD
-            let output;
-            try { output = await unifiedExecManager.execCommand({
-=======
             const ripgrep = locateRipgrep();
             const executionCommand = deriveExecArgs(shell,
               withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
@@ -835,7 +820,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                 return exitCode !== null && exitCode !== 0 && sections.length === rawCommands.length && nonzero.length > 0 &&
                   nonzero.every(section => nonZeroExitIsBenign(boundCommands[section.index - 1] ?? '', section.exitCode, section.text));
               },
->>>>>>> origin/main
               batchMarker: batch?.marker,
               command: executionCommand,
               shellType: shell.shellType,
@@ -847,24 +831,11 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               cwd: dir.real,
               displayCwd: dir.virtual,
               env: execChildEnvironment(),
-<<<<<<< HEAD
-              tty: input.tty ?? DEFAULT_TTY,
-              commandSandbox: getConfig().commandSandbox
-            }); } catch (error) { forgetExecOwner(processId); throw error; }
-            // Which durable local session may later write to this process id. The frontend
-            // conversation is replaceable during Compact & Resume; the local session is not.
-            if (output.processId === null) {
-              forgetExecOwner(processId);
-            } else {
-              noteExecOwner(output.processId, owner);
-            }
-=======
               tty: input.tty ?? DEFAULT_TTY
             });
             // Which exact session or temporary request principal may later write to this
             // process id. Request custody upgrades lazily when exact correlation arrives.
             noteExecOwner(output.processId ?? output.completedSessionId ?? null, owner);
->>>>>>> origin/main
             const responseText = execCommandResponseText(output);
             // A search that found nothing exits 1 and has not failed. Recording it as an
             // error made a session's error count meaningless; see exec-hints.ts for why this
@@ -1023,26 +994,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
   if (reg.sessionToolsExposed) {
     registerPlanTool(reg);
   }
-<<<<<<< HEAD
-  const taskFinishSchema = z.object({ task_id: z.string().uuid(), status: z.enum(['succeeded', 'failed']) });
-  const summaryFinishSchema = z.object({ summary: z.string().min(1).max(1000) });
-  const astraFinishExposed = reg.ctx.exposedFinishTool ?? getConfig().ui.finishTool === true;
-  const finishSchema = astraFinishExposed ? z.union([summaryFinishSchema, taskFinishSchema]) : taskFinishSchema;
-  reg.register('session_finish', toolDeclaration('session_finish', () => ({
-    description: astraFinishExposed
-      ? 'A task_id/status form records Codex-launched CoS task completion immediately. For Astra only, when a user prompt explicitly requests it, a summary form receives queued user instructions and can hold the turn for at most 25 seconds.'
-      : 'Record Codex-launched CoS task completion immediately with the exact task_id and succeeded/failed status.',
-    inputSchema: finishSchema,
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
-  }), astraFinishExposed ? 'astra-control' : 'control'), async (input) => {
-    if ('task_id' in input) return { content: [{ type: 'text' as const, text: `RECORDED: ${input.task_id} ${input.status}. End this turn with matching COS_TASK_RESULT marker.` }] };
-    if (!getConfig().ui.finishTool) return { content: [{ type: 'text' as const, text: 'RELEASED: The user disabled finish hold. You may write your final answer.' }] };
-    const caller = currentCaller();
-    if (!caller.sessionId || !caller.conversationId) return failIdentity('Exact session identity is required');
-    if (goalWorkerChat(caller.conversationId)) return fail('Session finish hold is not applicable to workers or decision helpers. Workers report with agents action=finish; decision helpers answer normally.');
-    return guard('session_finish', async () => ({ content: [{ type: 'text', text: await announceSessionFinish(caller.sessionId!, input.summary) }] }));
-  });
-=======
   if (reg.ctx.exposedFinishTool ?? getConfig().ui.finishTool === true) {
     reg.register('session_finish', toolDeclaration('session_finish', () => ({
       description: 'For Astra only, when explicitly requested by a user prompt. Call near actual completion, after implementing the requested work. Receives queued instructions; complete and verify them before calling again. Do not use for progress updates or queue collection. While HELD with no work remaining, call to wait. Each call waits at most 25 seconds.',
@@ -1057,7 +1008,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       return guard('session_finish', async () => ({ content: [{ type: 'text', text: await announceSessionFinish(caller.sessionId!, summary, deadline) }] }));
     });
   }
->>>>>>> origin/main
 
 
   // ----------------------------------------------------------------- agents
@@ -1947,12 +1897,12 @@ async function resolvePatchPaths(
   const add = async (spelledPath: string, requireExisting: boolean): Promise<string> => {
     // First resolve the sandbox identity without requiring the leaf to exist. This gives later
     // hunks a stable real key even when the path exists only in the patch's simulated state.
-    let resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: true, writable: true });
+    let resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: true });
     const state = pendingPresence.get(pathKey(resolved.real));
     // An untouched initial Update/Delete keeps the old strict Not-found behaviour. Once an
     // earlier hunk has established presence/absence, the verifier owns the sequential verdict.
     if (requireExisting && state === undefined) {
-      resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: false, writable: true });
+      resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: false });
     }
     realBySpelling.set(spelledPath, resolved.real);
     virtualPaths.set(resolved.real, resolved.virtual);

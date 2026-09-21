@@ -19,9 +19,6 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { promises as fs } from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { HeadTailBuffer } from './head-tail-buffer.js';
 import { CommandBatchDisplay } from './command-batch.js';
 import {
@@ -49,7 +46,6 @@ import {
 } from './unified-exec-constants.js';
 import { terminateProcessTree } from '../exec.js';
 import { prefixPowershellScriptWithUtf8, type ShellType } from './shell.js';
-import type { CommandSandboxSettings } from '../../shared/types.js';
 
 // --------------------------------------------------------------------------- errors
 
@@ -670,44 +666,6 @@ export interface ExecCommandRequest {
   displayCwd: string;
   env: NodeJS.ProcessEnv;
   tty: boolean;
-  commandSandbox?: CommandSandboxSettings;
-}
-
-export function applyCommandSandbox(
-  command: string[],
-  cwd: string,
-  settings: CommandSandboxSettings | undefined,
-  trustedHome = os.homedir()
-): string[] {
-  if (!settings) throw new Error('command sandbox settings are required for shell commands');
-  if (!settings.enabled) throw new Error('command sandbox is required for shell commands');
-  if (!path.isAbsolute(settings.codexPath)) throw new Error('command sandbox Codex path must be absolute');
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(settings.permissionProfile)) {
-    throw new Error('command sandbox permission profile is invalid');
-  }
-  if (settings.permissionProfile !== 'projects-only') {
-    throw new Error('command sandbox permission profile must be projects-only');
-  }
-  if (process.platform === 'win32') {
-    throw new Error('command sandbox requires a contained working-directory launcher on Windows');
-  }
-  if (!path.isAbsolute(cwd) || !path.isAbsolute(trustedHome)) {
-    throw new Error('command sandbox paths must be absolute');
-  }
-  return [
-    settings.codexPath,
-    'sandbox',
-    '-c',
-    'shell_environment_policy.inherit=all',
-    '--permission-profile',
-    settings.permissionProfile,
-    '--cd',
-    trustedHome,
-    '/usr/bin/env',
-    '-C',
-    cwd,
-    ...command
-  ];
 }
 
 export interface WriteStdinRequest {
@@ -766,41 +724,22 @@ export class UnifiedExecProcessManager {
   private readonly completed = new Map<number, Pick<ExecCommandToolOutput, 'rawOutput' | 'displayOutput' | 'exitCode' | 'benignExit'> & { identity: object }>();
   private releaseListener?: (processId: number) => void;
   private readonly reservedProcessIds = new Set<number>();
-  private readonly revokedProcessIds = new Set<number>();
   private readonly maxWriteStdinYieldTimeMs: number;
 
-  constructor(
-    maxWriteStdinYieldTimeMs: number,
-    private readonly sandboxLaunch: (
-      command: string[], cwd: string, settings: CommandSandboxSettings | undefined, trustedHome: string
-    ) => { command: string[]; cwd: string } = (command, cwd, settings, trustedHome) => ({
-      command: applyCommandSandbox(command, cwd, settings, trustedHome),
-      cwd: trustedHome
-    })
-  ) {
+  constructor(maxWriteStdinYieldTimeMs: number) {
     this.maxWriteStdinYieldTimeMs = Math.max(maxWriteStdinYieldTimeMs, MIN_EMPTY_YIELD_TIME_MS);
   }
 
-<<<<<<< HEAD
-  hasProcessOrReservation(processId: number): boolean {
-    return this.reservedProcessIds.has(processId) || this.processes.has(processId);
-=======
   /** The custody registry drops ownership only when this manager really discards an id. */
   setProcessReleaseListener(listener: (processId: number) => void): void {
     this.releaseListener = listener;
->>>>>>> origin/main
   }
 
   /** `rand::rng().random_range(1_000..100_000)`, retried against the reservations. */
   allocateProcessId(): number {
     for (;;) {
       const processId = 1_000 + Math.floor(Math.random() * (100_000 - 1_000));
-<<<<<<< HEAD
-      if (this.reservedProcessIds.has(processId)) continue;
-      this.revokedProcessIds.delete(processId);
-=======
       if (this.reservedProcessIds.has(processId) || this.completed.has(processId)) continue;
->>>>>>> origin/main
       this.reservedProcessIds.add(processId);
       return processId;
     }
@@ -808,7 +747,6 @@ export class UnifiedExecProcessManager {
 
   releaseProcessId(processId: number): void {
     this.reservedProcessIds.delete(processId);
-    this.revokedProcessIds.delete(processId);
     this.processes.delete(processId);
     this.completed.delete(processId);
     this.releaseListener?.(processId);
@@ -839,35 +777,14 @@ export class UnifiedExecProcessManager {
     try {
       // `UnifiedExecRuntime::run` prefixes every PowerShell script before it reaches the
       // process launcher so pipe-mode output is UTF-8 just like PTY output.
-      const preparedCommand =
+      const command =
         request.shellType === 'powershell' ? prefixPowershellScriptWithUtf8(request.command) : request.command;
-      const commandWithPath = [...preparedCommand];
-      if (globalThis.process.platform !== 'win32' && request.env.PATH && commandWithPath.length >= 3) {
-        const shellFlag = commandWithPath[1];
-        if (shellFlag === '-c' || shellFlag === '-lc') {
-          const pathValue = request.env.PATH.replaceAll("'", "'\\''");
-          commandWithPath[2] = `export PATH='${pathValue}'; ${commandWithPath[2]}`;
-        }
-      }
-      const trustedHome = await fs.realpath(os.homedir());
-      const canonicalCwd = await fs.realpath(request.cwd);
-      const sameCwd = globalThis.process.platform === 'win32'
-        ? canonicalCwd.toLowerCase() === path.resolve(request.cwd).toLowerCase()
-        : canonicalCwd === path.resolve(request.cwd);
-      if (!sameCwd) throw new Error('command working directory changed after authorization');
-      const launch = this.sandboxLaunch(commandWithPath, canonicalCwd, request.commandSandbox, trustedHome);
-      const env = { ...request.env };
-      for (const key of Object.keys(env)) {
-        if (key.toLowerCase() === 'home' || key.toLowerCase() === 'codex_home') delete env[key];
-      }
-      env.HOME = trustedHome;
-      env.CODEX_HOME = path.join(trustedHome, '.codex');
       process = await UnifiedExecProcess.spawn({
         batchMarker: request.batchMarker,
-        command: launch.command,
+        command,
         shellType: request.shellType,
-        cwd: launch.cwd,
-        env,
+        cwd: request.cwd,
+        env: request.env,
         tty: request.tty
       });
     } catch (error) {
@@ -875,11 +792,6 @@ export class UnifiedExecProcessManager {
       throw error instanceof UnifiedExecError
         ? error
         : UnifiedExecError.createProcess(error instanceof Error ? error.message : String(error));
-    }
-    if (this.revokedProcessIds.has(request.processId)) {
-      await process.terminate();
-      this.releaseProcessId(request.processId);
-      throw UnifiedExecError.processFailed('process launch was cancelled');
     }
 
     const start = Date.now();
@@ -1186,11 +1098,7 @@ export class UnifiedExecProcessManager {
 
   async terminateProcess(processId: number): Promise<boolean> {
     const entry = this.processes.get(processId);
-    if (!entry) {
-      if (!this.reservedProcessIds.has(processId)) return false;
-      this.revokedProcessIds.add(processId);
-      return true;
-    }
+    if (!entry) return false;
     if (!entry.process.hasExited()) await entry.process.terminate();
     const current = this.processes.get(processId);
     if (current && current.process === entry.process) {

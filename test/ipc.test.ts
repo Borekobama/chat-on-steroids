@@ -456,11 +456,7 @@ it('keeps origin history navigation separate from live revision cursors over IPC
 });
 
 describe('explicit settings replace the published tool contract', () => {
-<<<<<<< HEAD
-  it.each(['finish', 'command', 'session'] as const)('updates %s in real endpoint publication after its setting is disabled', async kind => {
-=======
   it.each(['finish', 'command'] as const)('withdraws %s from real endpoint publication after its setting is disabled', async kind => {
->>>>>>> origin/main
     const { startMcpServer } = await import('../src/main/mcp/server.js');
     const { effectiveCapabilities } = await import('../src/main/config.js');
     const { publishPluginSurface, pluginRefreshPublications, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
@@ -482,17 +478,8 @@ describe('explicit settings replace the published tool contract', () => {
         : { capabilities: { ...current.capabilities, command: false } }) };
       expect((await save(patch)).ok).toBe(true);
       const after = snapshot();
-<<<<<<< HEAD
-      if (kind === 'finish') {
-        const finish = after.tools.find(row => row.name === tool)!;
-        expect(finish).toBeDefined();
-        expect(JSON.stringify(finish.inputSchema)).toContain('task_id');
-        expect(JSON.stringify(finish.inputSchema)).not.toContain('summary');
-      } else expect(after.tools.map(row => row.name)).not.toContain(tool);
-=======
       expect(after.tools.map(row => row.name)).not.toContain(tool);
       expect(after.tools.map(row => row.name)).not.toContain('session');
->>>>>>> origin/main
       expect(after.schemaId).not.toBe(before.schemaId);
       const saved = getConfig();
       expect((await save({ ...saved, ui: { ...saved.ui, theme: 'dark' } })).ok).toBe(true);
@@ -728,13 +715,6 @@ describe('settings writes from more than one UI', () => {
     const current = getConfig();
     expect((await save({ ...current, tunnel: { ...current.tunnel, pluginsTunnelId: '' } }, current)).ok).toBe(true);
     expect(getConfig().tunnel.pluginsTunnelId).toBe('');
-  });
-
-  it('rejects one tunnel id shared by multiple connector surfaces', async () => {
-    const base = defaultConfig(); await saveConfig(base);
-    const tunnelId = `tunnel_${'a'.repeat(32)}`;
-    const duplicate = { ...base, tunnel: { ...base.tunnel, tunnelId, pluginsTunnelId: tunnelId } };
-    expect((await save(duplicate, base)).ok).toBe(false);
   });
 
   it('preserves a newer Plugins tunnel across stale and legacy renderer saves', async () => {

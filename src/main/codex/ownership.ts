@@ -44,12 +44,7 @@ const NOTICES_PER_KIND = 3;
 
 /** Owners, keyed by the process id `exec_command` handed back as `session_id`. */
 const owners = new Map<number, string | null>();
-<<<<<<< HEAD
-/** Launch reservations are cancellable, but never authorize write_stdin. */
-const pendingOwners = new Map<number, string | null>();
-=======
 const REQUEST_PRINCIPAL_PREFIX = 'request:';
->>>>>>> origin/main
 
 /** When each owned session was last started or polled, keyed the same way. */
 const attendedAt = new Map<number, number>();
@@ -61,12 +56,6 @@ const attendedAt = new Map<number, number>();
  */
 const noticeOffers = new Map<number, OutputPublication>();
 
-<<<<<<< HEAD
-export function execProcessIdsOwnedBy(sessionId: string): Set<number> {
-  const processIds = new Set<number>();
-  for (const [processId, owner] of owners) if (owner === sessionId) processIds.add(processId);
-  for (const [processId, owner] of pendingOwners) if (owner === sessionId) processIds.add(processId);
-=======
 function requestPrincipal(requestId: string): string {
   return `${REQUEST_PRINCIPAL_PREFIX}${requestId}`;
 }
@@ -106,7 +95,6 @@ export function executionPrincipal(
 function processIdsOwnedBy(principal: string): Set<number> {
   const processIds = new Set<number>();
   for (const [processId, owner] of owners) if (samePrincipal(owner, principal)) processIds.add(processId);
->>>>>>> origin/main
   return processIds;
 }
 
@@ -131,18 +119,8 @@ export function provenSession(requestId: string | null, sessionId: string | null
 /** Records custody for a returned running or completed process id. */
 export function noteExecOwner(processId: number | null, principal: string | null): void {
   if (processId === null) return;
-<<<<<<< HEAD
-  pendingOwners.delete(processId);
-  owners.set(processId, sessionId);
-=======
   owners.set(processId, principal);
->>>>>>> origin/main
   attendedAt.set(processId, Date.now());
-}
-
-/** Records a cancellable launch without granting process-write authority. */
-export function reserveExecOwner(processId: number, sessionId: string | null): void {
-  pendingOwners.set(processId, sessionId);
 }
 
 /**
@@ -164,7 +142,6 @@ export function noteExecAttended(processId: number | null): void {
 export function forgetExecOwner(processId: number | null): void {
   if (processId === null) return;
   owners.delete(processId);
-  pendingOwners.delete(processId);
   attendedAt.delete(processId);
   noticeOffers.delete(processId);
 }
@@ -175,15 +152,9 @@ export function execOwner(processId: number): string | null {
 }
 
 /** One caller-scoped projection used by reminders, admission and runtime status. */
-<<<<<<< HEAD
-export function backgroundExecObligations(sessionId: string | null | undefined): BackgroundExecState {
-  if (!sessionId) return { running: [], exitedUnread: [] };
-  return unifiedExecManager.backgroundState(execProcessIdsOwnedBy(sessionId));
-=======
 export function backgroundExecObligations(principal: string | null | undefined): BackgroundExecState {
   if (!principal) return { running: [], exitedUnread: [] };
   return unifiedExecManager.backgroundState(processIdsOwnedBy(principal));
->>>>>>> origin/main
 }
 
 /** Owned sessions still running past the unattended threshold. */
@@ -230,27 +201,16 @@ unifiedExecManager.setProcessReleaseListener(forgetExecOwner);
 export async function acknowledgeBackgroundExecOutput(
   principal: string | null | undefined, startedAt: number, except?: number
 ): Promise<void> {
-<<<<<<< HEAD
-  if (!sessionId) return;
-  const retired = await unifiedExecManager.acknowledgeCompletedOutput(execProcessIdsOwnedBy(sessionId), startedAt, except);
-  for (const id of retired) forgetExecOwner(id);
-=======
   if (!principal) return;
   await unifiedExecManager.acknowledgeCompletedOutput(processIdsOwnedBy(principal), startedAt, except);
->>>>>>> origin/main
 }
 
 /** One bounded page from the retained terminal buffer; this function never reruns a command. */
 export async function offerBackgroundExecOutput(
   principal: string | null | undefined, publication: OutputPublication, maxBytes: number
 ): Promise<string | null> {
-<<<<<<< HEAD
-  if (!sessionId || maxBytes < 1_024) return null;
-  const page = await unifiedExecManager.offerCompletedOutput(execProcessIdsOwnedBy(sessionId), publication, maxBytes - 1_024);
-=======
   if (!principal || maxBytes < 1_024) return null;
   const page = await unifiedExecManager.offerCompletedOutput(processIdsOwnedBy(principal), publication, maxBytes - 1_024);
->>>>>>> origin/main
   if (!page) return null;
   const command = truncateText(page.command.replace(/\s+/g, ' '), { kind: 'bytes', bytes: 400 });
   const remaining = page.total - page.end;

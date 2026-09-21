@@ -36,7 +36,6 @@ import {
   isAbsoluteVirtualPath,
   isNativeWindowsPath,
   resolvePath,
-  resolveWritablePath,
   type Resolved
 } from '../sandbox.js';
 import { currentWorkspace, learnWorkspace, setCurrentWorkspace } from '../workspace.js';
@@ -538,7 +537,6 @@ export async function dispatch(
   const context: CallContext = {
     publication: parent?.publication ?? inboundPublication() ?? { completedAt: null, failed: false },
     startedAt: Date.now(),
-    receiptStartedAt: performance.timeOrigin + performance.now(),
     transportKey,
     agent: null,
     allowUnattributed: getConfig().multiAgent.allowUnattributedCalls,
@@ -551,7 +549,7 @@ export async function dispatch(
       trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent))
     );
     // In-process callers have no socket; resolving their outer invocation publishes it.
-    if (!parent && !inboundPublication()) context.publication!.completedAt = performance.timeOrigin + performance.now();
+    if (!parent && !inboundPublication()) context.publication!.completedAt = Date.now();
     return result;
   } catch (error) {
     if (!parent) context.publication!.failed = true;
@@ -788,12 +786,8 @@ async function dispatchTracked(
   if (!nested && requestId && !blockedChat && !supersededConversation && !compacting) {
     const explicitPoll = name === 'write_stdin' && args && typeof args === 'object'
       ? (args as { session_id?: number }).session_id : undefined;
-<<<<<<< HEAD
-    await acknowledgeBackgroundExecOutput(context.caller.sessionId, context.receiptStartedAt ?? startedAt, explicitPoll);
-=======
     const principal = executionPrincipal(requestId, context.caller.sessionId, allowUnattributed);
     await acknowledgeBackgroundExecOutput(principal, startedAt, explicitPoll);
->>>>>>> origin/main
   }
   let handlerRan = false;
   markTiming('identity');
@@ -915,13 +909,7 @@ async function dispatchTracked(
   };
   // Ordinary tools carry direct user input, but only the explicit finish signal
   // advances a planned stage. Successful work is not evidence that a stage is done.
-<<<<<<< HEAD
-  const finishBoundary = name === 'session_finish' && args !== null && typeof args === 'object' &&
-    typeof (args as Record<string, unknown>).summary === 'string' && !result.isError;
-  const userInput = nested ? { messages: [], reminder: '' } : await offerToolInput(context.caller.sessionId, context.caller.conversationId, context.caller.requestId, startedAt, finishBoundary).catch(() => {
-=======
   const userInput = nested || deliveryFenced ? { messages: [], reminder: '' } : await offerToolInput(context.caller.sessionId, context.caller.conversationId, context.caller.requestId, startedAt, name === 'session_finish' && !result.isError).catch(() => {
->>>>>>> origin/main
     logWarn('User input could not be attached; the completed tool result is preserved');
     return { messages: [], reminder: '' };
   });
@@ -1078,7 +1066,7 @@ async function validatedWorkspace() {
 export async function resolveIn(
   roots: Parameters<typeof resolvePath>[0],
   requested: string,
-  options: { allowMissing?: boolean; base?: string | null; writable?: boolean } = {}
+  options: { allowMissing?: boolean; base?: string | null } = {}
 ): Promise<Resolved> {
   // An explicit adapter-supplied base beats the workspace; otherwise the workspace is the base.
   // Either way the joining happens inside `resolvePath`, ahead of validation,
@@ -1088,11 +1076,7 @@ export async function resolveIn(
   // `/elsewhere`, and nothing downstream can tell it apart from a path that was always that.
   const workspace = await validatedWorkspace();
   const base = options.base !== undefined ? options.base : (workspace?.virtual ?? null);
-<<<<<<< HEAD
-  const resolved = await (options.writable ? resolveWritablePath : resolvePath)(roots, requested, {
-=======
   const resolveOptions = {
->>>>>>> origin/main
     ...(options.allowMissing === undefined ? {} : { allowMissing: options.allowMissing }),
     base
   };
