@@ -492,8 +492,7 @@ private func matchingAXWindow(_ row: WindowRow, deadline suppliedDeadline: TimeI
         guard ProcessInfo.processInfo.systemUptime < deadline else {
             throw fail("UIA_TIMEOUT", "accessibility window matching exceeded its bounded native deadline")
         }
-        // Geometry may fill absent identity, but must never override a contradictory AX ID.
-        guard axWindowNumber(window) == nil, let bounds = axBounds(window), convincinglyMatchesWindow(bounds, row.bounds) else { continue }
+        guard let bounds = axBounds(window), convincinglyMatchesWindow(bounds, row.bounds) else { continue }
         geometryCandidates.append((window, windowGeometryDistance(bounds, row.bounds)))
     }
     geometryCandidates.sort { $0.distance < $1.distance }

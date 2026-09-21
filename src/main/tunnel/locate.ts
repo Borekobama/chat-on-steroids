@@ -119,8 +119,6 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
           return sibling;
         }
       }
-      // An explicit existing path is authoritative. Do not silently replace a
-      // non-executable selection with the bundled client or a PATH entry.
       locateCache.set(key, null);
       return null;
     }
@@ -130,10 +128,6 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
       locateCache.set(key, sibling);
       return sibling;
     }
-    // An explicit selection is an executable identity, not a suggestion. Falling
-    // back here hides a missing/non-executable selection behind an unrelated copy.
-    locateCache.set(key, null);
-    return null;
   }
 
   const bundled = bundledDir();

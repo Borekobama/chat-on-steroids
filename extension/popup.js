@@ -231,6 +231,7 @@ function paintHeader(status) {
 
   $('retryBtn').hidden = ready || incompatible;
   $('retryBtn').textContent = off ? 'Connect' : 'Try again';
+  $('unpairBtn').hidden = !paired || incompatible;
   return ready;
 }
 
@@ -405,6 +406,11 @@ $('retryBtn').addEventListener('click', async () => {
   $('retryBtn').disabled = true;
   await chrome.runtime.sendMessage({ type: 'pair' });
   $('retryBtn').disabled = false;
+  await refresh();
+});
+
+$('unpairBtn').addEventListener('click', async () => {
+  await chrome.runtime.sendMessage({ type: 'unpair' });
   await refresh();
 });
 

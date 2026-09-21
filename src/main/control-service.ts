@@ -50,7 +50,7 @@ const refreshHooks: ControlRefreshHooks = {
   getSession,
   readEvents,
   processIdsOwnedBy: execProcessIdsOwnedBy,
-  hasProcessOrReservation: processId => unifiedExecManager.hasProcessOrReservation(processId)
+  hasProcessOrReservation: processId => { const state = unifiedExecManager.backgroundState(new Set([processId])); return state.running.includes(processId) || state.exitedUnread.some(row => row.processId === processId); }
 };
 
 let socketPath = '';

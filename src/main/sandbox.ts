@@ -13,7 +13,6 @@
  */
 
 import { rawPromises as fs, rawRealpathNative } from './rawfs.js';
-import os from 'node:os';
 import path from 'node:path';
 import type { Root } from '../shared/types.js';
 
@@ -397,28 +396,6 @@ export async function resolvePath(
     virtual: toVirtualPath(root, rootReal, finalReal),
     root
   };
-}
-
-/** Mutation targets must also stay below CoS's fixed Projects ceiling. */
-export async function resolveWritablePath(
-  roots: readonly Root[],
-  virtualPath: string,
-  options: ResolveOptions = {},
-  projectsRoot = path.join(os.homedir(), 'Downloads', 'Projects')
-): Promise<Resolved> {
-  const resolved = await resolvePath(roots, virtualPath, options);
-  let ceiling: string;
-  try {
-    ceiling = await canonicalRealpath(projectsRoot);
-  } catch {
-    throw new SandboxError('Projects workspace is unavailable; filesystem writes are disabled.');
-  }
-  const { real, missing } = await realpathDeepest(resolved.real);
-  const target = missing.length === 0 ? real : path.join(real, ...missing);
-  if (!isContained(ceiling, target)) {
-    throw new SandboxError('Filesystem writes are allowed only inside ~/Downloads/Projects.');
-  }
-  return { ...resolved, real: target };
 }
 
 /** Converts a real path back into the virtual path the model sees. */

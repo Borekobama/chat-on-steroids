@@ -32,8 +32,7 @@ function harness(initial: Tab[], cached?: number) {
         set: async (values: object) => { Object.assign(stored, values); },
         remove: async (key: string) => { delete stored[key]; }
       } },
-      tabs: { query: async () => [...tabs.values()].map(tab => ({ ...tab })), create, move, get,
-        remove: vi.fn(async (ids: number[]) => { for (const id of ids) tabs.delete(id); }) },
+      tabs: { query: async () => [...tabs.values()].map(tab => ({ ...tab })), create, move, get },
       windows: { create: windowCreate, update: windowUpdate, get: async (id: number) => {
         if (!windows.has(id)) throw new Error('Window closed'); return windows.get(id);
       } }
@@ -61,7 +60,7 @@ it('adopts an existing app main window after cache loss and puts planner and wor
   expect(app.windowCreate).not.toHaveBeenCalled();
   expect(app.stored.chatBackgroundWindow).toBe(9);
   expect([...app.tabs.values()].every(tab => tab.windowId === 9)).toBe(true);
-  expect(app.windowUpdate).toHaveBeenCalledWith(9, { state: 'minimized', focused: false });
+  expect(app.windowUpdate).not.toHaveBeenCalled();
 });
 
 it('consolidates app tabs into the existing owner without opening another window', async () => {
@@ -98,15 +97,6 @@ it('does not adopt or move personal tabs in a mixed window', async () => {
   expect(app.tabs.get(1)?.windowId).toBe(worker.windowId);
   expect(app.tabs.get(2)?.windowId).toBe(9);
   expect(app.move).toHaveBeenCalledTimes(1);
-});
-
-it('adopts a managed startup window, removes setup tabs and minimizes it', async () => {
-  const app = harness([{ id: 1, windowId: 9, url: 'https://chatgpt.com/c/main' },
-    { id: 2, windowId: 9, url: 'chrome://setup/' }, { id: 3, windowId: 9, url: 'helium://setup/' }]);
-  expect(await app.reconcileBackgroundWindow({ ...policy, managedBrowser: true })).toBe(true);
-  expect([...app.tabs.keys()]).toEqual([1]);
-  expect(app.stored.chatBackgroundWindow).toBe(9);
-  expect(app.windowUpdate).toHaveBeenCalledWith(9, { state: 'minimized', focused: false });
 });
 
 it('adopts an exact pending planner startup tab before it has a conversation', async () => {

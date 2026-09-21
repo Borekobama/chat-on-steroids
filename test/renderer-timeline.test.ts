@@ -154,7 +154,7 @@ async function settleHistoryFrame(w: Pick<Window, 'requestAnimationFrame'>): Pro
   await settle();
 }
 
-async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[]; pro?: boolean; astra?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null } = {}) {
+async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[]; pro?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null } = {}) {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
@@ -208,8 +208,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
   const api: any = new Proxy(
     {
       getState: () => ok(state),
-      getChatModels: () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: options.pro ? ['high', 'pro'] : ['none', 'high'] },
-        ...(options.astra ? [{ id: 'gpt-6-pro', label: 'GPT-6 Pro', efforts: ['pro'] }] : [])] }),
+      getChatModels: () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: options.pro ? ['high', 'pro'] : ['none', 'high'] }] }),
       getSessionControls: (id: string) => ok({ sessionId: id, conversationId: 'chat-a', automation: live.automation, activeTurnId: 'held-turn', finishHeld: live.finishHeld, blocked: '', job: live.compacting ? { busy: true } : null }),
       releaseSessionFinish: (id: string, turn: string) => { live.controlCalls.push({ id, action: `release:${turn}` }); live.finishHeld = false; return ok({}); },
       setSessionAutomation: (id: string, action: string) => { live.controlCalls.push({ id, action }); live.automation = action; return ok({}); },
@@ -1618,7 +1617,7 @@ it.each(['composer', 'bubble'])('clears New Chat drafts and removes a delivery c
   const cancel = vi.fn(async (id: string) => { live.inputs = live.inputs.map(row => row.id === id ? { ...row, state: 'cancelled' as const, error: 'Not sent: this delivery was cancelled before Send was authorized.' } : row); return { ok: true, data: true }; });
   (w as any).api.cancelInput = cancel;
   expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Cancel delivery');
-  if (control === 'composer') w.document.getElementById('chatSend')!.click();
+  if (control === 'composer') w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { cancelable: true }));
   else (w.document.querySelector('#inputQueue [title="Cancel delivery"]') as HTMLButtonElement).click();
   await settle();
   expect(cancel).toHaveBeenCalledWith(live.inputs[0]!.id);
@@ -2071,7 +2070,7 @@ it('shows Stop immediately for a queued first send, switches to Send for a new d
   expect(send.dataset.action).toBe('stop');
   const cancel = vi.fn(async (id: string) => { live.inputs = live.inputs.map(row => row.id === id ? { ...row, state: 'cancelled' } : row); return { ok: true, data: true }; });
   (w as any).api.cancelInput = cancel;
-  send.click();
+  form.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
   await settle();
   expect(cancel).toHaveBeenCalledWith(live.sent[0]!.id);
   expect(send.dataset.action).toBe('send');
@@ -2584,24 +2583,6 @@ it('routes an armed empty-composer plan through the planner and paints only its 
   expect(live.sent[0]).toMatchObject({ text: 'Write SVG paths', stages: ['Validate the SVG'] });
 });
 
-it('does not turn an empty or repeated form submission into a Stop request', async () => {
-  const { w, live } = await boot([]);
-  const api = (w as any).api;
-  const stop = vi.fn(async () => ({ ok: true, data: {} }));
-  api.stopSessionTurn = stop;
-  const form = w.document.getElementById('composer')!;
-  form.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
-  await settle();
-  expect(stop).not.toHaveBeenCalled();
-  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
-  input.value = 'A single correction'; input.dispatchEvent(new w.Event('input'));
-  form.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
-  form.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
-  await settle();
-  expect(live.sent.map(row => row.text)).toEqual(['A single correction']);
-  expect(stop).not.toHaveBeenCalled();
-});
-
 it('keeps actual-turn Stop through two authored sends and stops only the captured active turn', async () => {
   const { w, live } = await boot([]);
   const api = (w as any).api;
@@ -2624,7 +2605,7 @@ it('keeps actual-turn Stop through two authored sends and stops only the capture
   expect(live.sent.map(row => row.text)).toEqual(['First new direction', 'Second new direction']);
   expect(live.sent.every(row => row.sessionId === '2026-09-02-test0001' && row.mode === 'auto')).toBe(true);
   // A queued follow-up does not replace the real active turn as Stop's authority.
-  send.click();
+  form.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
   await settle();
   expect(stop).toHaveBeenCalledWith('2026-09-02-test0001', 'held-turn');
   expect(cancel).not.toHaveBeenCalled();
@@ -2641,7 +2622,7 @@ it('does not retarget an awaiting Stop after leaving and reselecting the same ch
   api.stopSessionTurn = stop;
   let resolve!: (value: any) => void;
   api.getSessionControls = () => new Promise(done => { resolve = done; });
-  w.document.getElementById('chatSend')!.click();
+  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
   api.getSessionControls = original;
   w.document.getElementById('newChat')!.click();
   (w.document.querySelector('#sessionList [data-id]') as HTMLElement).click();
@@ -2777,7 +2758,6 @@ it('follows the accepted New Chat receipt while preserving a typed follow-up', a
 
 it('shows Pro Loop delivery before sending and freezes changes made while the opening is being accepted', async () => {
   const { w, live } = await boot([], false, [], [], { pro: true });
-  (await (w as any).api.getState()).data.config.ui.finishTool = true;
   const row = w.document.getElementById('loopDeliveryRow')!;
   const effort = w.document.getElementById('composerReasoning') as HTMLSelectElement;
   const delivery = w.document.getElementById('loopDelivery') as HTMLSelectElement;
@@ -2806,45 +2786,6 @@ it('shows Pro Loop delivery before sending and freezes changes made while the op
   expect(row.hidden).toBe(true);
   w.document.getElementById('newChat')!.click();
   expect(delivery.value).toBe('finish');
-});
-
-it.each(['goal', 'loop'] as const)('keeps Astra %s selected when changing delivery and hides finish choices when finish is disabled', async mode => {
-  const { w, append } = await boot([], true, [], [], { astra: true });
-  const api = (w as any).api;
-  const state = (await api.getState()).data;
-  state.config.ui.finishTool = true;
-  const getSession = api.getSession;
-  api.getSession = async (...args: unknown[]) => {
-    const result = await getSession(...args);
-    result.data.summary.selectedModel = { conversationId: 'chat-b', model: 'gpt-6-pro', reasoningEffort: 'pro', observedAt: Date.now() };
-    return result;
-  };
-  const model = w.document.getElementById('composerModel') as HTMLSelectElement;
-  model.value = 'gpt-6-pro'; model.dispatchEvent(new w.Event('change'));
-  const controls = { sessionId: summary([]).id, conversationId: 'chat-b', automation: mode, loopAfterTurn: false, blocked: '' };
-  api.getSessionControls = async () => ({ ok: true, data: controls });
-  api.setSessionAutomation = vi.fn(async (_id: string, next: string, afterTurn: boolean) => {
-    controls.automation = next as typeof mode; controls.loopAfterTurn = afterTurn;
-    return { ok: true, data: controls };
-  });
-  await append([]);
-  // Re-select after the session's recorded model projection has settled.
-  model.value = 'gpt-6-pro'; model.dispatchEvent(new w.Event('change'));
-  const row = w.document.getElementById('loopDeliveryRow')!;
-  const delivery = w.document.getElementById('loopDelivery') as HTMLSelectElement;
-  expect(row.hidden).toBe(false);
-  delivery.value = 'after-turn'; delivery.dispatchEvent(new w.Event('change'));
-  await settle();
-  expect(api.setSessionAutomation).toHaveBeenLastCalledWith(summary([]).id, mode, true);
-  expect((w.document.getElementById('chatAutomation') as HTMLSelectElement).value).toBe(mode);
-  state.config.ui.finishTool = false;
-  await append([]);
-  expect(row.hidden).toBe(true);
-  expect(delivery.value).toBe('after-turn');
-  state.config.ui.finishTool = true;
-  model.value = 'gpt-6-pro'; model.dispatchEvent(new w.Event('change'));
-  expect(row.hidden).toBe(false);
-  expect(delivery.value).toBe('after-turn');
 });
 
 it('applies Off to the exact accepted New Chat opening while preserving an unrelated composer draft', async () => {

@@ -78,14 +78,7 @@ export default async function sealMacOsBundle(context) {
   // bundle would leave the same self-contradiction one level down. Apple discourages --deep for
   // *distribution* signing, where each nested component wants its own identity and entitlements;
   // for a uniform ad-hoc seal with no entitlements there is nothing to distinguish.
-  // Release builds remain ad-hoc. Local installations may opt into a persistent identity
-  // or requirement so macOS does not forget their Keychain ACL after every rebuild.
-  const identity = process.env.COS_MAC_SIGNING_IDENTITY?.trim() || '-';
-  const requirement = process.env.COS_MAC_DESIGNATED_REQUIREMENT?.trim();
-  run('codesign', ['--force', '--deep', '--sign', identity, app]);
-  // `--deep` applies an explicit requirement to nested Electron code after sealing its
-  // parent and invalidates that seal. Reseal only the outer app with the stable requirement.
-  if (requirement) run('codesign', ['--force', '--sign', identity, `-r=designated => ${requirement}`, app]);
+  run('codesign', ['--force', '--deep', '--sign', '-', app]);
 
   // The check the two broken releases did not have. --strict so a seal that merely exists is not
   // mistaken for a seal that is coherent, and --deep so a nested framework cannot be the one
@@ -98,9 +91,7 @@ export default async function sealMacOsBundle(context) {
   // would be a policy change smuggled in as a build step.
   // codesign displays these details on stderr even on success. Use the same
   // stdout+stderr policy as the standalone bundle audit, including TeamIdentifier.
-  if (identity === '-') {
-    assertNoTrustBearingMacCodeSignature(app, shown, existsSync(path.join(app, 'Contents', '_CodeSignature', 'CodeResources')));
-  }
+  assertNoTrustBearingMacCodeSignature(app, shown, existsSync(path.join(app, 'Contents', '_CodeSignature', 'CodeResources')));
 
-  process.stdout.write(`Sealed ${appName} with ${identity === '-' ? 'an ad-hoc' : 'the requested persistent'} identity and verified its resource envelope.\n`);
+  process.stdout.write(`Sealed ${appName} ad-hoc and verified its resource envelope.\n`);
 }

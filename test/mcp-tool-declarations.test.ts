@@ -84,23 +84,6 @@ it('refreshes root-sensitive read descriptions without rebuilding unrelated decl
   expect(c.find(tool => tool.name === 'view_image')!.inputSchema.properties).toBe(a.find(tool => tool.name === 'view_image')!.inputSchema.properties);
 });
 
-it('publishes task completion independently while keeping the optional Astra finish arm gated', async () => {
-  const ctx: ToolContext = { roots: [], caps: { ...DEFAULT_CAPABILITIES }, readOnly: false, sessionTools: false, agentTools: false, exposedFinishTool: false };
-  const declarations = async () => {
-    let tools: PluginToolSchema[] = [];
-    const server = buildServer(ctx, 'core', (_name, _version, _instructions, published) => { tools = published; });
-    await server.close();
-    return tools;
-  };
-  const taskOnly = (await declarations()).find(tool => tool.name === 'session_finish')!;
-  expect(JSON.stringify(taskOnly.inputSchema)).toContain('task_id');
-  expect(JSON.stringify(taskOnly.inputSchema)).not.toContain('summary');
-  ctx.exposedFinishTool = true;
-  const withAstra = (await declarations()).find(tool => tool.name === 'session_finish')!;
-  expect(JSON.stringify(withAstra.inputSchema)).toContain('task_id');
-  expect(JSON.stringify(withAstra.inputSchema)).toContain('summary');
-});
-
 it('shares schemas without capturing the preceding request permission snapshot in handlers', async () => {
   const register = async (read: boolean) => {
     const ctx: ToolContext = { roots: [], caps: { ...DEFAULT_CAPABILITIES, read }, exposedCaps: { ...DEFAULT_CAPABILITIES, read: true }, readOnly: false, sessionTools: false, agentTools: false, exposedFinishTool: false };

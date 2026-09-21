@@ -3843,9 +3843,9 @@ SOFTWARE.
 
 
 ================================================================================
-@napi-rs/canvas-win32-x64-msvc@1.0.9
+@napi-rs/canvas-darwin-arm64@1.0.9
 Declared license: MIT
-Package: https://www.npmjs.com/package/@napi-rs/canvas-win32-x64-msvc/v/1.0.9
+Package: https://www.npmjs.com/package/@napi-rs/canvas-darwin-arm64/v/1.0.9
 
 --- Upstream license supplement (see docs/licenses/README.md) ---
 MIT License

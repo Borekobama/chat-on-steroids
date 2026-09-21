@@ -71,8 +71,6 @@ export interface CallContext {
   publication?: OutputPublication;
   /** Wall-clock start of this MCP request, shared by identity-sensitive handlers. */
   startedAt: number;
-  /** High-resolution wall-clock start used only to order response publication receipts. */
-  receiptStartedAt?: number;
   /** Stable per-conversation key when the transport offers one, else null. */
   transportKey: string | null;
   /** Resolved agent id in multi-agent mode, else null. */

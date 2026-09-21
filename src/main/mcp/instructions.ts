@@ -142,7 +142,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform, skills: s
   );
   if (ctx.exposedFinishTool ?? config.ui.finishTool) lines.push(
     '',
-    'session_finish task_id/status records completion of an explicitly assigned CoS control task. Its summary form is for Astra only when the user prompt explicitly requests it. Follow that prompt’s finish timing after implementation; complete newly delivered work. It is not a plan/progress update or a way to collect queued tasks. Workers use agents action=finish instead.'
+    'session_finish is for Astra only when the user prompt explicitly requests it. Follow that prompt’s finish timing after implementation; complete newly delivered work. It is not a plan/progress update or a way to collect queued tasks. Workers use agents action=finish instead.'
   );
   if (desktop && (caps.screen || caps.control || caps.clipboardRead || caps.clipboardWrite)) lines.push(
     '',

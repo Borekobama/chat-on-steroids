@@ -27,7 +27,7 @@ it('keeps different markers, ordinary Unicode bytes, and an incomplete delimiter
 });
 
 async function start(script: string) {
-  const manager = new UnifiedExecProcessManager(5_000, (command, cwd) => ({ command, cwd }));
+  const manager = new UnifiedExecProcessManager(5_000);
   managers.push(manager);
   const output = await manager.execCommand({ command: [process.execPath, '-e', script], batchMarker: marker,
     shellType: process.platform === 'win32' ? 'powershell' : 'bash', hookCommand: 'batch presentation fixture',

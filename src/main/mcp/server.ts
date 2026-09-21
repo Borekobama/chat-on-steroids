@@ -358,11 +358,9 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
 
     const startedAt = Date.now();
     const publication = { completedAt: null as number | null, failed: false };
-    res.once('close', () => {
-      if (!res.writableFinished && publication.completedAt === null) publication.failed = true;
-    });
+    res.once('close', () => { if (publication.completedAt === null) publication.failed = true; });
     res.on('finish', () => {
-      if (res.statusCode >= 200 && res.statusCode < 300 && !publication.failed) publication.completedAt = performance.timeOrigin + performance.now();
+      if (res.statusCode >= 200 && res.statusCode < 300 && !publication.failed) publication.completedAt = Date.now();
       else publication.failed = true;
       const shape = route
         ? `mcp/${route.id}`

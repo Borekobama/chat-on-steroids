@@ -667,21 +667,6 @@ export function reconcileAgentRequestOwners(): Promise<void> {
         if (epoch !== requestOwnerEpoch) return;
         if (!target || retiredWorkerForConversation(target) || !allFamilies().includes(owner) ||
           owner.primeConversationId || unpublishedRuns.has(owner as Run)) continue;
-        // Worker ACKs can precede the prime's exact request proof. Their recorded
-        // sessions then have no parent, even after the worker has already slept.
-        // Complete that existing origin before publishing the family attachment;
-        // a failed write remains retryable while this owner is still provisional.
-        const parentSession = await getSession(targetSessionId);
-        if (parentSession?.chatIds.includes(target)) {
-          const { noteChatOrigin } = await import('./session/recorder.js');
-          for (const agent of owner.agents.values()) {
-            if (epoch !== requestOwnerEpoch) return;
-            if (!allFamilies().includes(owner) || owner.primeConversationId) break;
-            if (agent.info.role !== 'worker' || !agent.info.conversationId) continue;
-            await noteChatOrigin(agent.info.conversationId, { kind: 'worker',
-              fromSessionId: parentSession.id, agentId: agent.info.id, task: agent.info.task });
-          }
-        }
         // Reread after the parent walk: a concurrent A -> B commit cannot leave this fleet
         // attached to a superseded source merely because its earlier read returned A.
         const latest = await getSession(proof.sessionId);
@@ -3671,12 +3656,6 @@ export function primeForOwnedConversation(conversationId: string): string | null
   const run = runForConversation(conversationId);
   if (run && agentForConversationId(conversationId)) return run.primeConversationId;
   return dormantAgentForConversation(conversationId)?.owner.primeConversationId ?? null;
-}
-
-/** A currently occupied slot; parked history must not grant or refuse browser recovery. */
-export function liveAgentForOwnedConversation(conversationId: string): AgentInfo | null {
-  const agent = agentForConversationId(conversationId);
-  return agent ? { ...agent.info } : null;
 }
 
 /** Read-only exact owner metadata for recorder/origin reconstruction across parked histories. */

@@ -13,7 +13,6 @@ import {
   isContained,
   normaliseRootName,
   resolvePath,
-  resolveWritablePath,
   splitVirtualPath,
   strayVirtualPath,
   toVirtualPath,
@@ -122,24 +121,6 @@ describe('resolvePath — happy path', () => {
     const resolved = await resolvePath(roots, '/project/a/b/c.txt', { allowMissing: true });
     expect(resolved.real).toBe(path.join(approved, 'a', 'b', 'c.txt'));
     expect(resolved.virtual).toBe('/project/a/b/c.txt');
-  });
-});
-
-describe('resolveWritablePath — Projects ceiling', () => {
-  it('keeps approved reads broad but refuses writes outside the canonical ceiling', async () => {
-    await expect(resolvePath(roots, '/project/file.txt')).resolves.toMatchObject({ real: path.join(approved, 'file.txt') });
-    await expect(resolveWritablePath(roots, '/project/file.txt', {}, outside)).rejects.toThrow(
-      'Filesystem writes are allowed only inside ~/Downloads/Projects.'
-    );
-  });
-
-  it('allows existing and missing write targets inside the canonical ceiling', async () => {
-    await expect(resolveWritablePath(roots, '/project/file.txt', {}, approved)).resolves.toMatchObject({
-      real: path.join(approved, 'file.txt')
-    });
-    await expect(resolveWritablePath(roots, '/project/new/file.txt', { allowMissing: true }, approved)).resolves.toMatchObject({
-      real: path.join(approved, 'new', 'file.txt')
-    });
   });
 });
 

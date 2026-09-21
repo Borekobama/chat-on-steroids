@@ -101,23 +101,20 @@ const { findSessionByConversation, initSessionStore, readRecentEvents, resetSess
 const { recordChatObservations, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceForChat } = await import('../src/main/workspace.js');
 const { DEFAULT_CAPABILITIES } = await import('../src/shared/types.js');
-const { makeSandboxShim, makeTempDir, removeTempDir } = await import('./helpers.js');
+const { makeTempDir, removeTempDir } = await import('./helpers.js');
 
 let dir: string;
-let sandbox: string;
 
 async function setEnabled(enabled: boolean, maxWorkers = 3, allowUnattributedCalls = false): Promise<void> {
   const base = defaultConfig();
   await saveConfig({
     ...base,
-    commandSandbox: { enabled: true, codexPath: sandbox, permissionProfile: 'projects-only' },
     multiAgent: { ...base.multiAgent, enabled, maxWorkers, allowUnattributedCalls }
   });
 }
 
 beforeAll(async () => {
   dir = await makeTempDir('clf-agents-');
-  sandbox = await makeSandboxShim(dir);
   initConfigPath(dir);
   initSessionStore(dir);
   initDurableStore(dir);

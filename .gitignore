@@ -10,8 +10,6 @@ build/
 resources/
 
 *.log
-slopo.db
-slopo-report/
 # Local environment and credential files. Never publish real secrets.
 .env
 .env.*
@@ -50,3 +48,7 @@ proof-*.txt
 /outputs/
 /.codex-remote-attachments/
 /docs/audit-user-requests-20260905-06.md
+
+.supervisor-shunt/
+slopo.db
+slopo-report/

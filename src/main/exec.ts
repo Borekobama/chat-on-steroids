@@ -102,11 +102,6 @@ function validateEnvironment(overrides: CommandEnvironment | undefined): void {
 export function childEnv(overrides?: CommandEnvironment): NodeJS.ProcessEnv {
   validateEnvironment(overrides);
   const env = normalizeEnvironment(process.env);
-  // GUI apps launched by Finder commonly inherit only /usr/bin. Keep standard
-  // macOS package-manager tools available to commands without overriding user PATH.
-  if (process.platform === 'darwin') {
-    for (const dir of ['/usr/local/bin', '/opt/homebrew/bin']) if (existsSync(dir)) prependPath(env, dir);
-  }
   const ripgrep = locateRipgrep();
   if (ripgrep) prependPath(env, path.dirname(ripgrep));
   // Windows environment keys are case-insensitive. Remove every inherited spelling of

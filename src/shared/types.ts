@@ -133,7 +133,6 @@ export interface UiPrefs {
   /** Maintenance may reuse existing tabs but cannot open helpers or missing chats. */
   browserOnly?: boolean;
   backgroundChats?: boolean;
-  browserBridgePort?: import('./browser-bridge.js').BrowserBridgePort;
   /** Opt-in browser automation for changed connector tool schemas. */
   autoRefreshPlugins?: boolean;
   /** Actual app-owned tabs to retain; active work and drafts stay protected. Omitted uses workers + 2. */
@@ -311,12 +310,19 @@ export interface McpSettings {
   instructions: string;
 }
 
+export interface CommandSandboxSettings {
+  enabled: boolean;
+  codexPath: string;
+  permissionProfile: string;
+}
+
 export interface Config {
   /** Inactive setups only. Keys remain in encrypted secret slots addressed by profile ID. */
   setupProfiles?: Array<{ id: string; name: string; tunnelId: string; desktopTunnelId: string; pluginsTunnelId: string }>;
   roots: Root[];
   capabilities: Capabilities;
   readOnly: boolean;
+  commandSandbox: CommandSandboxSettings;
   tunnel: TunnelSettings;
   ui: UiPrefs;
   sessions: SessionSettings;
@@ -461,10 +467,6 @@ export interface LogEntry {
 
 /** What the renderer needs to know about the extension bridge, without any secrets. */
 export interface BridgeStatus {
-  /** Effective environment override, independent of the saved Settings choice. */
-  portOverridden?: boolean;
-  /** Last startup failure; a rejected settings change keeps the working bridge status. */
-  error?: string | null;
   running: boolean;
   port: number | null;
   /** Durable authorization: true once a browser extension has been issued this app's token. */

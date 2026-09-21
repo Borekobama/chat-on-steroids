@@ -1,6 +1,6 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 const browser = vi.hoisted(() => ({ connected: false, present: false, lastSeenAt: null as number | null }));
-const config = vi.hoisted(() => ({ ui: { chatBrowser: 'chrome', managedBrowser: false } }));
+const config = vi.hoisted(() => ({ ui: { chatBrowser: 'chrome' } }));
 vi.mock('../src/main/config.js', () => ({ getConfig: () => config }));
 const open = vi.hoisted(() => vi.fn(async (_url: string): Promise<string | null> => 'chrome'));
 const running = vi.hoisted(() => vi.fn(async (): Promise<boolean | null> => null));
@@ -8,7 +8,7 @@ vi.mock('../src/main/bridge.js', () => ({ bridgeStatus: async () => ({ ...browse
 vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: open, isPreferredBrowserRunning: running }));
 vi.mock('../src/main/connection.js', () => ({ connect: vi.fn(), getStatus: vi.fn(), onStatusChange: vi.fn() }));
 import { resetBrowserStartupForTests, wakeBrowserUrl } from '../src/main/browser-startup.js';
-beforeEach(() => { resetBrowserStartupForTests(); config.ui.chatBrowser = 'chrome'; config.ui.managedBrowser = false; browser.connected = false; browser.present = false; browser.lastSeenAt = null; open.mockReset().mockResolvedValue('chrome'); running.mockReset().mockResolvedValue(false); });
+beforeEach(() => { resetBrowserStartupForTests(); config.ui.chatBrowser = 'chrome'; browser.connected = false; browser.present = false; browser.lastSeenAt = null; open.mockReset().mockResolvedValue('chrome'); running.mockReset().mockResolvedValue(false); });
 
 it('starts the newly selected family without reusing the old attempt or overriding a connected companion', async () => {
   await wakeBrowserUrl('https://chatgpt.com/?cos-model-catalog=old');
@@ -20,15 +20,6 @@ it('starts the newly selected family without reusing the old attempt or overridi
   config.ui.chatBrowser = 'chrome';
   await wakeBrowserUrl('https://chatgpt.com/?cos-model-catalog=connected');
   expect(open).toHaveBeenCalledTimes(2);
-});
-
-it('does not treat a personal extension connection as managed-browser readiness', async () => {
-  config.ui.managedBrowser = true;
-  browser.connected = true;
-  running.mockResolvedValue(true);
-  await wakeBrowserUrl('https://chatgpt.com/?cos-input=managed');
-  expect(open).toHaveBeenCalledOnce();
-  expect(running).not.toHaveBeenCalled();
 });
 
 it('discards absence evidence when the selected browser changes during its probe', async () => {

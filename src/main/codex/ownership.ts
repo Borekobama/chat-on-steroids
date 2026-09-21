@@ -92,7 +92,7 @@ export function executionPrincipal(
   return null;
 }
 
-function processIdsOwnedBy(principal: string): Set<number> {
+export function execProcessIdsOwnedBy(principal: string): Set<number> {
   const processIds = new Set<number>();
   for (const [processId, owner] of owners) if (samePrincipal(owner, principal)) processIds.add(processId);
   return processIds;
@@ -154,7 +154,7 @@ export function execOwner(processId: number): string | null {
 /** One caller-scoped projection used by reminders, admission and runtime status. */
 export function backgroundExecObligations(principal: string | null | undefined): BackgroundExecState {
   if (!principal) return { running: [], exitedUnread: [] };
-  return unifiedExecManager.backgroundState(processIdsOwnedBy(principal));
+  return unifiedExecManager.backgroundState(execProcessIdsOwnedBy(principal));
 }
 
 /** Owned sessions still running past the unattended threshold. */
@@ -202,7 +202,7 @@ export async function acknowledgeBackgroundExecOutput(
   principal: string | null | undefined, startedAt: number, except?: number
 ): Promise<void> {
   if (!principal) return;
-  await unifiedExecManager.acknowledgeCompletedOutput(processIdsOwnedBy(principal), startedAt, except);
+  await unifiedExecManager.acknowledgeCompletedOutput(execProcessIdsOwnedBy(principal), startedAt, except);
 }
 
 /** One bounded page from the retained terminal buffer; this function never reruns a command. */
@@ -210,7 +210,7 @@ export async function offerBackgroundExecOutput(
   principal: string | null | undefined, publication: OutputPublication, maxBytes: number
 ): Promise<string | null> {
   if (!principal || maxBytes < 1_024) return null;
-  const page = await unifiedExecManager.offerCompletedOutput(processIdsOwnedBy(principal), publication, maxBytes - 1_024);
+  const page = await unifiedExecManager.offerCompletedOutput(execProcessIdsOwnedBy(principal), publication, maxBytes - 1_024);
   if (!page) return null;
   const command = truncateText(page.command.replace(/\s+/g, ' '), { kind: 'bytes', bytes: 400 });
   const remaining = page.total - page.end;

@@ -1,4 +1,4 @@
-import { existsSync, promises as fs } from 'node:fs';
+import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { pathEntries } from '../src/main/env.js';
@@ -238,9 +238,6 @@ describe('the environment prepared for a child process', () => {
     for (const entry of inherited) expect(child).toContain(entry);
     // The bundled ripgrep is a prefix, so the child is never shorter than what it inherited.
     expect(child.length).toBeGreaterThanOrEqual(inherited.length);
-    if (process.platform === 'darwin') {
-      for (const entry of ['/usr/local/bin', '/opt/homebrew/bin']) if (existsSync(entry)) expect(child).toContain(entry);
-    }
   });
 
   it('resolves a command against the same path the child will search', () => {

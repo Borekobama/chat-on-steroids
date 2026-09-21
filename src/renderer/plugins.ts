@@ -99,6 +99,7 @@ function showConnection(): void {
   const actions = el('div', 'plugin-setup-actions');
   actions.append(button(() => t("Open ChatGPT plugins"), async () => { await run(window.api.openLink('https://chatgpt.com/#settings/Plugins')); }), button(() => t("Save & connect"), async () => {
     if (!appState) return;
+    if (tunnel && !tunnel.value.trim()) { tunnel.focus(); throw new Error(t("Enter your Plugins tunnel ID.")); }
     if (key?.value) { const next = await run(window.api.setApiKey(key.value)); if (!next) return; key.value = ''; applyAppState(next); applyPluginsState(next); }
     if (tunnel) {
       const { capabilities, readOnly, tunnel: previousTunnel, ui, sessions, compaction, multiAgent, goal, mcp } = appState.config;

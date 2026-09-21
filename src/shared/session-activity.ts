@@ -16,7 +16,9 @@ export function workerReportedFinish(summary: SessionSummary): boolean {
     summary.lastFinishReportAt >= (summary.lastToolCallAt ?? 0);
 }
 
-/** Displayed work is independent of permission to reopen or reload its browser tab. */
+/** Shared by the displayed label and the opening cohort of attribution recovery. */
 export function sessionWorkingAt(summary: SessionSummary, now: number): boolean {
-  return !workerReportedFinish(summary) && recentChatActivity(summary, now);
+  // An unexpected page loss can retain work. Explicit user departure dismisses
+  // the active presentation until that exact page is observed again.
+  return summary.browserRecoveryDismissedAt === undefined && !workerReportedFinish(summary) && recentChatActivity(summary, now);
 }

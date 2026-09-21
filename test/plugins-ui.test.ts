@@ -100,15 +100,6 @@ it('keeps plugin connection setup local, preserves a draft and saves through the
   expect(document.querySelector('#pluginDialog .plugin-tools')).toBeNull();
 });
 
-it('allows clearing a Plugins tunnel that conflicts with Core', async () => {
-  const current = { hasApiKey: true, config: { tunnel: { kind: 'openai', tunnelId: 'same', pluginsTunnelId: 'same' } }, status: { surfaces: [] } } as unknown as AppState;
-  initPlugins(); applyPluginsState(current); await tick();
-  document.getElementById('pluginsSetupLink')!.click();
-  document.querySelector<HTMLInputElement>('#pluginDialog #pluginsTunnelId')!.value = '';
-  [...document.querySelectorAll<HTMLButtonElement>('#pluginDialog button')].find(node => node.textContent === 'Save & connect')!.click(); await tick();
-  expect(api.saveSettings).toHaveBeenCalledWith(expect.objectContaining({ tunnel: expect.objectContaining({ pluginsTunnelId: '' }) }), expect.anything());
-});
-
 it('explains starting enabled runtimes and tool publication conflicts', async () => {
   state.plugins[0]!.status = 'connecting';
   state.plugins[0]!.tools = [{ name: 'get_scene_info', exposedName: 'get_scene_info', enabled: true, published: false, exposureError: 'Another installed plugin declares get_scene_info.' }];

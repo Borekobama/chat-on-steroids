@@ -7,7 +7,7 @@ const publication = (): OutputPublication => ({ completedAt: null, failed: false
 afterEach(async () => { await Promise.all(managers.splice(0).map(m => m.terminateAllProcesses())); });
 
 async function child(output: string, exitCode = 7) {
-  const manager = new UnifiedExecProcessManager(60_000, (command, cwd) => ({ command, cwd }));
+  const manager = new UnifiedExecProcessManager(60_000);
   managers.push(manager);
   const id = manager.allocateProcessId();
   const initial = await manager.execCommand({

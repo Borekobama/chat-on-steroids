@@ -2,7 +2,7 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import { defaultConfig, initConfigPath, loadConfig, saveConfig } from '../src/main/config.js';
-import { configureManagedBrowser, managedBrowserProfile, openInPreferredBrowser, preferredBrowserCandidates } from '../src/main/browser.js';
+import { openInPreferredBrowser, preferredBrowserCandidates } from '../src/main/browser.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let dir: string;
@@ -60,28 +60,4 @@ it('finds Brave installations on each platform without mixing in Chrome or Edge'
   expect(linux).toContain('/opt/brave.com/brave/brave-browser');
   expect(linux).toContain('/snap/bin/brave');
   expect(linux.every(candidate => !/chrome|chromium|edge/.test(candidate))).toBe(true);
-});
-
-it('selects Helium without falling back to Chrome', () => {
-  expect(preferredBrowserCandidates('darwin', {}, '/Users/example', 'helium')).toEqual([
-    '/Applications/Helium.app/Contents/MacOS/Helium',
-    '/Users/example/Applications/Helium.app/Contents/MacOS/Helium'
-  ]);
-});
-
-it('launches managed Helium with a CoS-owned user-data directory and isolated Default profile', async () => {
-  const config = defaultConfig();
-  await saveConfig({ ...config, ui: { ...config.ui, managedBrowser: true, chatBrowser: 'helium' } });
-  configureManagedBrowser({ userDataDir: dir, extensionPath: '/cos/extension' });
-  const profile = managedBrowserProfile();
-  expect(profile).toBe(path.join(dir, 'managed-browser', 'helium-profile'));
-  const launch = vi.fn(async () => ({ pid: 123 }));
-  await openInPreferredBrowser('https://chatgpt.com/', {
-    platform: 'darwin', browser: 'helium', usable: () => true, launch, home: '/Users/example'
-  });
-  expect(launch).toHaveBeenCalledWith(expect.stringContaining('Helium.app'), expect.arrayContaining([
-    `--user-data-dir=${profile}`,
-    '--profile-directory=Default',
-    '--load-extension=/cos/extension'
-  ]), expect.any(String));
 });

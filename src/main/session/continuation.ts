@@ -1047,8 +1047,7 @@ export async function attachSummary(token: string, text: string): Promise<Handof
   return capture(token, brief, async (entry) =>
     prepareHandoff({
       sessionId: entry.sessionId,
-      text: brief,
-      continuationToken: entry.token
+      text: brief
     })
   );
 }

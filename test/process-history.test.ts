@@ -9,14 +9,13 @@ import { appendEvent, completeProcessCall, createSession, flushSessions, getSess
   rebindSession, resetSessionStoreForTests, turnHasMcpCall } from '../src/main/session/store.js';
 import { foldProgress, toolCallSummary, workSequence, type SessionEvent } from '../src/shared/session.js';
 import { UnifiedExecProcessManager, type ProcessCompletion } from '../src/main/codex/unified-exec.js';
-import { makeSandboxShim, makeTempDir, removeTempDir } from './helpers.js';
+import { makeTempDir, removeTempDir } from './helpers.js';
 
-let dir: string, sandbox: string;
+let dir: string;
 beforeEach(async () => {
   dir = await makeTempDir('process-history-');
-  sandbox = await makeSandboxShim(dir);
   initSessionStore(dir); initConfigPath(dir);
-  await saveConfig({ ...defaultConfig(), commandSandbox: { enabled: true, codexPath: sandbox, permissionProfile: 'projects-only' } });
+  await saveConfig(defaultConfig());
 });
 afterEach(async () => {
   await flushRecorder(); await flushSessions();
@@ -190,8 +189,7 @@ it('real process exit updates history while all output remains available to its 
     const output = await manager.execCommand({ processId: id, command: [process.execPath, '-e',
       'setTimeout(() => { console.log("retained"); process.exitCode = 7; }, 650)'],
       shellType: process.platform === 'win32' ? 'powershell' : 'bash', hookCommand: 'fixture', cwd: dir, displayCwd: dir,
-      env: process.env, tty: false, yieldTimeMs: 250, maxOutputTokens: undefined, truncationPolicy: { kind: 'tokens', tokens: 1000 },
-      commandSandbox: { enabled: true, codexPath: sandbox, permissionProfile: 'projects-only' } });
+      env: process.env, tty: false, yieldTimeMs: 250, maxOutputTokens: undefined, truncationPolicy: { kind: 'tokens', tokens: 1000 } });
     expect(output.processId).toBe(id);
     await recordToolCall({ tool: 'exec_command', args: { cmd: 'fixture' }, content: [{ type: 'text', text: 'initial' }],
       startedAt: Date.now(), durationMs: 250, outcome: 'ok', conversationId: 'owner', sessionId: session.id,
