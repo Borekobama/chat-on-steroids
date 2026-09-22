@@ -404,8 +404,11 @@ describe('session store', () => {
 
   it('finds an attachment beyond the 5,000-session maintenance scan cap', async () => {
     const seed = await createSession({ title: 'catalog seed', conversationId: null });
-    const seedSummary = await getSession(seed.id);
-    expect(seedSummary).not.toBeNull();
+    await flushSessions();
+    // Clone an actual persisted checkpoint, including its private version/watermark
+    // fields. A public summary is a legacy fixture and causes 5,001 real migrations.
+    const seedSummary = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
+    const seedStat = await fs.stat(path.join(sessionsRoot(), seed.id, 'meta.json'));
     // Force the next lookup to rebuild from the durable catalog rather than the live seed.
     resetSessionStoreForTests();
 
@@ -414,7 +417,23 @@ describe('session store', () => {
     const targetId = names[names.length - 1] as string;
     const realReaddir = fs.readdir.bind(fs);
     const realReadFile = fs.readFile.bind(fs);
+    const realStat = fs.stat.bind(fs);
     const rootPath = sessionsRoot();
+    const virtualNames = new Set(names);
+    const virtualId = (file: string): string | null => {
+      const parts = path.relative(rootPath, file).split(path.sep);
+      return parts.length === 2 && virtualNames.has(parts[0]!) ? parts[0]! : null;
+    };
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
+      (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
+        const file = String(target);
+        if (virtualId(file)) {
+          if (path.basename(file) === 'meta.json') return seedStat;
+          throw Object.assign(new Error('synthetic catalog has no message history'), { code: 'ENOENT' });
+        }
+        return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
+      }) as typeof fs.stat
+    );
     const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(
       (async (target: Parameters<typeof fs.readdir>[0], ...args: unknown[]) => {
         if (String(target) === rootPath) return names;
@@ -424,8 +443,8 @@ describe('session store', () => {
     const readSpy = vi.spyOn(fs, 'readFile').mockImplementation(
       (async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
         const file = String(target);
-        const id = path.basename(path.dirname(file));
-        if (file.endsWith('meta.json') && id.startsWith('catalog-')) {
+        const id = virtualId(file);
+        if (path.basename(file) === 'meta.json' && id) {
           return JSON.stringify({
             ...seedSummary,
             id,
@@ -440,9 +459,13 @@ describe('session store', () => {
 
     try {
       expect((await findSessionByConversation(conversationId, { requireUnique: true }))?.id).toBe(targetId);
+      expect((await realReaddir(rootPath)).some(name => virtualNames.has(name))).toBe(false);
     } finally {
       readSpy.mockRestore();
       readdirSpy.mockRestore();
+      statSpy.mockRestore();
+      resetSessionStoreForTests();
+      await deleteSession(seed.id);
     }
   }, 90_000);
 
@@ -1861,8 +1884,9 @@ describe('handoff storage', () => {
 
   it('finds the newest handoff even when its session is beyond the 5,000-folder maintenance cap', async () => {
     const seed = await createSession({ title: 'handoff catalog seed' });
-    const seedSummary = await getSession(seed.id);
-    expect(seedSummary).not.toBeNull();
+    await flushSessions();
+    const seedSummary = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
+    const seedStat = await fs.stat(path.join(sessionsRoot(), seed.id, 'meta.json'));
     resetSessionStoreForTests();
 
     const names = Array.from({ length: 5001 }, (_, index) => `handoff-${String(index).padStart(5, '0')}`);
@@ -1870,7 +1894,23 @@ describe('handoff storage', () => {
     const handoffId = '2026-08-24-deadbeef';
     const realReaddir = fs.readdir.bind(fs);
     const realReadFile = fs.readFile.bind(fs);
+    const realStat = fs.stat.bind(fs);
     const rootPath = sessionsRoot();
+    const virtualNames = new Set(names);
+    const virtualId = (file: string): string | null => {
+      const parts = path.relative(rootPath, file).split(path.sep);
+      return parts.length === 2 && virtualNames.has(parts[0]!) ? parts[0]! : null;
+    };
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
+      (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
+        const file = String(target);
+        if (virtualId(file)) {
+          if (path.basename(file) === 'meta.json') return seedStat;
+          throw Object.assign(new Error('synthetic catalog has no message history'), { code: 'ENOENT' });
+        }
+        return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
+      }) as typeof fs.stat
+    );
     const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(
       (async (target: Parameters<typeof fs.readdir>[0], ...args: unknown[]) => {
         if (String(target) === rootPath) return names;
@@ -1880,8 +1920,8 @@ describe('handoff storage', () => {
     const readSpy = vi.spyOn(fs, 'readFile').mockImplementation(
       (async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
         const file = String(target);
-        const id = path.basename(path.dirname(file));
-        if (file.endsWith('meta.json') && id.startsWith('handoff-')) {
+        const id = virtualId(file);
+        if (path.basename(file) === 'meta.json' && id) {
           return JSON.stringify({
             ...seedSummary,
             id,
@@ -1891,7 +1931,7 @@ describe('handoff storage', () => {
             lastHandoffAt: id === targetId ? 20_000 : null
           });
         }
-        if (file.endsWith(`${path.sep}handoffs${path.sep}${handoffId}.json`)) {
+        if (file === path.join(rootPath, targetId, 'handoffs', `${handoffId}.json`)) {
           return JSON.stringify(handoff(targetId, handoffId, 20_000));
         }
         return (realReadFile as (...callArgs: unknown[]) => ReturnType<typeof fs.readFile>)(target, ...args);
@@ -1900,9 +1940,12 @@ describe('handoff storage', () => {
 
     try {
       expect((await latestHandoff())?.id).toBe(handoffId);
+      expect((await realReaddir(rootPath)).some(name => virtualNames.has(name))).toBe(false);
     } finally {
       readdirSpy.mockRestore();
       readSpy.mockRestore();
+      statSpy.mockRestore();
+      resetSessionStoreForTests();
       await deleteSession(seed.id);
     }
   }, 90_000);
@@ -2433,8 +2476,9 @@ describe('canonical recorder 1.8', () => {
    * request id that starts after the reported end is proof the end was the page's, not
    * ChatGPT's. The recorder reopens the turn durably and lets the real end close it later.
    */
-  it('reopens a turn the page ended while its server turn kept calling tools', async () => {
-    const conversationId = 'conv-false-turn-end';
+  it.each(['completed', 'stopped', 'interrupted'] as const)('reopens a turn the page marked %s while its server turn kept calling tools', async outcome => {
+    const conversationId = `conv-false-turn-end-${outcome}`;
+    const sameRequest = `wfr_same_turn_${outcome}`, nextRequest = `wfr_next_turn_${outcome}`;
     const sessionId = await sessionForConversation(conversationId);
     const now = Date.now();
     const active = () => liveConversations().find((entry) => entry.conversationId === conversationId)?.activeTurnId ?? null;
@@ -2443,28 +2487,28 @@ describe('canonical recorder 1.8', () => {
       {
         kind: 'tool_evidence', time: now, fiberConversationId: conversationId,
         calls: [
-          { messageId: 'same-0', tool: 'read', order: 0, answered: false, requestId: 'wfr_same_turn' },
-          { messageId: 'next-0', tool: 'read', order: 1, answered: false, requestId: 'wfr_next_turn' }
+          { messageId: 'same-0', tool: 'read', order: 0, answered: false, requestId: sameRequest },
+          { messageId: 'next-0', tool: 'read', order: 1, answered: false, requestId: nextRequest }
         ]
       }
     ]);
-    await tool('wfr_same_turn', now + 10);
+    await tool(sameRequest, now + 10);
     expect(active()).toBe('g-false-end');
 
     await recordChatObservations(conversationId, [
-      { kind: 'turn_end', time: now + 20, turnId: 'g-false-end', outcome: 'completed' }
+      { kind: 'turn_end', time: now + 20, turnId: 'g-false-end', outcome }
     ]);
     expect(active()).toBeNull();
 
     // An in-flight call that merely finished late proves nothing about the end.
-    await tool('wfr_same_turn', now + 15);
+    await tool(sameRequest, now + 15);
     expect(active()).toBeNull();
     // Nor does a different server turn: that is a different turn.
-    await tool('wfr_next_turn', now + 30);
+    await tool(nextRequest, now + 30);
     expect(active()).toBeNull();
 
     // The same server turn calling on after the end is the turn not having ended.
-    await tool('wfr_same_turn', now + 40);
+    await tool(sameRequest, now + 40);
     expect(active()).toBe('g-false-end');
     const starts = await readEvents(sessionId!, { kinds: ['turn_start'] });
     expect(starts.map((event) => [event.turnId, event.source])).toEqual([
@@ -2474,7 +2518,7 @@ describe('canonical recorder 1.8', () => {
     expect(starts[1]?.kind === 'turn_start' && starts[1].detail).toMatch(/kept calling tools/);
 
     // Reopened once; the same turn going on is not news, and the real end is accepted.
-    await tool('wfr_same_turn', now + 50);
+    await tool(sameRequest, now + 50);
     expect(await readEvents(sessionId!, { kinds: ['turn_start'] })).toHaveLength(2);
     await recordChatObservations(conversationId, [
       { kind: 'turn_end', time: now + 60, turnId: 'g-false-end', outcome: 'completed' }
@@ -2482,6 +2526,42 @@ describe('canonical recorder 1.8', () => {
     expect(active()).toBeNull();
     const ends = await readEvents(sessionId!, { kinds: ['turn_end'] });
     expect(ends.map((event) => event.time)).toEqual([now + 20, now + 60]);
+  });
+
+  it.each(['continued-work', 'native-final'] as const)(
+    'reconciles a stopped response after recorder restart from %s', async evidenceKind => {
+    const conversationId = `conv-stop-restart-${evidenceKind}`;
+    const requestId = `wfr_stop_restart_${evidenceKind}`, turnId = 'stopped-before-restart';
+    const now = Date.now();
+    const { sessionId } = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: now, messageId: 'restart-question', text: 'Complete the task.' },
+      { kind: 'turn_start', time: now + 1, turnId },
+      { kind: 'tool_evidence', time: now + 2, turnId, fiberConversationId: conversationId,
+        calls: [{ messageId: 'restart-call', tool: 'read', order: 0, answered: false, requestId }] }
+    ]);
+    await tool(requestId, now + 3);
+    await recordChatObservations(conversationId, [{ kind: 'turn_end', time: now + 10, turnId, outcome: 'stopped' }]);
+    await flushSessions();
+    resetRecorderForTests();
+    resetSessionStoreForTests();
+    await sessionForConversation(conversationId);
+    // Restored exact request proof is supplied by a re-observed native call.
+    await recordChatObservations(conversationId, [{ kind: 'tool_evidence', time: now + 20, turnId,
+      fiberConversationId: conversationId,
+      calls: [{ messageId: 'restart-call', tool: 'read', order: 0, answered: true, requestId }] }]);
+    if (evidenceKind === 'continued-work') {
+      await tool(requestId, now + 21);
+      expect((await getSession(sessionId!))?.activeTurnId).toBe(turnId);
+    }
+    await recordChatObservations(conversationId, [{ kind: 'assistant_message', time: now + 30,
+      turnId, messageId: 'native-final-after-reload', providerMessageId: '11111111-2222-4333-8444-555555555555',
+      text: 'The full answer is available after reload.', state: 'final', final: true, activeNow: false }]);
+    const { readCompletedFinal } = await import('../src/main/session/store.js');
+    expect(await readCompletedFinal(sessionId!, conversationId, turnId))
+      .toMatchObject({ messageId: 'native-final-after-reload', turnId });
+    await tool(requestId, now + 31);
+    expect((await getSession(sessionId!))?.activeTurnId).toBeNull();
+    expect(await readCompletedFinal(sessionId!, conversationId, turnId)).not.toBeNull();
   });
 
   it('never cross-attributes concurrent same-tool calls from two chats', async () => {
@@ -3476,13 +3556,13 @@ describe('folding redrawn commentary', () => {
       message: { text, truncated: false, chars: text.length }
     }) as SessionEvent;
 
-  it('reconciles a stored Stop status from its exact stopped turn without moving or duplicating the row', () => {
+  it('keeps a Stop request truthful when the page reports stopped without a final answer', () => {
     const pending: SessionEvent = { ...progress(2, 'finish-release:stop-one', 'Stop requested. ChatGPT has not yet confirmed that generation stopped.'), source: 'app', turnId: 'stop-one' };
     const stopped: SessionEvent = { seq: 4, time: 4, source: 'extension', kind: 'turn_end', turnId: 'stop-one', outcome: 'stopped' };
     const rows = [pending, stopped];
     const folded = foldProgress(rows);
     expect(folded).toHaveLength(2);
-    expect(folded[0]).toMatchObject({ seq: 2, time: 2, progressId: 'finish-release:stop-one', turnId: 'stop-one', message: { text: 'Stopped. ChatGPT confirmed that generation stopped.', truncated: false } });
+    expect(folded[0]).toEqual(pending);
     expect(foldProgress(folded)).toEqual(folded);
     expect(pending.kind === 'progress' && pending.message.text).toContain('not yet confirmed');
   });

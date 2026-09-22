@@ -107,20 +107,10 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
         locateCache.set(key, asDir);
         return asDir;
       }
-      const namesMatching = path.basename(trimmed).toLowerCase() === fileName.toLowerCase();
-      if (namesMatching && isExecutableFile(trimmed)) {
+      if (path.basename(trimmed).toLowerCase() === fileName.toLowerCase() && isExecutableFile(trimmed)) {
         locateCache.set(key, trimmed);
         return trimmed;
       }
-      if (!namesMatching) {
-        const sibling = path.join(path.dirname(trimmed), fileName);
-        if (isExecutableFile(sibling)) {
-          locateCache.set(key, sibling);
-          return sibling;
-        }
-      }
-      locateCache.set(key, null);
-      return null;
     }
     // cloudflared normally sits beside tunnel-client in the release archive.
     const sibling = path.join(path.dirname(trimmed), fileName);
@@ -128,6 +118,10 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
       locateCache.set(key, sibling);
       return sibling;
     }
+    // An explicit selection is an executable identity, not a suggestion. Falling
+    // back here hides a missing/non-executable selection behind an unrelated copy.
+    locateCache.set(key, null);
+    return null;
   }
 
   const bundled = bundledDir();

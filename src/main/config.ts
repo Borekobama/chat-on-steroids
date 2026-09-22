@@ -1,5 +1,6 @@
 import { REASONING_EFFORTS } from '../shared/session.js';
 import { appearanceSchema } from './appearance-schema.js';
+import { BROWSER_BRIDGE_PORTS } from '../shared/browser-bridge.js';
 /**
  * Non-secret settings, stored as one small JSON file in the app's userData folder.
  * No database: there are at most a handful of roots and a dozen booleans.
@@ -42,6 +43,8 @@ import {
 import { logError } from './logger.js';
 import { RESERVED_ROOT_NAMES } from './sandbox.js';
 import { capabilitiesForPlatform } from './platform.js';
+
+export const browserBridgePortSchema = z.union([z.literal('auto'), z.literal(BROWSER_BRIDGE_PORTS)]);
 
 /**
  * Defaults for the newer sections, in one place so the schema and defaultConfig()
@@ -287,13 +290,14 @@ const configSchema = z.object({
   ui: z.object({
     appearance: appearanceSchema.optional().catch(undefined),
     autoContinue: z.boolean().optional().default(true),
-    chatBrowser: z.enum(CHAT_BROWSERS).optional().default('chrome'),
+    chatBrowser: z.enum(CHAT_BROWSERS).catch('chrome').optional().default('chrome'),
     developerMode: z.boolean().optional(),
     finishTool: z.boolean().optional(),
     planBackend: z.enum(['chatgpt', 'api']).optional(),
     finishAction: z.enum(['notify', 'goal']).optional(),
     finishLeadMinutes: z.number().int().min(3).max(5).optional(),
     backgroundChats: z.boolean().optional().default(true),
+    browserBridgePort: browserBridgePortSchema.optional().default('auto'),
     browserOnly: z.boolean().optional().default(false),
     autoRefreshPlugins: z.boolean().optional().default(false),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
@@ -469,7 +473,7 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     readOnly: false,
     commandSandbox: { ...DEFAULT_COMMAND_SANDBOX },
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, backgroundChats: true, autoContinue: true },
+    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, backgroundChats: true, browserBridgePort: 'auto', autoContinue: true },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...FIRST_LAUNCH_MULTI_AGENT },
@@ -648,8 +652,7 @@ export function effectiveCapabilities(
   return capped;
 }
 
-async function persistConfig(next: Config): Promise<Config> {
-  const parsed = configSchema.parse(next);
+async function persistConfig(parsed: Config): Promise<Config> {
   const tmp = `${configPath}.tmp`;
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   await fs.writeFile(tmp, JSON.stringify(parsed, null, 2), 'utf8');
@@ -670,11 +673,15 @@ async function persistConfig(next: Config): Promise<Config> {
  */
 export function updateConfig(
   update: (latest: Config) => Config | Promise<Config>,
-  afterPublish?: (next: Config, previous: Config) => void | Promise<void>
+  afterPublish?: (next: Config, previous: Config) => void | Promise<void>,
+  publish?: (next: Config, previous: Config, persist: () => Promise<Config>) => Promise<Config>
 ): Promise<Config> {
   const operation = mutationQueue.then(async () => {
     const previous = current;
-    const next = await persistConfig(await update(previous));
+    // Validate before reserving external resources. The optional publisher owns their rollback.
+    const proposed = configSchema.parse(await update(previous));
+    const persist = () => persistConfig(proposed);
+    const next = await (publish ? publish(proposed, previous, persist) : persist());
     // Keep dependent durable retirement inside the same settings transaction;
     // the next On cannot overtake a published Off's cancellation work.
     await afterPublish?.(next, previous);
