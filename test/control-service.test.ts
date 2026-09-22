@@ -3,7 +3,9 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { initDurableStore } from '../src/main/durable.js';
+import { initDurableStore, readDurable, writeDurableNow } from '../src/main/durable.js';
+import { appendEvent, createSession, initSessionStore } from '../src/main/session/store.js';
+import { finishControlTask, migrateTask } from '../src/main/control-service.js';
 import { beginControlTaskFollowup, cancellationReachedTerminal, deliveredTurnId, recoveredTaskCompletionEvidence, refreshControlTaskForTests, startControlService, stopControlService, taskCompletionEvidence, workspaceLeaseView, type ControlRefreshHooks, type Task } from '../src/main/control-service.js';
 import { readonlyCodexCommand, readonlyCodexEnvironment, readonlySeatbeltProfile, validateReadonlyRequest } from '../src/main/control-readonly.js';
 import type { SessionEvent } from '../src/shared/session.js';
@@ -36,7 +38,8 @@ describe('CoS control service', () => {
     const socketPath = await startControlService(root);
     const response = await request(socketPath, 'GET', '/v1/health');
     expect(response).toEqual({ status: 200, body: {
-      apiVersion: '1', ready: true, capabilities: ['submit', 'status', 'result', 'input', 'cancel', 'codex_readonly']
+      apiVersion: '1', ready: true, capabilities: ['submit', 'status', 'result', 'input', 'cancel', 'supervisor_task_finish'],
+      capabilityReasons: { worker_writable: 'disabled', codex_readonly: 'sandbox_unavailable' }
     } });
     await expect((await import('node:fs/promises')).stat(socketPath).then(stat => stat.mode & 0o777)).resolves.toBe(0o600);
   });
@@ -86,7 +89,7 @@ describe('CoS control service', () => {
 
   it('accepts only exact bound immediate task completion evidence', () => {
     const finish = (seq: number, turnId: string, taskId: string, status: string, time = seq * 10) => ({
-      kind: 'tool_call', seq, time, turnId, call: { tool: 'session_finish', outcome: 'ok', args: { truncated: false, text: JSON.stringify({ task_id: taskId, status }) } }
+      kind: 'tool_call', seq, time, turnId, call: { tool: 'supervisor_task_finish', outcome: 'ok', args: { truncated: false, text: JSON.stringify({ task_id: taskId, status }) } }
     }) as SessionEvent;
     const events = [
       finish(3, 'turn-1', 'wrong-task', 'succeeded'),
@@ -101,9 +104,9 @@ describe('CoS control service', () => {
   });
 
   it('recovers exact task completion after a provider retry changes turns', () => {
-    const finish = { kind: 'tool_call', seq: 8, time: 300, call: { tool: 'session_finish', outcome: 'ok',
+    const finish = { kind: 'tool_call', seq: 8, time: 300, turnId: 'retry', call: { tool: 'supervisor_task_finish', outcome: 'ok',
       args: { truncated: false, text: JSON.stringify({ task_id: 'task-1', status: 'succeeded' }) } } } as SessionEvent;
-    expect(recoveredTaskCompletionEvidence([finish], 'task-1', 2, 200)).toEqual({ seq: 8, time: 300, status: 'succeeded' });
+    expect(recoveredTaskCompletionEvidence([finish], 'task-1', 2, 200)).toEqual({ seq: 8, time: 300, status: 'succeeded', turnId: 'retry' });
     expect(recoveredTaskCompletionEvidence([finish], 'wrong-task', 2, 200)).toBeNull();
   });
 
@@ -121,6 +124,62 @@ describe('CoS control service', () => {
     hasProcessOrReservation: () => activeProcesses
   });
 
+  const acknowledged = (turnId: string, seq = 2, recordedAt = Date.now()): Partial<Task> => ({
+    completionAcknowledged: true,
+    completionStatus: 'succeeded', completionInputId: 'input-1', completionTurnId: turnId,
+    completionSeq: seq, completionRecordedAt: recordedAt
+  });
+
+  it.runIf(process.platform === 'darwin')('persists completion only for the delivered input and exact session', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'cos-completion-'));
+    initDurableStore(root); initSessionStore(root);
+    const session = await createSession({ conversationId: 'conversation-completion' });
+    const inputId = 'cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa';
+    const row = task({ inputId, inputIds: [inputId], sessionId: null, state: 'running' });
+    await writeDurableNow('control-tasks', [row]);
+    await startControlService(root);
+    await appendEvent(session.id, { kind: 'turn_start', source: 'app', time: 50, turnId: 'exact-turn' });
+    await appendEvent(session.id, { kind: 'user_message', source: 'app', time: 100, turnId: 'exact-turn', inputId,
+      inputDelivery: 'confirmed', message: { text: 'brief', chars: 5, truncated: false } });
+    await expect(finishControlTask(row.taskId, 'succeeded', 'wrong-session', 'conversation-completion', 200)).rejects.toThrow('turn_unproven');
+    await expect(finishControlTask(row.taskId, 'succeeded', session.id, 'conversation-completion', 100)).rejects.toThrow('not_delivered');
+    await finishControlTask(row.taskId, 'succeeded', session.id, 'conversation-completion', 200);
+    const saved = await readDurable<Task[]>('control-tasks');
+    expect(saved?.[0]).toMatchObject({ completionAcknowledged: true, completionInputId: inputId, completionTurnId: 'exact-turn' });
+    await appendEvent(session.id, { kind: 'user_message', source: 'app', time: 300, turnId: 'exact-turn',
+      message: { text: 'new request', chars: 11, truncated: false } });
+    await expect(finishControlTask(row.taskId, 'succeeded', session.id, 'conversation-completion', 400)).rejects.toThrow('superseded');
+  });
+
+  it('quarantines unknown versions and malformed persisted messages', () => {
+    const row = task({ inputId: 'cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa', inputIds: [] });
+    expect(migrateTask({ ...row, schemaVersion: 20 })).toBeNull();
+    expect(migrateTask({ ...row, messages: [null] })).toBeNull();
+    expect(migrateTask({ ...row, completionRecordedAt: 'bad' })).toBeNull();
+    expect(migrateTask(row)?.inputIds).toEqual([row.inputId]);
+  });
+
+  it('does not accept legacy or unacknowledged completion-shaped recorder arguments', async () => {
+    for (const tool of ['session_finish', 'supervisor_task_finish']) {
+      const events = [
+        { kind: 'user_message', seq: 1, time: 10, inputId: 'input-1', inputDelivery: 'confirmed', turnId: 'turn' },
+        { kind: 'tool_call', seq: 2, time: 20, turnId: 'turn', call: { tool, outcome: 'ok', args: { truncated: false, text: JSON.stringify({ task_id: task().taskId, status: 'succeeded' }) } } },
+        { kind: 'assistant_message', seq: 3, time: 30, turnId: 'turn', final: true, state: 'final', message: { text: 'wrong' } }
+      ] as SessionEvent[];
+      const result = await refreshControlTaskForTests(task(), hooks(events));
+      expect(result.state).not.toBe('succeeded');
+      expect(result.finalText).toBeNull();
+    }
+  });
+
+  it('never replays a cancelled input missing from the outbox', async () => {
+    const fixture = hooks([]);
+    fixture.listInputs = async () => [];
+    fixture.sendInput = vi.fn();
+    await refreshControlTaskForTests(task({ cancellationRequestedAt: 1, state: 'cancelling' }), fixture);
+    expect(fixture.sendInput).not.toHaveBeenCalled();
+  });
+
   it('returns enough lease evidence to wait or cancel the exact task', () => {
     expect(workspaceLeaseView(task())).toEqual({
       error: 'workspace_leased', message: 'Workspace already has an active task',
@@ -135,10 +194,10 @@ describe('CoS control service', () => {
       { kind: 'assistant_message', seq: finalSeq, turnId: 'exact-turn', final: true, state: 'final', message: { text: 'done' } },
       { kind: 'turn_end', seq: 4, turnId: 'exact-turn', outcome: 'completed' }
     ] as SessionEvent[];
-    await expect(refreshControlTaskForTests(task(), hooks(events, true))).resolves.toMatchObject({
+    await expect(refreshControlTaskForTests(task(acknowledged('exact-turn')), hooks(events, true))).resolves.toMatchObject({
       state: 'running', boundTurnId: 'exact-turn', currentTurnId: null, outcome: null
     });
-    await expect(refreshControlTaskForTests(task(), hooks(events, false))).resolves.toMatchObject({
+    await expect(refreshControlTaskForTests(task(acknowledged('exact-turn')), hooks(events, false))).resolves.toMatchObject({
       state: 'succeeded', outcome: 'completed', finalText: 'done'
     });
   });
@@ -159,10 +218,10 @@ describe('CoS control service', () => {
       { kind: 'user_message', seq: 1, time: 100, inputId: 'input-1', inputDelivery: 'confirmed', turnId: 'failed-turn' },
       { kind: 'turn_end', seq: 2, time: 150, turnId: 'failed-turn', outcome: 'failed', detail: 'Connection interrupted' },
       { kind: 'tool_call', seq: 3, time: 200, call: { tool: 'read', outcome: 'ok', args: { truncated: false, text: '{}' } } },
-      { kind: 'tool_call', seq: 4, time: 250, call: { tool: 'session_finish', outcome: 'ok', args: { truncated: false, text: JSON.stringify({ task_id: taskId, status: 'succeeded' }) } } },
+      { kind: 'tool_call', seq: 4, time: 250, turnId: 'retry-turn', call: { tool: 'session_finish', outcome: 'ok', args: { truncated: false, text: JSON.stringify({ task_id: taskId, status: 'succeeded' }) } } },
       { kind: 'assistant_message', seq: 5, time: 300, turnId: 'retry-turn', final: true, state: 'final', message: { text: 'recovered result' } }
     ] as SessionEvent[];
-    await expect(refreshControlTaskForTests(task({ taskId, state: 'failed' }), hooks(events))).resolves.toMatchObject({
+    await expect(refreshControlTaskForTests(task({ taskId, state: 'recovering', ...acknowledged('retry-turn', 4) }), hooks(events))).resolves.toMatchObject({
       state: 'succeeded', outcome: 'completed', finalText: 'recovered result', completionSeq: 4,
       lastToolCall: { seq: 4, tool: 'session_finish' }
     });
@@ -186,7 +245,7 @@ describe('CoS control service', () => {
       { kind: 'tool_call', seq: 2, time: 2, turnId: 'exact-turn', call: { tool: 'session_finish', outcome: 'ok', args: { truncated: false, text: JSON.stringify({ task_id: taskId, status: 'succeeded' }) } } },
       { kind: 'turn_end', seq: 3, time: 3, turnId: 'exact-turn', outcome: 'completed' }
     ] as SessionEvent[];
-    await expect(refreshControlTaskForTests(task({ taskId }), hooks(events))).resolves.toMatchObject({
+    await expect(refreshControlTaskForTests(task({ taskId, ...acknowledged('exact-turn', 2, 2) }), hooks(events))).resolves.toMatchObject({
       state: 'delivery_failed', outcome: 'final_delivery_missing', deliveryState: 'failed', completionSeq: 2
     });
   });
@@ -240,6 +299,7 @@ describe('CoS control service', () => {
     ] as SessionEvent[];
     const fixture = hooks(evidence);
     fixture.listInputs = async () => [{ id: 'input-2', state: 'tool', deliveredSessionId: 'session-1' }] as any;
+    Object.assign(followup, acknowledged('active-turn', 7), { completionInputId: 'input-2' });
     await expect(refreshControlTaskForTests(followup, fixture)).resolves.toMatchObject({
       state: 'succeeded', boundInputSeq: 5, boundTurnId: 'active-turn', currentTurnId: null, finalText: 'new answer'
     });

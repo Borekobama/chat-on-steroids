@@ -19,6 +19,9 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { HeadTailBuffer } from './head-tail-buffer.js';
 import { CommandBatchDisplay } from './command-batch.js';
 import {
@@ -44,8 +47,9 @@ import {
   resolveMaxTokens,
   UNIFIED_EXEC_ENV
 } from './unified-exec-constants.js';
-import { terminateProcessTree } from '../exec.js';
+import { applyCommandSandbox, terminateProcessTree } from '../exec.js';
 import { prefixPowershellScriptWithUtf8, type ShellType } from './shell.js';
+import type { CommandSandboxSettings } from '../../shared/types.js';
 
 // --------------------------------------------------------------------------- errors
 
@@ -652,6 +656,7 @@ export function execCommandStructuredOutput(output: ExecCommandToolOutput): Reco
 // --------------------------------------------------------------------------- manager
 
 export interface ExecCommandRequest {
+  commandSandbox?: CommandSandboxSettings;
   classifyExit?: (exitCode: number | null, rawOutput: string) => boolean;
   batchMarker?: string;
   command: string[];
@@ -777,13 +782,27 @@ export class UnifiedExecProcessManager {
     try {
       // `UnifiedExecRuntime::run` prefixes every PowerShell script before it reaches the
       // process launcher so pipe-mode output is UTF-8 just like PTY output.
-      const command =
+      const preparedCommand =
         request.shellType === 'powershell' ? prefixPowershellScriptWithUtf8(request.command) : request.command;
+      let launchCwd = request.cwd;
+      let command = preparedCommand;
+      if (request.commandSandbox?.enabled) {
+        const trustedHome = await fs.realpath(os.homedir());
+        const canonicalCwd = await fs.realpath(request.cwd);
+        const expectedCwd = path.resolve(request.cwd);
+        const sameCwd = globalThis.process.platform === 'win32'
+          ? canonicalCwd.toLowerCase() === expectedCwd.toLowerCase()
+          : canonicalCwd === expectedCwd;
+        if (!sameCwd) throw new Error('command working directory changed after authorization');
+        const launch = applyCommandSandbox(preparedCommand, canonicalCwd, request.commandSandbox, trustedHome);
+        command = [launch.file, ...launch.args];
+        launchCwd = launch.cwd;
+      }
       process = await UnifiedExecProcess.spawn({
         batchMarker: request.batchMarker,
         command,
         shellType: request.shellType,
-        cwd: request.cwd,
+        cwd: launchCwd,
         env: request.env,
         tty: request.tty
       });

@@ -11,8 +11,9 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
+import type { CommandSandboxSettings } from '../shared/types.js';
 import {
   applyEnvOverrides,
   deleteEnvValue,
@@ -122,6 +123,57 @@ export interface PreparedCommand {
    * Only ever set for `cmd.exe`, and it is not a preference — see prepareShellCommand.
    */
   windowsVerbatimArguments?: boolean;
+}
+
+export interface SandboxedLaunch {
+  file: string;
+  args: string[];
+  cwd: string;
+}
+
+/** Wrap one launch through configured Codex confinement when enabled. */
+export function applyCommandSandbox(
+  command: string[],
+  cwd: string,
+  settings: CommandSandboxSettings | undefined,
+  trustedHome = process.env.HOME || process.cwd()
+): SandboxedLaunch {
+  if (!settings?.enabled) return { file: command[0] ?? '', args: command.slice(1), cwd };
+  if (!path.isAbsolute(settings.codexPath)) throw new ExecError('command sandbox Codex path must be absolute');
+  if (!existsSync(settings.codexPath)) throw new ExecError('command sandbox Codex path is unavailable');
+  try {
+    const stat = statSync(settings.codexPath);
+    if (!stat.isFile() || (stat.mode & 0o111) === 0) {
+      throw new ExecError('command sandbox Codex path is not executable');
+    }
+  } catch (error) {
+    if (error instanceof ExecError) throw error;
+    throw new ExecError('command sandbox Codex path is unavailable');
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(settings.permissionProfile)) {
+    throw new ExecError('command sandbox permission profile is invalid');
+  }
+  if (settings.permissionProfile !== 'projects-only') {
+    throw new ExecError('command sandbox permission profile must be projects-only');
+  }
+  if (process.platform === 'win32') {
+    throw new ExecError('command sandbox requires a contained working-directory launcher on Windows');
+  }
+  if (!path.isAbsolute(cwd) || !path.isAbsolute(trustedHome)) {
+    throw new ExecError('command sandbox paths must be absolute');
+  }
+  return {
+    file: settings.codexPath,
+    args: [
+      'sandbox',
+      '-c', 'shell_environment_policy.inherit=all',
+      '--permission-profile', settings.permissionProfile,
+      '--cd', trustedHome,
+      '/usr/bin/env', '-C', cwd,
+      ...command
+    ],
+    cwd: trustedHome
+  };
 }
 
 let cachedPowerShell: string | null | undefined;
@@ -288,13 +340,22 @@ interface RunOptions {
   cwd: string;
   timeoutMs: number;
   env?: NodeJS.ProcessEnv;
+  commandSandbox?: CommandSandboxSettings;
 }
 
 function run(opts: RunOptions): Promise<ExecResult> {
   return new Promise((resolve) => {
     const started = Date.now();
-    const child = spawn(opts.file, opts.args, {
-      cwd: opts.cwd,
+    let launch: SandboxedLaunch;
+    try {
+      launch = applyCommandSandbox([opts.file, ...opts.args], opts.cwd, opts.commandSandbox);
+    } catch (error) {
+      resolve({ exitCode: null, stdout: '', stderr: `Failed to start: ${error instanceof Error ? error.message : String(error)}`,
+        truncated: false, timedOut: false, durationMs: Date.now() - started });
+      return;
+    }
+    const child = spawn(launch.file, launch.args, {
+      cwd: launch.cwd,
       env: opts.env ?? childEnv(),
       windowsHide: true,
       shell: false,
@@ -453,7 +514,8 @@ export function prepareShellCommand(
 export async function runPowerShell(
   script: string,
   cwd: string,
-  timeoutMs: number
+  timeoutMs: number,
+  commandSandbox?: CommandSandboxSettings
 ): Promise<ExecResult> {
   if (typeof script !== 'string' || script.trim() === '') {
     throw new ExecError('script must be a non-empty string');
@@ -474,7 +536,8 @@ export async function runPowerShell(
     file: shell,
     args: ['-NoProfile', '-NonInteractive', '-NoLogo', '-OutputFormat', 'Text', '-EncodedCommand', encoded],
     cwd,
-    timeoutMs
+    timeoutMs,
+    commandSandbox
   });
   const stderr = cleanPowerShellStderr(result.stderr);
   return {
@@ -546,12 +609,14 @@ export function prepareCommand(
 export async function launchCommand(
   command: string,
   args: readonly string[],
-  cwd: string
+  cwd: string,
+  commandSandbox?: CommandSandboxSettings
 ): Promise<{ pid: number }> {
   const prepared = prepareCommand(command, args, cwd);
+  const launch = applyCommandSandbox([prepared.file, ...prepared.args], cwd, commandSandbox);
   return new Promise((resolve, reject) => {
-    const child = spawn(prepared.file, prepared.args, {
-      cwd,
+    const child = spawn(launch.file, launch.args, {
+      cwd: launch.cwd,
       env: prepared.env,
       windowsHide: false,
       shell: false,
@@ -578,7 +643,8 @@ export async function runCommand(
   args: readonly string[],
   cwd: string,
   timeoutMs: number,
-  env?: CommandEnvironment
+  env?: CommandEnvironment,
+  commandSandbox?: CommandSandboxSettings
 ): Promise<ExecResult> {
   const prepared = prepareCommand(command, args, cwd, env);
   return run({
@@ -586,6 +652,7 @@ export async function runCommand(
     args: prepared.args,
     cwd,
     timeoutMs,
-    env: prepared.env
+    env: prepared.env,
+    commandSandbox
   });
 }

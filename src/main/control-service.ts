@@ -8,12 +8,13 @@ import { cancelDesktopInput, sendDesktopInput } from './session/start-input.js';
 import { getSession, readEvents } from './session/store.js';
 import { stopSessionTurn } from './bridge.js';
 import { isChatBlocked, setChatBlocked } from './session/blocked-chats.js';
-import { readDurable, writeDurableNow } from './durable.js';
+import { readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
 import { addProject, getProject, listProjects, projectWorkspace } from './projects.js';
 import { execProcessIdsOwnedBy } from './codex/ownership.js';
 import { unifiedExecManager } from './codex/manager.js';
 import type { SessionEvent } from '../shared/session.js';
 import { READONLY_MAX_BODY, runReadonlyCodex } from './control-readonly.js';
+import { getConfig } from './config.js';
 
 const STATE = 'control-tasks';
 const API = '1';
@@ -33,6 +34,9 @@ export type Task = {
   messages?: Array<{ messageId: string; payloadHash: string; inputId: string; text: string; dueAt: number }>;
   boundInputSeq?: number; boundTurnId?: string;
   completionStatus?: 'succeeded' | 'failed'; completionSeq?: number; completionRecordedAt?: number;
+  completionInputId?: string; completionTurnId?: string;
+  completionAcknowledged?: boolean;
+  inputReplayAt?: number;
   failureReason?: string; deliveryState?: string;
   lastEvent?: Record<string, unknown>; lastToolCall?: Record<string, unknown>;
 };
@@ -44,12 +48,14 @@ export type ControlRefreshHooks = {
   readEvents: typeof readEvents;
   processIdsOwnedBy: (sessionId: string) => Iterable<number>;
   hasProcessOrReservation: (processId: number) => boolean;
+  sendInput?: typeof sendDesktopInput;
 };
 const refreshHooks: ControlRefreshHooks = {
   listInputs,
   getSession,
   readEvents,
   processIdsOwnedBy: execProcessIdsOwnedBy,
+  sendInput: sendDesktopInput,
   hasProcessOrReservation: processId => { const state = unifiedExecManager.backgroundState(new Set([processId])); return state.running.includes(processId) || state.exitedUnread.some(row => row.processId === processId); }
 };
 
@@ -57,6 +63,7 @@ let socketPath = '';
 let discoveryPath = '';
 let server: http.Server | null = null;
 let tasks: Task[] = [];
+let committedTasks: Task[] = [];
 let taskLock = Promise.resolve();
 let cancellationSweep: NodeJS.Timeout | null = null;
 const TERMINAL_STATES = new Set<TaskState>(['delivery_failed', 'succeeded', 'failed', 'cancelled']);
@@ -80,8 +87,78 @@ function isWithin(parent: string, child: string): boolean {
   const base = path.resolve(parent) + path.sep;
   return child === path.resolve(parent) || child.startsWith(base);
 }
-async function loadTasks(): Promise<void> { tasks = (await readDurable<Task[]>(STATE)) ?? []; }
-async function saveTasks(): Promise<void> { await writeDurableNow(STATE, tasks); }
+export function migrateTask(value: unknown): Task | null {
+  if (!value || typeof value !== 'object') return null;
+  const item = value as Partial<Task>;
+  if (item.schemaVersion !== undefined && item.schemaVersion !== 1) return null;
+  if (item.messages !== undefined && (!Array.isArray(item.messages) || item.messages.some(message =>
+    !message || !validId(message.messageId) || !validId(message.inputId) ||
+    typeof message.payloadHash !== 'string' || typeof message.text !== 'string' || !Number.isFinite(message.dueAt)))) return null;
+  for (const key of ['createdAt', 'updatedAt', 'eventCursor', 'boundInputSeq', 'completionSeq', 'completionRecordedAt', 'inputReplayAt', 'cancellationRequestedAt'] as const) {
+    if (item[key] !== undefined && (typeof item[key] !== 'number' || !Number.isFinite(item[key]) || item[key]! < 0)) return null;
+  }
+  if (!validId(item.taskId) || !validId(item.requestId) || typeof item.brief !== 'string' ||
+      !Array.isArray(item.inputIds) && !validId(item.inputId)) return null;
+  const inputId = validId(item.inputId) ? item.inputId : item.inputIds?.[0];
+  if (!validId(inputId)) return null;
+  const now = Date.now();
+  return {
+    schemaVersion: 1, taskId: item.taskId, requestId: item.requestId,
+    payloadHash: typeof item.payloadHash === 'string' ? item.payloadHash : hash(item),
+    projectId: typeof item.projectId === 'string' ? item.projectId : null,
+    canonicalWorkspace: typeof item.canonicalWorkspace === 'string' ? item.canonicalWorkspace : null,
+    brief: item.brief, requestedModel: typeof item.requestedModel === 'string' ? item.requestedModel : null,
+    requestedEffort: typeof item.requestedEffort === 'string' ? item.requestedEffort : null,
+    inputId, inputIds: Array.isArray(item.inputIds) && item.inputIds.length ? item.inputIds.filter(validId) : [inputId],
+    sessionId: typeof item.sessionId === 'string' ? item.sessionId : null,
+    conversationIds: Array.isArray(item.conversationIds) ? item.conversationIds.filter((id): id is string => typeof id === 'string') : [],
+    currentTurnId: typeof item.currentTurnId === 'string' ? item.currentTurnId : null,
+    eventCursor: typeof item.eventCursor === 'number' && Number.isFinite(item.eventCursor) ? item.eventCursor : 0,
+    state: typeof item.state === 'string' && ['queued', 'delivering', 'running', 'awaiting_input', 'recovering', 'cancelling', 'delivery_failed', 'succeeded', 'failed', 'cancelled'].includes(item.state)
+      ? item.state as TaskState : 'queued',
+    outcome: typeof item.outcome === 'string' ? item.outcome : null,
+    finalText: typeof item.finalText === 'string' ? item.finalText : null,
+    createdAt: typeof item.createdAt === 'number' ? item.createdAt : now,
+    updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : now,
+    cancellationRequestedAt: item.cancellationRequestedAt,
+    cancellationBlocks: Array.isArray(item.cancellationBlocks) ? item.cancellationBlocks.filter((id): id is string => typeof id === 'string') : undefined,
+    messages: Array.isArray(item.messages) ? item.messages : undefined,
+    boundInputSeq: item.boundInputSeq, boundTurnId: item.boundTurnId,
+    completionStatus: item.completionStatus, completionSeq: item.completionSeq,
+    completionRecordedAt: item.completionRecordedAt, completionInputId: item.completionInputId,
+    completionTurnId: item.completionTurnId, inputReplayAt: item.inputReplayAt,
+    completionAcknowledged: item.completionAcknowledged === true,
+    failureReason: item.failureReason, deliveryState: item.deliveryState,
+    lastEvent: item.lastEvent, lastToolCall: item.lastToolCall
+  };
+}
+async function loadTasks(): Promise<void> {
+  const saved = await readDurable<unknown>(STATE);
+  const values = Array.isArray(saved) ? saved : [];
+  const migrated = values.map(migrateTask);
+  const rejected = values.filter((_value, index) => migrated[index] === null);
+  tasks = migrated.filter((task): task is Task => task !== null);
+  committedTasks = structuredClone(tasks);
+  if (rejected.length) await writeDurableNow(`${STATE}-quarantine`, { schemaVersion: 1, records: rejected.slice(0, 100) });
+  if (tasks.length !== values.length) await saveTasks();
+}
+async function saveTasks(): Promise<void> {
+  // Keep request receipts and cancellation ownership: count eviction permits duplicate execution.
+  const next = structuredClone(tasks);
+  try {
+    await writeDurableNow(STATE, next);
+    committedTasks = next;
+  } catch (cause) {
+    const current = new Map(tasks.map(task => [task.taskId, task]));
+    tasks = committedTasks.map(saved => {
+      const task = current.get(saved.taskId) ?? {} as Task;
+      for (const key of Object.keys(task)) delete (task as unknown as Record<string, unknown>)[key];
+      return Object.assign(task, structuredClone(saved));
+    });
+    writeDurableSoon(STATE, structuredClone(committedTasks));
+    throw cause;
+  }
+}
 function scheduleCancellationSweep(): void {
   if (cancellationSweep || !tasks.some(task => task.cancellationBlocks?.length)) return;
   cancellationSweep = setTimeout(() => {
@@ -89,7 +166,7 @@ function scheduleCancellationSweep(): void {
     void serial(async () => {
       for (const task of tasks.filter(item => item.cancellationBlocks?.length)) await refresh(task);
       await saveTasks();
-    }).finally(scheduleCancellationSweep);
+    }).catch(() => undefined).finally(scheduleCancellationSweep);
   }, 1000);
   cancellationSweep.unref?.();
 }
@@ -99,7 +176,7 @@ export function workspaceLeaseView(task: Task) {
     taskId: task.taskId, state: task.state, workspace: task.canonicalWorkspace };
 }
 function supervisorText(task: Task): string {
-  return `${task.brief}\n\nCoS WEB SUPERVISOR TASK\nTask ID: ${task.taskId}\nWorkspace: ${task.canonicalWorkspace}\nKeep this ChatGPT conversation as Supervisor Shunt parent. Use one supervisor-shunt run-role invocation at a time with --parent-host chatgpt_cos. Inspect actual diffs and verify independently. One precise correction is allowed before escalation. Do not use CoS worker chats, Goal, or Loop. Do not launch nested Shunt agents. End with changed files, verification, and unresolved blockers. When acceptance is complete, call session_finish with task_id=${task.taskId} and status=succeeded, then end the same turn with the final response. This task form records immediately and does not hold the turn. For terminal failure, use status=failed. If user input is needed, omit session_finish and ask one clear question.`;
+  return `${task.brief}\n\nCoS WEB SUPERVISOR TASK\nTask ID: ${task.taskId}\nWorkspace: ${task.canonicalWorkspace}\nKeep this ChatGPT conversation as Supervisor Shunt parent. Use one supervisor-shunt run-role invocation at a time with --parent-host chatgpt_cos. Inspect actual diffs and verify independently. One precise correction is allowed before escalation. Do not use CoS worker chats, Goal, or Loop. Do not launch nested Shunt agents. End with changed files, verification, and unresolved blockers. When acceptance is complete, call supervisor_task_finish with task_id=${task.taskId} and status=succeeded, then end the same turn with the final response. This task form records immediately and does not hold the turn. For terminal failure, use status=failed. If user input is needed, omit supervisor_task_finish and ask one clear question.`;
 }
 
 export function deliveredTurnId(events: Awaited<ReturnType<typeof readEvents>>, inputId: string): { seq: number; time: number; turnId: string } | null {
@@ -121,7 +198,8 @@ export function cancellationReachedTerminal(cancellationRequestedAt: number | un
 export function taskCompletionEvidence(events: SessionEvent[], taskId: string, inputSeq: number, turnId: string,
   terminalSeq = Number.POSITIVE_INFINITY, inputDeliveredAt = Number.NEGATIVE_INFINITY): { seq: number; status: 'succeeded' | 'failed' } | null {
   for (const event of events) {
-    if (event.kind !== 'tool_call' || event.seq <= inputSeq || event.seq >= terminalSeq || event.turnId !== turnId || event.call.tool !== 'session_finish' ||
+    if (event.kind !== 'tool_call' || event.seq <= inputSeq || event.seq >= terminalSeq || event.turnId !== turnId ||
+        event.call.tool !== 'supervisor_task_finish' ||
         event.call.outcome !== 'ok' || event.call.args.truncated || event.time <= inputDeliveredAt) continue;
     try {
       const args = JSON.parse(event.call.args.text) as { task_id?: unknown; status?: unknown };
@@ -132,18 +210,56 @@ export function taskCompletionEvidence(events: SessionEvent[], taskId: string, i
 }
 
 export function recoveredTaskCompletionEvidence(events: SessionEvent[], taskId: string, inputSeq: number,
-  inputDeliveredAt = Number.NEGATIVE_INFINITY): { seq: number; time: number; status: 'succeeded' | 'failed' } | null {
+  inputDeliveredAt = Number.NEGATIVE_INFINITY, turnId?: string): { seq: number; time: number; status: 'succeeded' | 'failed'; turnId?: string } | null {
   for (const event of events) {
-    if (event.kind !== 'tool_call' || event.seq <= inputSeq || event.call.tool !== 'session_finish' ||
-        event.call.outcome !== 'ok' || event.call.args.truncated || event.time <= inputDeliveredAt) continue;
+    if (event.kind !== 'tool_call' || event.seq <= inputSeq ||
+        event.call.tool !== 'supervisor_task_finish' || !event.turnId ||
+        event.call.outcome !== 'ok' || event.call.args.truncated || event.time <= inputDeliveredAt ||
+        (turnId !== undefined && event.turnId !== turnId)) continue;
     try {
       const args = JSON.parse(event.call.args.text) as { task_id?: unknown; status?: unknown };
       if (args.task_id === taskId && (args.status === 'succeeded' || args.status === 'failed')) {
-        return { seq: event.seq, time: event.time, status: args.status };
+        return { seq: event.seq, time: event.time, status: args.status, turnId: event.turnId };
       }
     } catch { /* Malformed recorder evidence cannot complete a task. */ }
   }
   return null;
+}
+
+/** A successful tool response is a durable acknowledgement, never merely echoed arguments. */
+export async function finishControlTask(taskId: string, status: 'succeeded' | 'failed',
+  sessionId: string, conversationId: string, startedAt: number): Promise<void> {
+  await serial(async () => {
+    const task = tasks.find(item => item.taskId === taskId);
+    if (!task || (task.sessionId !== null && task.sessionId !== sessionId) || task.cancellationRequestedAt || terminal(task.state)) {
+      throw new Error('control_task_not_owned_or_active');
+    }
+    const session = await getSession(sessionId);
+    if (!session || session.conversationId !== conversationId || !session.activeTurnId) {
+      throw new Error('control_task_turn_unproven');
+    }
+    const inputId = task.inputIds.at(-1) ?? task.inputId;
+    const events = await readEvents(sessionId);
+    const delivered = deliveredTurnId(events, inputId);
+    if (!delivered || !Number.isFinite(delivered.time) || startedAt <= delivered.time) {
+      throw new Error('control_task_input_not_delivered');
+    }
+    if (session.activeTurnId !== delivered.turnId) throw new Error('control_task_turn_unproven');
+    if (events.some(event => event.kind === 'user_message' && event.seq > delivered.seq && event.inputId !== inputId)) {
+      throw new Error('control_task_input_superseded');
+    }
+    task.boundInputSeq = delivered.seq;
+    task.sessionId = sessionId;
+    task.boundTurnId = delivered.turnId;
+    task.completionInputId = inputId;
+    task.completionTurnId = session.activeTurnId;
+    task.completionStatus = status;
+    task.completionAcknowledged = true;
+    task.completionRecordedAt = Date.now();
+    task.completionSeq = events.reduce((last, event) => Math.max(last, event.seq), delivered.seq);
+    task.updatedAt = Date.now();
+    await saveTasks();
+  });
 }
 
 function eventView(event: SessionEvent): Record<string, unknown> {
@@ -164,7 +280,16 @@ function taskId(pathname: string): string | null { const match = pathname.match(
 async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): Promise<Task> {
   const alreadyCompleted = task.completionStatus !== undefined;
   const activeInputId = task.inputIds.at(-1) ?? task.inputId;
-  const row = (await hooks.listInputs()).find(input => input.id === activeInputId);
+  let row = (await hooks.listInputs()).find(input => input.id === activeInputId);
+  if (!row && !task.cancellationRequestedAt && hooks.sendInput && (!task.inputReplayAt || Date.now() - task.inputReplayAt >= 1000) && !terminal(task.state)) {
+    task.inputReplayAt = Date.now();
+    const message = task.messages?.find(item => item.inputId === activeInputId);
+    const input = inputArgs.parse({ id: activeInputId, projectId: task.projectId, sessionId: task.sessionId,
+      text: message?.text ?? supervisorText(task), mode: 'auto', dueAt: message?.dueAt ?? task.createdAt,
+      model: message ? null : task.requestedModel, reasoningEffort: message ? null : task.requestedEffort, automation: 'off' });
+    await hooks.sendInput(input).catch(() => undefined);
+    row = (await hooks.listInputs()).find(inputRow => inputRow.id === activeInputId);
+  }
   if (row && !alreadyCompleted) {
     task.sessionId = row.deliveredSessionId ?? task.sessionId ?? null;
     if (row.state === 'queued') task.state = 'queued';
@@ -198,15 +323,16 @@ async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): P
       exactTerminal = end?.kind === 'turn_end';
       if (turnId) task.currentTurnId = !exactTerminal ? turnId : null;
       else if (task.currentTurnId && events.some(event => event.kind === 'turn_end' && event.turnId === task.currentTurnId)) task.currentTurnId = null;
-      const deliveredAt = binding?.time ?? events.find(event => event.kind === 'user_message' && event.seq === inputSeq)?.time ?? Number.NEGATIVE_INFINITY;
-      const completion = recoveredTaskCompletionEvidence(events, task.taskId, inputSeq, deliveredAt);
-      if (completion) {
-        task.completionStatus = completion.status; task.completionSeq = completion.seq;
-        task.completionRecordedAt = completion.time;
+      // Only the handler's persisted acknowledgement owns completion. Recorder arguments
+      // cannot recreate authority lost before admission or belonging to a previous input.
+      if (task.completionStatus && (!task.completionAcknowledged || task.completionInputId !== activeInputId || !task.completionTurnId)) {
+        task.completionStatus = undefined;
       }
+      const completionTurnId = task.completionTurnId ?? turnId;
       const final = events.findLast((event): event is Extract<typeof event, { kind: 'assistant_message' }> =>
-        event.kind === 'assistant_message' && event.seq > inputSeq && event.final && event.state === 'final');
-      if (final) task.finalText = final.message.text;
+        event.kind === 'assistant_message' && event.seq > inputSeq && event.final && event.state === 'final' &&
+        event.turnId === completionTurnId && (!task.completionSeq || event.seq > task.completionSeq));
+      if (final && task.completionInputId === activeInputId) task.finalText = final.message.text;
       if (task.completionStatus === 'failed') {
         task.state = 'failed'; task.outcome = 'supervisor_failed'; task.failureReason = 'Supervisor reported task failure.';
       }
@@ -230,16 +356,17 @@ async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): P
       }
       else if (task.cancellationRequestedAt) task.state = 'cancelling';
       else if (task.boundTurnId) task.state = 'running';
-      task.eventCursor = Math.max(task.eventCursor, ...events.map(event => event.seq), 0);
+      for (const event of events) task.eventCursor = Math.max(task.eventCursor, event.seq);
     }
   }
   const hasOwnedProcess = !!task.sessionId && [...hooks.processIdsOwnedBy(task.sessionId)]
     .some(processId => hooks.hasProcessOrReservation(processId));
   if (task.cancellationBlocks?.length) {
-    task.cancellationBlocks = task.cancellationBlocks.filter(isChatBlocked);
     if (exactTerminal && !hasOwnedProcess) {
       for (const conversationId of task.cancellationBlocks) setChatBlocked(conversationId, false);
       task.cancellationBlocks = [];
+    } else {
+      for (const conversationId of task.cancellationBlocks) setChatBlocked(conversationId, true);
     }
   }
   const undeliveredCancelled = !task.boundTurnId && (!row || row.state === 'cancelled' || row.state === 'failed');
@@ -251,7 +378,6 @@ async function refresh(task: Task, hooks: ControlRefreshHooks = refreshHooks): P
   } else if (task.cancellationRequestedAt) {
     task.state = 'cancelling'; task.outcome = null;
   }
-  task.updatedAt = Date.now();
   return task;
 }
 
@@ -265,11 +391,29 @@ export async function refreshControlTaskForTests(task: Task, hooks: ControlRefre
 export function beginControlTaskFollowup(task: Task): void {
   task.boundInputSeq = undefined;
   task.boundTurnId = undefined;
+  task.completionStatus = undefined;
+  task.completionSeq = undefined;
+  task.completionRecordedAt = undefined;
+  task.completionInputId = undefined;
+  task.completionTurnId = undefined;
+  task.completionAcknowledged = undefined;
+  task.deliveryState = undefined;
 }
 async function route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const pathname = url.pathname;
-  if (req.method === 'GET' && pathname === '/v1/health') return json(res, 200, { apiVersion: API, ready: true, capabilities: ['submit', 'status', 'result', 'input', 'cancel', 'codex_readonly'] });
+  if (req.method === 'GET' && pathname === '/v1/health') {
+    const capabilities = ['submit', 'status', 'result', 'input', 'cancel', 'supervisor_task_finish'];
+    const sandbox = getConfig().commandSandbox;
+    const executableReady = sandbox.enabled && path.isAbsolute(sandbox.codexPath) && await fs.stat(sandbox.codexPath)
+      .then(stat => stat.isFile() && (stat.mode & 0o111) !== 0, () => false);
+    if (executableReady) capabilities.push('worker_writable', 'command_sandbox');
+    if (process.platform === 'darwin' && executableReady) capabilities.push('codex_readonly');
+    return json(res, 200, { apiVersion: API, ready: true, capabilities, capabilityReasons: {
+      worker_writable: executableReady ? 'available' : sandbox.enabled ? 'codex_executable_unavailable' : 'disabled',
+      codex_readonly: process.platform !== 'darwin' ? 'platform_unavailable' : executableReady ? 'available' : 'sandbox_unavailable'
+    } });
+  }
   if (req.method === 'POST' && pathname === '/v1/codex/readonly') {
     const result = await runReadonlyCodex(await body(req, READONLY_MAX_BODY));
     return json(res, 200, result);
@@ -312,7 +456,8 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
     const admitted = await serial(async () => {
       const prior = tasks.find(task => task.requestId === payload.requestId);
       if (prior) return { prior, task: null };
-      const leased = tasks.find(task => task.canonicalWorkspace === canonicalWorkspace && !terminal(task.state));
+      const leased = tasks.find(task => task.canonicalWorkspace && !terminal(task.state) &&
+        (isWithin(task.canonicalWorkspace, canonicalWorkspace) || isWithin(canonicalWorkspace, task.canonicalWorkspace)));
       if (leased) return { prior: leased, task: null };
       tasks.push(candidate); await saveTasks(); return { prior: null, task: candidate };
     });
@@ -324,7 +469,8 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
     const task = admitted.task!;
     const supervisorBrief = supervisorText(task);
     void sendDesktopInput(inputArgs.parse({ id: task.inputId, projectId: task.projectId, sessionId: task.sessionId, text: supervisorBrief, mode: 'auto', dueAt: task.createdAt, model: task.requestedModel, reasoningEffort: task.requestedEffort, automation: 'off' }))
-      .then(() => undefined, async cause => { await serial(async () => { if (!task.cancellationRequestedAt) { task.state = 'failed'; task.outcome = cause instanceof Error ? cause.message : String(cause); } task.updatedAt = Date.now(); await saveTasks(); }); });
+      .catch(async cause => { await serial(async () => { if (!task.cancellationRequestedAt) { task.state = 'recovering'; task.outcome = cause instanceof Error ? cause.message : String(cause); } task.updatedAt = Date.now(); await saveTasks(); }); })
+      .catch(() => undefined); // Durable rollback preserves the receipt for a later refresh.
     return json(res, 202, { taskId: task.taskId, state: task.state });
   }
   const id = taskId(pathname); if (!id) return error(res, 404, 'not_found');
@@ -334,7 +480,12 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
   const waitMs = Math.min(45_000, Math.max(0, Number(url.searchParams.get('timeout') ?? '0') * 1000 || 0));
   const deadline = Date.now() + waitMs;
   do {
-    await serial(async () => { await refresh(task); await saveTasks(); });
+    await serial(async () => {
+      const before = JSON.stringify({ ...task, updatedAt: 0 });
+      await refresh(task);
+      const after = JSON.stringify({ ...task, updatedAt: 0 });
+      if (before !== after) { task.updatedAt = Date.now(); await saveTasks(); }
+    });
     if (waitMs === 0 || task.eventCursor > originalCursor || task.state === 'awaiting_input' || terminal(task.state) || Date.now() >= deadline) break;
     await new Promise(resolve => setTimeout(resolve, Math.min(250, deadline - Date.now())));
   } while (true);
@@ -378,10 +529,16 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
       await Promise.all(task.inputIds.map(inputId => cancelDesktopInput(inputId).catch(() => false)));
       if (task.sessionId && task.currentTurnId) await stopSessionTurn(task.sessionId, task.currentTurnId).catch(() => undefined);
       const cancellationBlocks = task.conversationIds.filter(conversationId => !isChatBlocked(conversationId));
-      for (const conversationId of cancellationBlocks) setChatBlocked(conversationId, true);
       task.cancellationBlocks = [...new Set([...(task.cancellationBlocks ?? []), ...cancellationBlocks])];
-      if (task.sessionId) await Promise.all([...execProcessIdsOwnedBy(task.sessionId)].map(processId => unifiedExecManager.terminateProcess(processId)));
-      await refresh(task); await saveTasks();
+      // Persist ownership before fallible browser/process side effects.
+      await saveTasks();
+      for (const conversationId of cancellationBlocks) {
+        try { setChatBlocked(conversationId, true); } catch { /* refresh reconciles missing blocks */ }
+      }
+      if (task.sessionId) {
+        await Promise.allSettled([...execProcessIdsOwnedBy(task.sessionId)].map(processId => unifiedExecManager.terminateProcess(processId)));
+      }
+      await refresh(task); task.updatedAt = Date.now(); await saveTasks();
       scheduleCancellationSweep();
     });
     return json(res, 202, { taskId: task.taskId, state: task.state });
@@ -400,7 +557,11 @@ export async function startControlService(userDataDir: string): Promise<string> 
   const dirStat = await fs.lstat(dir); if (!dirStat.isDirectory() || dirStat.isSymbolicLink() || dirStat.uid !== process.getuid?.()) throw new Error('control directory ownership/type refused');
   await fs.chmod(dir, 0o700);
   try { const stat = await fs.lstat(socketPath); if (stat.isSymbolicLink() || !stat.isSocket() || stat.uid !== process.getuid?.()) throw new Error('control socket ownership/type refused'); await fs.unlink(socketPath); } catch (cause) { if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause; }
-  server = http.createServer((req, res) => { route(req, res).catch(cause => error(res, cause instanceof Error && cause.message === 'body_too_large' ? 413 : 400, cause instanceof Error ? cause.message : 'request_failed')); });
+  server = http.createServer((req, res) => { route(req, res).catch(cause => {
+    const message = cause instanceof Error ? cause.message : 'request_failed';
+    const status = message === 'body_too_large' ? 413 : message === 'codex_readonly_busy' ? 429 : 400;
+    error(res, status, message);
+  }); });
   await new Promise<void>((resolve, reject) => { server!.once('error', reject); server!.listen(socketPath, () => resolve()); });
   const socketStat = await fs.lstat(socketPath); if (!socketStat.isSocket() || socketStat.uid !== process.getuid?.()) { await stopControlService(); throw new Error('control socket ownership/type refused'); }
   await fs.chmod(socketPath, 0o600);
@@ -408,7 +569,7 @@ export async function startControlService(userDataDir: string): Promise<string> 
   try { if ((await fs.lstat(discoveryPath)).isSymbolicLink()) throw new Error('control discovery symlink refused'); } catch (cause) { if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause; }
   const discoveryTemp = `${discoveryPath}.${process.pid}.tmp`; await fs.writeFile(discoveryTemp, JSON.stringify({ apiVersion: API, socketPath }), { mode: 0o600, flag: 'wx' }); await fs.rename(discoveryTemp, discoveryPath); await fs.chmod(discoveryPath, 0o600);
   const inputs = await listInputs();
-  for (const task of tasks.filter(task => task.state === 'queued' && !inputs.some(input => input.id === task.inputId))) {
+  for (const task of tasks.filter(task => task.state === 'queued' && !task.cancellationRequestedAt && !inputs.some(input => input.id === task.inputId))) {
     const input = inputArgs.parse({ id: task.inputId, projectId: task.projectId, sessionId: task.sessionId, text: supervisorText(task), mode: 'auto', dueAt: task.createdAt, model: task.requestedModel, reasoningEffort: task.requestedEffort, automation: 'off' });
     void sendDesktopInput(input).catch(() => undefined);
   }

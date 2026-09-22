@@ -13,6 +13,7 @@ export const READONLY_MAX_SCHEMA = 64 * 1024;
 export const READONLY_TIMEOUT_MS = 15 * 60_000;
 export const READONLY_MAX_EVENTS = 64;
 export const READONLY_MAX_EVENT_BYTES = 32 * 1024;
+export const READONLY_MAX_IN_FLIGHT = 2;
 export const READONLY_ROLES = ['scout', 'reviewer'] as const;
 export type ReadonlyRole = (typeof READONLY_ROLES)[number];
 
@@ -23,6 +24,7 @@ export type ReadonlyRequest = {
   reasoningEffort: string;
   prompt: string;
   outputSchema?: string | null;
+  timeoutMs?: number;
 };
 
 export type ReadonlyResult = {
@@ -39,7 +41,7 @@ type ValidatedReadonlyRequest = ReadonlyRequest & {
 
 const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/;
 const MAX_REASONING = 32;
-const REQUEST_KEYS = new Set(['role', 'cwd', 'model', 'reasoningEffort', 'prompt', 'outputSchema']);
+const REQUEST_KEYS = new Set(['role', 'cwd', 'model', 'reasoningEffort', 'prompt', 'outputSchema', 'timeoutMs']);
 const USAGE_KEYS = ['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens'] as const;
 
 function within(parent: string, child: string): boolean {
@@ -208,6 +210,8 @@ function bad(message: string): Error {
   return new Error(message);
 }
 
+let readonlyInFlight = 0;
+
 async function canonicalProjectsRoot(): Promise<string> {
   const root = path.join(os.homedir(), 'Downloads', 'Projects');
   return fs.realpath(root).catch(() => { throw bad('projects_ceiling_unavailable'); });
@@ -231,6 +235,7 @@ export async function validateReadonlyRequest(input: unknown): Promise<Validated
   const cwd = value.cwd;
   const reasoningEffort = value.reasoningEffort;
   const outputSchema = value.outputSchema ?? null;
+  const timeoutMs = value.timeoutMs ?? READONLY_TIMEOUT_MS;
   if (role !== 'scout' && role !== 'reviewer') throw bad('invalid_role');
   if (typeof cwd !== 'string' || !path.isAbsolute(cwd) || cwd.length > 1024) throw bad('invalid_workspace');
   if (typeof value.model !== 'string' || !MODEL.test(value.model)) throw bad('invalid_model');
@@ -239,6 +244,9 @@ export async function validateReadonlyRequest(input: unknown): Promise<Validated
   }
   if (typeof value.prompt !== 'string' || !value.prompt.trim() || value.prompt.length > READONLY_MAX_PROMPT) throw bad('invalid_prompt');
   if (outputSchema !== null && typeof outputSchema !== 'string') throw bad('output_schema_invalid');
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs < 100 || timeoutMs > READONLY_TIMEOUT_MS) {
+    throw bad('invalid_timeout');
+  }
   const projects = await canonicalProjectsRoot();
   const workspace = await fs.realpath(cwd).catch(() => '');
   if (!workspace) throw bad('workspace_unavailable');
@@ -246,7 +254,7 @@ export async function validateReadonlyRequest(input: unknown): Promise<Validated
   if (!workspaceStat.isDirectory() || !within(projects, workspace)) throw bad('workspace_outside_projects');
   const schema = outputSchema === null ? null : await regularCanonicalFile(outputSchema, projects);
   return { role, cwd, model: value.model, reasoningEffort, prompt: value.prompt,
-    workspace, outputSchema: schema } as ValidatedReadonlyRequest;
+    workspace, outputSchema: schema, timeoutMs } as ValidatedReadonlyRequest;
 }
 
 async function trustedExecutable(): Promise<string> {
@@ -308,57 +316,63 @@ function collect(child: ChildProcess, max: number): Promise<{ stdout: string }> 
 
 export async function runReadonlyCodex(input: unknown): Promise<ReadonlyResult> {
   if (process.platform !== 'darwin') throw bad('readonly_codex_unavailable');
-  const request = await validateReadonlyRequest(input);
-  const executable = await trustedExecutable();
-  const authPath = await trustedAuthPath();
-  const runtimeDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'cos-readonly-')));
-  const codeHome = path.join(runtimeDir, '.codex');
-  let child: ChildProcess | null = null;
+  if (readonlyInFlight >= READONLY_MAX_IN_FLIGHT) throw bad('codex_readonly_busy');
+  readonlyInFlight += 1;
   try {
-    await fs.chmod(runtimeDir, 0o700);
-    await fs.mkdir(codeHome, { mode: 0o700 });
-    await fs.chmod(codeHome, 0o700);
-    await fs.symlink(authPath, path.join(codeHome, 'auth.json'), 'file');
-    const command = readonlyCodexCommand(executable, request.workspace, runtimeDir, request.model, request.reasoningEffort, request.outputSchema, authPath);
-    const environment = readonlyCodexEnvironment(runtimeDir, codeHome);
-    child = spawn(command[0]!, command.slice(1), {
-      cwd: request.workspace,
-      env: environment,
-      shell: false,
-      detached: true,
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    child.stdin?.end(request.prompt, 'utf8');
-    let timedOut = false;
-    let timeoutCleanup: Promise<void> | null = null;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      timeoutCleanup = child?.pid && child.exitCode === null ? terminateProcessTree(child.pid) : Promise.resolve();
-    }, READONLY_TIMEOUT_MS);
-    timeout.unref?.();
-    let captured: { stdout: string };
-    const childPid = child.pid;
+    const request = await validateReadonlyRequest(input);
+    const executable = await trustedExecutable();
+    const authPath = await trustedAuthPath();
+    const runtimeDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'cos-readonly-')));
+    const codeHome = path.join(runtimeDir, '.codex');
+    let child: ChildProcess | null = null;
     try {
-      captured = await collect(child, READONLY_MAX_OUTPUT);
-      if (timeoutCleanup) await timeoutCleanup;
+      await fs.chmod(runtimeDir, 0o700);
+      await fs.mkdir(codeHome, { mode: 0o700 });
+      await fs.chmod(codeHome, 0o700);
+      await fs.symlink(authPath, path.join(codeHome, 'auth.json'), 'file');
+      const command = readonlyCodexCommand(executable, request.workspace, runtimeDir, request.model, request.reasoningEffort, request.outputSchema, authPath);
+      const environment = readonlyCodexEnvironment(runtimeDir, codeHome);
+      child = spawn(command[0]!, command.slice(1), {
+        cwd: request.workspace,
+        env: environment,
+        shell: false,
+        detached: true,
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      child.stdin?.end(request.prompt, 'utf8');
+      let timedOut = false;
+      let timeoutCleanup: Promise<void> | null = null;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        timeoutCleanup = child?.pid ? terminateProcessTree(child.pid) : Promise.resolve();
+      }, request.timeoutMs);
+      timeout.unref?.();
+      let captured: { stdout: string };
+      const childPid = child.pid;
+      try {
+        captured = await collect(child, READONLY_MAX_OUTPUT);
+        if (timeoutCleanup) await timeoutCleanup;
+      } finally {
+        clearTimeout(timeout);
+        // detached:true makes pid the process-group id. Kill the group even when the leader
+        // already exited so a surviving descendant cannot race output validation or outlive cleanup.
+        if (childPid) await terminateProcessTree(childPid);
+      }
+      if (timedOut) throw bad('codex_readonly_timeout');
+      if (child.exitCode !== 0) throw bad('codex_readonly_failed');
+      const outputPath = path.join(runtimeDir, 'output.json');
+      const outputStat = await fs.lstat(outputPath).catch(() => null);
+      if (!outputStat?.isFile() || outputStat.isSymbolicLink() || outputStat.size <= 0 || outputStat.size > READONLY_MAX_OUTPUT) {
+        throw bad('codex_readonly_missing_output');
+      }
+      const output = await fs.readFile(outputPath, 'utf8').catch(() => '');
+      if (!output || Buffer.byteLength(output) > READONLY_MAX_OUTPUT) throw bad('codex_readonly_missing_output');
+      const parsed = boundedEvents(captured.stdout);
+      return { role: request.role, output, usage: parsed.usage, events: parsed.events };
     } finally {
-      clearTimeout(timeout);
-      // detached:true makes pid the process-group id. Kill the group even when the leader
-      // already exited so a surviving descendant cannot race output validation or outlive cleanup.
-      if (childPid) await terminateProcessTree(childPid);
+      await fs.rm(runtimeDir, { recursive: true, force: true }).catch(() => undefined);
     }
-    if (timedOut) throw bad('codex_readonly_timeout');
-    if (child.exitCode !== 0) throw bad('codex_readonly_failed');
-    const outputPath = path.join(runtimeDir, 'output.json');
-    const outputStat = await fs.lstat(outputPath).catch(() => null);
-    if (!outputStat?.isFile() || outputStat.isSymbolicLink() || outputStat.size <= 0 || outputStat.size > READONLY_MAX_OUTPUT) {
-      throw bad('codex_readonly_missing_output');
-    }
-    const output = await fs.readFile(outputPath, 'utf8').catch(() => '');
-    if (!output || Buffer.byteLength(output) > READONLY_MAX_OUTPUT) throw bad('codex_readonly_missing_output');
-    const parsed = boundedEvents(captured.stdout);
-    return { role: request.role, output, usage: parsed.usage, events: parsed.events };
   } finally {
-    await fs.rm(runtimeDir, { recursive: true, force: true }).catch(() => undefined);
+    readonlyInFlight -= 1;
   }
 }

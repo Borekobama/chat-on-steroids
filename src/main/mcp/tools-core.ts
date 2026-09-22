@@ -3,6 +3,7 @@ import { registerPlanTool } from './plan-tool.js';
 import { goalWorkerChat } from '../bridge.js';
 import { announceSessionFinish, sessionFinishDeadline } from '../session/finish.js';
 import { getConfig } from '../config.js';
+import { finishControlTask } from '../control-service.js';
 /**
  * The Core connector: reading, changing and running code on this PC.
  *
@@ -831,7 +832,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               cwd: dir.real,
               displayCwd: dir.virtual,
               env: execChildEnvironment(),
-              tty: input.tty ?? DEFAULT_TTY
+              tty: input.tty ?? DEFAULT_TTY,
+              commandSandbox: getConfig().commandSandbox
             });
             // Which exact session or temporary request principal may later write to this
             // process id. Request custody upgrades lazily when exact correlation arrives.
@@ -994,9 +996,24 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
   if (reg.sessionToolsExposed) {
     registerPlanTool(reg);
   }
+  if (!reg.ctx.readOnly && Object.values(reg.caps).some(Boolean)) reg.register('supervisor_task_finish', toolDeclaration('supervisor_task_finish', () => ({
+    description: 'Record completion for an active Supervisor Shunt control task after exact acceptance. Use only with task_id and status.',
+    inputSchema: z.object({ task_id: z.string().uuid(), status: z.enum(['succeeded', 'failed']) }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+  })), async ({ task_id, status }) => {
+    const caller = currentCaller();
+    const call = currentCall();
+    if (!caller.sessionId || !caller.conversationId || !call) return failIdentity('Exact session identity is required');
+    if (getConfig().readOnly) return fail('Completion is unavailable in Read-only mode');
+    return guard('supervisor_task_finish', async () => {
+      await finishControlTask(task_id, status, caller.sessionId!, caller.conversationId!, call.startedAt);
+      return { content: [{ type: 'text' as const, text: `TASK_RECORDED: ${task_id} ${status}` }] };
+    });
+  });
+
   if (reg.ctx.exposedFinishTool ?? getConfig().ui.finishTool === true) {
     reg.register('session_finish', toolDeclaration('session_finish', () => ({
-      description: 'For Astra only, when explicitly requested by a user prompt. Call near actual completion, after implementing the requested work. Receives queued instructions; complete and verify them before calling again. Do not use for progress updates or queue collection. While HELD with no work remaining, call to wait. Each call waits at most 25 seconds.',
+      description: 'For Astra only, when explicitly requested by a user prompt. Call near actual completion, after implementing the requested work. Receives queued instructions; complete and verify them before calling again. Do not use for progress updates or queue collection.',
       inputSchema: z.object({ summary: z.string().min(1).max(1000) }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
     })), async ({ summary }) => {

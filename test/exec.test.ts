@@ -8,6 +8,7 @@ import {
   MAX_OUTPUT_BYTES,
   MAX_TIMEOUT_MS,
   childEnv,
+  applyCommandSandbox,
   findPowerShell,
   launchCommand,
   normaliseTimeout,
@@ -218,6 +219,22 @@ describe('runCommand', () => {
   it('rejects an absurd number of arguments', async () => {
     const many = Array.from({ length: 200 }, (_, i) => String(i));
     await expect(runCommand(node, many, cwd, 5000)).rejects.toThrow(/Too many arguments/);
+  });
+});
+
+describe('command sandbox boundary', () => {
+  it.runIf(!IS_WINDOWS)('wraps legacy launches through the configured Codex profile', async () => {
+    const launcher = path.join(cwd, 'codex-sandbox');
+    await fs.writeFile(launcher, '#!/bin/sh\n', 'utf8');
+    await (await import('node:fs/promises')).chmod(launcher, 0o755);
+    const launch = applyCommandSandbox([node, '-e', 'process.exit(0)'], cwd,
+      { enabled: true, codexPath: launcher, permissionProfile: 'projects-only' }, '/Users/test');
+    expect(launch.file).toBe(launcher);
+    expect(launch.cwd).toBe('/Users/test');
+    expect(launch.args).toEqual([
+      'sandbox', '-c', 'shell_environment_policy.inherit=all', '--permission-profile', 'projects-only',
+      '--cd', '/Users/test', '/usr/bin/env', '-C', cwd, node, '-e', 'process.exit(0)'
+    ]);
   });
 });
 

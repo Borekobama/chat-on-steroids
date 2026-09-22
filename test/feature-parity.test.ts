@@ -66,6 +66,7 @@ describe('portable browser-backed feature parity', () => {
       'write_stdin',
       'update_plan',
       'agents',
+      'supervisor_task_finish',
       'session_finish',
       'exec'
     ]);

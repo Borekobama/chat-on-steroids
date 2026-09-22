@@ -140,9 +140,9 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform, skills: s
     'Use action=message to steer a worker; batch messages when sending several. Worker reports arrive with tool results. Check their findings and changes before relying on them.',
     'Workers communicate with the prime, keep working while replies are pending, and use action=finish when done with RESULT / CHANGES / VALIDATION / BLOCKERS. A finished reusable worker sleeps and can be messaged again.'
   );
-  if (ctx.exposedFinishTool ?? config.ui.finishTool) lines.push(
+  lines.push(
     '',
-    'session_finish is for Astra only when the user prompt explicitly requests it. Follow that prompt’s finish timing after implementation; complete newly delivered work. It is not a plan/progress update or a way to collect queued tasks. Workers use agents action=finish instead.'
+    'Supervisor Shunt control tasks call supervisor_task_finish with task_id and status only after exact acceptance. This records task completion without finish hold. Astra uses session_finish with summary only when explicitly requested by the user. Neither form is for progress updates or queue collection. Workers use agents action=finish instead.'
   );
   if (desktop && (caps.screen || caps.control || caps.clipboardRead || caps.clipboardWrite)) lines.push(
     '',

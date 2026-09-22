@@ -1,4 +1,4 @@
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -62,6 +62,23 @@ describe('Codex unified exec runtime parity', () => {
   afterEach(async () => {
     await Promise.all(managers.splice(0).map((item) => item.terminateAllProcesses()));
     await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  it.runIf(process.platform !== 'win32').each([false, true])('launches the configured wrapper with tty=%s', async tty => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), 'cos-sandbox-test-')));
+    tempRoots.push(root);
+    const launcher = path.join(root, 'codex');
+    await writeFile(launcher, '#!/bin/sh\nprintf "SANDBOX_WRAPPER\\n"\n');
+    await chmod(launcher, 0o755);
+    const instance = manager(); managers.push(instance);
+    const result = await instance.execCommand({
+      command: ['/usr/bin/true'], shellType: 'sh', hookCommand: 'true', processId: instance.allocateProcessId(),
+      yieldTimeMs: 1000, maxOutputTokens: undefined, truncationPolicy,
+      cwd: root, displayCwd: root, env: process.env, tty,
+      commandSandbox: { enabled: true, codexPath: launcher, permissionProfile: 'projects-only' }
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.rawOutput.toString()).toContain('SANDBOX_WRAPPER');
   });
 
   /**
