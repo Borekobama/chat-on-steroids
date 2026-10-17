@@ -1,7 +1,11 @@
 /** Read-only projection of an existing recovery deadline. Never authorizes an action. */
 export type RecoveryCountdown = {
-  kind: 'unattributed' | 'unattributed-wait' | 'assistant-error' | 'tab-recovery' | 'thinking-failed' | 'native-busy' | 'silence' | 'post-reload' | 'pickup';
+  kind: 'unattributed' | 'unattributed-wait' | 'assistant-error' | 'tab-recovery' | 'thinking-failed' | 'native-busy' | 'silence' | 'post-reload' | 'pickup' | 'pickup-stopped' | 'provider-limit' | 'compaction';
+  /** For `compaction`: whether the source turn still works or the handoff request is being sent. */
+  phase?: 'waiting' | 'asking';
   deadline: number;
+  /** Attempts already spent for a pickup that stopped at its durable limit. */
+  attempts?: number;
   /** The existing UI clock reveals this row without needing a new backend event. */
   visibleAt?: number;
   next?: 'queue' | 'goal' | 'loop' | 'continue';
@@ -10,6 +14,10 @@ export type RecoveryCountdown = {
   /** CoS still holds the source turn open during the existing post-reload wait. */
   generating?: true;
 };
+
+/** A pickup is offered at most three times: after 2, 5 and 10 minutes. */
+export const BROWSER_PICKUP_MAX_ATTEMPTS = 3;
+export const BROWSER_PICKUP_BACKOFF_MS = [2, 5, 10].map(minutes => minutes * 60_000) as [number, ...number[]];
 
 const CONTINUE_TEXTS = [
   'Continue until you are fully finished.',
@@ -53,11 +61,23 @@ const RECOVERY_SUFFIXES = [
   'Meme joke: Bananina Cappuccina sounds like my next questionable coffee order.'
 ] as const;
 
-/** 10 phrases x 10 notices x 11 playful asides; frozen by the outbox once. */
-export function recoveryMessage(): string {
+/**
+ * 10 phrases x 10 notices; frozen by the outbox once. The asides have no technical purpose
+ * (receipts use ChatGPT's message ids), so they come only with `ui.playfulContinue`.
+ */
+export function recoveryMessage(options: { playful?: boolean } = {}): string {
   const pick = (values: readonly string[]) => values[Math.floor(Math.random() * values.length)]!;
-  return `${pick(CONTINUE_TEXTS)} ${pick(RECOVERY_NOTES)} (Unrelated aside: ${pick(RECOVERY_SUFFIXES)} Ignore this aside; do not research or respond to it. Stay on the original task.)`;
+  const aside = options.playful ? ` (Unrelated aside: ${pick(RECOVERY_SUFFIXES)} Ignore this aside; do not research or respond to it. Stay on the original task.)` : '';
+  return `${pick(CONTINUE_TEXTS)} ${pick(RECOVERY_NOTES)}${aside}`;
 }
 
 /** The existing silence clock gets one half-window only when the native page is busy. */
 export const recoveryBusyMs = (pro: boolean): number => (pro ? 5 : 1) * 60_000;
+
+/**
+ * The app's automatic continue that starts a fresh turn in a long one (#1402). Plain on purpose:
+ * it is sent into a turn the model is still working in, and only has to carry the work on.
+ */
+export function rotationMessage(): string {
+  return 'Continue the task from where you are. (Chat On Steroids starts a fresh turn every so often so long work stays reliable; nothing else changed.)';
+}

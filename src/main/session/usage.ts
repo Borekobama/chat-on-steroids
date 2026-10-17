@@ -7,7 +7,10 @@ import { eventTokens } from '../../shared/session.js';
 import { usageDateKey, usageMessageFamily, usageModelKey, usageWeekStart, type ModelUsage, type UsageMessageDay, type UsageModelTokens, type UsageOverview } from '../../shared/usage.js';
 import { getChatModels } from '../chat-models.js';
 import { isProModel } from '../../shared/chat-models.js';
-const row = z.object({ model: z.string().min(1).max(100), scope: z.enum(['model', 'feature', 'shared']), remaining: z.number().finite().nonnegative().nullable(), remainingPercent: z.number().min(0).max(100).nullable(), resetAt: z.number().finite().positive().nullable(), windowSeconds: z.number().finite().positive().nullable() });
+// An extension from before 2.1.40 sends wham/usage windows as "shared": they were Codex's all along.
+const legacyCodex = (entry: { model: string; scope: string }) => entry.scope === 'shared'
+  ? { ...entry, model: entry.model === 'Shared usage' ? 'Codex' : entry.model, scope: 'codex' as const } : entry;
+const row = z.object({ model: z.string().min(1).max(100), scope: z.enum(['model', 'feature', 'codex', 'shared']), remaining: z.number().finite().nonnegative().nullable(), remainingPercent: z.number().min(0).max(100).nullable(), resetAt: z.number().finite().positive().nullable(), windowSeconds: z.number().finite().positive().nullable() });
 let limits: ModelUsage[] = [];
 let latestObservedAt = 0;
 const FRESH_MS = 10 * 60000;
@@ -18,11 +21,16 @@ export function observeUsage(raw: unknown, capturedAt: unknown = Date.now()): vo
   // A snapshot is one account observation. Never merge old counters from another
   // account/tab into the latest response; an explicit empty snapshot clears them.
   latestObservedAt = capturedAt;
-  limits = parsed.map((entry) => ({ ...entry, observedAt: capturedAt }));
+  limits = parsed.map((entry) => ({ ...legacyCodex(entry), observedAt: capturedAt }) as ModelUsage);
+}
+/** ChatGPT's latest reported limits, as the page last showed them. */
+export function reportedUsageLimits(): ModelUsage[] {
+  return limits.map(row => ({ ...row }));
 }
 // One derived cache owns token totals and verified sends. Display preferences project
 // this baseline; only changed canonical session revisions reread transcripts.
 const CACHE_VERSION = 9;
+const SLOW_OVERVIEW_MS = 250;
 const modelTokens = z.object({ model: z.string().min(1).max(100), reasoningEffort: z.string().max(100).nullable(), assumed: z.boolean(), tokens: z.number().finite().nonnegative() });
 const verifiedMessage = z.object({ id: z.string().min(1).max(512), time: z.number().finite().positive().max(8.64e15), model: z.enum(['gpt-5.6', 'gpt-6']) });
 type VerifiedMessage = z.infer<typeof verifiedMessage>;
@@ -97,13 +105,28 @@ async function computeOverview(signal?: AbortSignal): Promise<UsageOverview> {
       };
       const events = await readEvents(session.id);
       signal?.throwIfAborted();
+      // A send typed on the page carries no model of its own. The reply that answers it does:
+      // ChatGPT's server stamps it with the model that actually ran. Only that reply, before
+      // the next send, may prove the model — never the picker or a later tool.
+      let unproven: { id: string; time: number } | null = null;
       for (const event of events) {
         // The delivered native row owns model proof. Never borrow the mutable picker,
         // a later tool's model or LEGACY's token-estimation assumptions for this count.
         if (event.kind === 'user_message' && event.messageId && !event.messageId.startsWith('input:') && event.inputDelivery !== 'offered') {
           const model = usageMessageFamily(event.model);
           const time = event.authoredAt ?? event.time;
-          if (model && Number.isFinite(time) && time > 0 && time <= 8.64e15) verified.push({ id: event.messageId, time, model });
+          unproven = null;
+          if (Number.isFinite(time) && time > 0 && time <= 8.64e15) {
+            if (model) verified.push({ id: event.messageId, time, model });
+            else if (!event.model) unproven = { id: event.messageId, time };
+          }
+        } else if (event.kind === 'user_message') {
+          unproven = null;
+        }
+        if (event.kind === 'assistant_message' && unproven && event.resolvedModel) {
+          const model = usageMessageFamily(event.resolvedModel);
+          if (model) verified.push({ ...unproven, model });
+          unproven = null;
         }
         // A code-mode child is local execution evidence, not another model round trip.
         if (event.kind === 'tool_call' && event.call.nested === true) continue;
@@ -153,7 +176,12 @@ async function computeOverview(signal?: AbortSignal): Promise<UsageOverview> {
     day[message.model === 'gpt-6' ? 'gpt6' : 'gpt56']++;
     messageDays.set(date, day);
   }
-  logInfo(`usage overview sessions=${sessions.length} reused=${sessions.length - rebuilt} rebuilt=${rebuilt} elapsed_ms=${Math.round(performance.now() - started)}`);
+  // The open Usage page refreshes this every few seconds. A pass that only reused the cache is
+  // not news; logging each one buried the real events in Activity under identical lines.
+  const elapsed = Math.round(performance.now() - started);
+  if (rebuilt > 0 || dirty || elapsed >= SLOW_OVERVIEW_MS) {
+    logInfo(`usage overview sessions=${sessions.length} reused=${sessions.length - rebuilt} rebuilt=${rebuilt} elapsed_ms=${elapsed}`);
+  }
   return {
     contextTokenCap,
     messages: { through, days: [...messageDays.values()].sort((a, b) => a.date.localeCompare(b.date)) },

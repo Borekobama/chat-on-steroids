@@ -141,12 +141,13 @@ async function recorder(f: ReturnType<typeof fixture>, replies: Record<string, (
     events: () => sent.filter(m => m.type === 'events').flatMap(m => m.entries.map((entry: any) => entry.event)) };
 }
 
-function addExchange(f: ReturnType<typeof fixture>, ordinal: number, text: string) {
+function addExchange(f: ReturnType<typeof fixture>, ordinal: number, text: string, { userSlot = true } = {}) {
   const id = (part: number) => `99999999-1111-4111-8111-${String(ordinal * 10 + part).padStart(12, '0')}`;
   const userId = id(1), turnId = id(2), answerId = id(3);
   const node = f.doc.createElement('div'); node.setAttribute('data-turn-key', userId);
-  node.innerHTML = `<div data-content-search-turn-key="${turnId}"><div data-content-search-unit-key="${turnId}:0:user"><div data-user-message-bubble><div class="whitespace-pre-wrap"></div></div></div><span hidden data-chatgpt-agent-turn-start></span><div data-content-search-unit-key="${turnId}:1:assistant"><div data-markdown-text-style="assistant-message"></div></div></div>`;
-  node.querySelector('.whitespace-pre-wrap')!.textContent = text;
+  const user = userSlot ? `<div data-content-search-unit-key="${turnId}:0:user"><div data-user-message-bubble><div class="whitespace-pre-wrap"></div></div></div>` : '';
+  node.innerHTML = `<div data-content-search-turn-key="${turnId}">${user}<span hidden data-chatgpt-agent-turn-start></span><div data-content-search-unit-key="${turnId}:1:assistant"><div data-markdown-text-style="assistant-message"></div></div></div>`;
+  if (userSlot) node.querySelector('.whitespace-pre-wrap')!.textContent = text;
   const entry = { id: turnId, conversationId: THREAD, turn: { status: 'in_progress', messageIds: [userId, answerId], items: [
     { type: 'user-message', messageId: userId, serverMessageId: userId, message: text },
     { type: 'assistant-message', messageId: answerId, content: 'Working', phase: 'final_answer', completed: false }
@@ -177,7 +178,9 @@ it('reads the real shell composer, messages and tools through existing contracts
   expect(turns[0].messages.map((m: any) => [m.role, m.rawMessageId, m.rawText])).toEqual([['user', USER, 'hello'], ['assistant', ANSWER, 'Answer']]);
   expect(turns[0].calls).toEqual([{ messageId: CALL, tool: 'read', order: 0, answered: false, requestId: null, createTime: null }]);
   expect(JSON.stringify(turns)).not.toContain('NEVER_COPY_TOOL_ARGS');
-  expect(JSON.stringify(turns)).not.toContain('Commentary without a provider');
+  // Id-less commentary is never a message; it is in the turn's outline (#942).
+  expect(JSON.stringify(turns[0].messages)).not.toContain('Commentary without a provider');
+  expect(turns[0].trace[0]).toEqual({ kind: 'say', text: 'Commentary without a provider message id', done: true });
   expect(f.api.turns().map((t: any) => t.role)).toEqual(['user', 'assistant']);
   expect(f.api.messages().map((m: any) => [m.id, m.role, m.text])).toEqual([[USER, 'user', 'hello'], [ANSWER, 'assistant', 'Answer']]);
   expect(f.api.presentationTurns().map((t: any) => t.role)).toEqual(['user', 'assistant']);
@@ -187,6 +190,149 @@ it.each(['in_progress', 'cancelled', 'complete', 'unknown', undefined])('does no
   const f = fixture(); (f.entry.turn as any).status = status;
   const turn = (await f.ask()).turns[0];
   expect(turn.calls[0].answered).toBe(false); expect(turn.endMessageId).toBeNull();
+});
+it('outlines a running turn in ChatGPT\'s order: sentences, this app\'s calls, recaps and the answer', async () => {
+  // A new chat's first turn: ChatGPT shows the model's sentences but publishes no message for them.
+  const f = fixture();
+  expect((await f.ask()).turns[0].trace).toEqual([
+    { kind: 'say', text: 'Commentary without a provider message id', done: true },
+    { kind: 'call', id: CALL, tool: 'read', done: false },
+    { kind: 'answer', id: ANSWER }
+  ]);
+  const group = f.entry.turn.items[1];
+  group.items.push(
+    { type: 'reasoning', presentation: 'thought', content: 'Read   the\n project' },
+    // A transient item and a hidden group are not part of what the turn shows.
+    { type: 'reasoning', presentation: 'preamble', content: 'Draft', isTransient: true },
+    // GPT-6 writes its sentences as messages whose text lives in the DIL reference's fallback.
+    { type: 'assistant-message', messageId: OTHER, phase: 'final_answer', completed: true,
+      content: `::chatgpt-content-reference{index="0" source_message_id="${OTHER}"}`,
+      contentReferences: [{ type: 'dil', source_message_id: OTHER, model_dil_v2: { fallbackMarkdown: 'Now editing `a.txt`.' } }] },
+    { type: 'mcp-tool-call', callId: 'not-ours', completed: true, invocation: { server: 'Someone Else', tool: 'x/read' } }
+  );
+  f.entry.turn.items.splice(2, 0, { type: 'chatgpt-reasoning-group', reasoningRecap: { type: 'hide_all' },
+    items: [{ type: 'reasoning', presentation: 'preamble', content: 'PRIVATE_HIDDEN_GROUP' }] });
+  const trace = (await f.ask()).turns[0].trace;
+  expect(trace.slice(2)).toEqual([
+    { kind: 'recap', text: 'Read the project' },
+    { kind: 'say', id: OTHER, text: 'Now editing `a.txt`.', done: true },
+    { kind: 'answer', id: ANSWER }
+  ]);
+  expect(JSON.stringify(trace)).not.toContain('PRIVATE_HIDDEN_GROUP');
+  expect(JSON.stringify(trace)).not.toContain('NEVER_COPY_TOOL_ARGS');
+});
+it('names the user message that opened each turn, so its outline is filed under the right one (#1301)', async () => {
+  const f = fixture();
+  expect((await f.ask()).turns[0].question).toBe(USER);
+  // A turn whose first item is not a user message names none.
+  f.entry.turn.items.shift();
+  expect((await f.ask()).turns[0].question).toBeUndefined();
+});
+it('says what a running turn is doing with the open thought ChatGPT shows, and nothing once it ends', async () => {
+  const f = fixture();
+  // Observed 2026-10-08: the group's activeReasoning is the status line until the round closes.
+  f.entry.turn.items[1].activeReasoning = { type: 'reasoning', presentation: 'thought', completed: false, content: 'Comparing   three\n layouts' };
+  expect((await f.ask()).turns[0].trace.at(-1)).toEqual({ kind: 'now', text: 'Comparing three layouts' });
+  f.entry.turn.items[1].activeReasoning = { type: 'reasoning', presentation: 'thought', completed: false, content: 'Draft', isTransient: true };
+  expect((await f.ask()).turns[0].trace.some((item: any) => item.kind === 'now')).toBe(false);
+  f.entry.turn.items[1].activeReasoning = { type: 'reasoning', presentation: 'thought', completed: false, content: 'Comparing three layouts' };
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  expect((await f.ask()).turns[0].trace.some((item: any) => item.kind === 'now')).toBe(false);
+});
+it('outlines commentary whose own message is readable too, while recording that message (#942)', async () => {
+  const f = fixture(); liveShellMapping(f, true);
+  const turn = (await f.ask()).turns[0];
+  expect(turn.trace).toContainEqual({ kind: 'say', text: 'I will inspect the project.', done: true });
+  expect(turn.messages.map((m: any) => m.rawText)).toContain('I will inspect the project.');
+});
+it('records a sentence GPT-6 writes inside the working group while the turn runs, as commentary', async () => {
+  // Live 2026-10-12: GPT-6 nests each interim sentence in the reasoning group as an assistant message
+  // (phase final_answer, completed, text in its DIL fallback). Only the outline read it: the canonical
+  // message arrived when the turn ended or the page reloaded, 15 to 23 minutes late.
+  const f = fixture();
+  f.entry.turn.items[1].items.push({ type: 'assistant-message', messageId: OTHER, phase: 'final_answer', completed: true,
+    content: `::chatgpt-content-reference{index="0" source_message_id="${OTHER}"}`,
+    contentReferences: [{ type: 'dil', source_message_id: OTHER, model_dil_v2: { fallbackMarkdown: 'Now editing `a.txt`.' } }] });
+  const turn = (await f.ask()).turns[0];
+  expect(turn.messages.find((m: any) => m.rawMessageId === OTHER)?.rawText).toBe('Now editing `a.txt`.');
+  // An interim sentence never ends the turn, whatever phase it carries.
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  expect((await f.ask()).turns[0].endMessageId).toBe(ANSWER);
+  // The same message hoisted to the top level is read once, and the scan stays readable.
+  f.entry.turn.items.splice(2, 0, { ...f.entry.turn.items[1].items.at(-1) });
+  const hoisted = (await f.ask()).turns[0];
+  expect(hoisted.messages.filter((m: any) => m.rawMessageId === OTHER)).toHaveLength(1);
+});
+it('reads a DIL answer as the Markdown the page falls back to, not as its content reference', async () => {
+  const f = fixture();
+  const answer = f.entry.turn.items[2];
+  answer.content = `::chatgpt-content-reference{index="0" source_message_id="${ANSWER}"}`;
+  answer.contentReferences = [{ type: 'dil', source_message_id: ANSWER, model_dil_v2: { fallbackMarkdown: '**Done.** Three files.' } }];
+  expect((await f.ask()).turns[0].messages.find((m: any) => m.rawMessageId === ANSWER).rawText).toBe('**Done.** Three files.');
+  // A reference to another message keeps its directive: that content is not this item's to give.
+  answer.contentReferences = [{ type: 'dil', source_message_id: OTHER, model_dil_v2: { fallbackMarkdown: 'Not this one' } }];
+  expect((await f.ask()).turns[0].messages.find((m: any) => m.rawMessageId === ANSWER).rawText).toContain('::chatgpt-content-reference');
+});
+it('reads a DIL answer as the model wrote it, without the escapes its fallback adds to plain text', async () => {
+  // Measured on GPT-6 (2026-10-09): the fallback escapes literal punctuation outside code, so the Goal
+  // marker arrived as \[\[COS\_GOAL:COMPLETE\]\] and every Loop decision as invalid JSON (2\^300).
+  const f = fixture();
+  const answer = f.entry.turn.items[2];
+  answer.content = `::chatgpt-content-reference{index="0" source_message_id="${ANSWER}"}`;
+  const read = async (fallbackMarkdown: string) => {
+    answer.contentReferences = [{ type: 'dil', source_message_id: ANSWER, model_dil_v2: { fallbackMarkdown } }];
+    return (await f.ask()).turns[0].messages.find((m: any) => m.rawMessageId === ANSWER).rawText;
+  };
+  expect(await read('Done.\n\n\\[\\[COS\\_GOAL:COMPLETE\\]\\]')).toBe('Done.\n\n[[COS_GOAL:COMPLETE]]');
+  expect(JSON.parse(await read('{"action":"continue","reply":"Recompute 2\\^300 with \\`echo\\` \\#1"}')))
+    .toEqual({ action: 'continue', reply: 'Recompute 2^300 with `echo` #1' });
+  expect(await read('## Title\n\n**bold** `code`\n2\\^10 = 1024 \\[ok\\] C:\\\\Users'))
+    .toBe('## Title\n\n**bold** `code`\n2^10 = 1024 [ok] C:\\Users');
+  // Code keeps its own text: fences and spans are verbatim in the fallback already.
+  expect(await read('```python\nx = a[0] ** 2  # note \\[\n```\n\n`C:\\Users\\[x]` and \\_after\\_'))
+    .toBe('```python\nx = a[0] ** 2  # note \\[\n```\n\n`C:\\Users\\[x]` and _after_');
+});
+it('decodes the entities a DIL fallback writes for | and & in plain text, once', async () => {
+  // Measured on GPT-6 (2026-10-16): the model wrote `a|b <c> &d \\e *f*` and the fallback held
+  // `a&#124;b \\<c> &amp;d \\\\e \\*f\\*`, the code span verbatim. Readers saw &#124; and &amp;.
+  const f = fixture();
+  const answer = f.entry.turn.items[2];
+  answer.content = `::chatgpt-content-reference{index="0" source_message_id="${ANSWER}"}`;
+  const read = async (fallbackMarkdown: string) => {
+    answer.contentReferences = [{ type: 'dil', source_message_id: ANSWER, model_dil_v2: { fallbackMarkdown } }];
+    return (await f.ask()).turns[0].messages.find((m: any) => m.rawMessageId === ANSWER).rawText;
+  };
+  expect(await read('a&#124;b \\<c> &amp;d \\\\e \\*f\\*\n`a|b <c> &d \\e *f*`\nEND'))
+    .toBe('a|b <c> &d \\e *f*\n`a|b <c> &d \\e *f*`\nEND');
+  expect(await read('KIWI &#124; /home/maxim/cos-ssh-live')).toBe('KIWI | /home/maxim/cos-ssh-live');
+  // A literal entity the model wrote has its & encoded, so one pass gives back the literal text.
+  expect(await read('Write &amp;#124; or &amp;amp; or &amp;lt;b&amp;gt; &#x7C; &#X7c;')).toBe('Write &#124; or &amp; or &lt;b&gt; | |');
+  // Code and formulas keep their own text.
+  expect(await read('`x &amp; y` and \\(a &amp; b\\)')).toBe('`x &amp; y` and \\(a &amp; b\\)');
+  // Not an entity: left as it is.
+  expect(await read('R&D, a & b, &nope; &#;')).toBe('R&D, a & b, &nope; &#;');
+});
+it('keeps the LaTeX of a DIL answer as written, while its plain text still loses the escapes (#1342)', async () => {
+  // Recorded from GPT-6 on 2026-10-12. The fallback escapes plain text only: a display formula is a
+  // block between a line "\\[" and a line "\\]", an inline one sits in \\( … \\), and both hold raw
+  // LaTeX. Literal brackets are escaped inside their text line, and literal parentheses never are.
+  // Unescaping the formulas too turned \\[ into [, \\( into (, f\\! into f! and \\\\[10pt] into \\[10pt].
+  const f = fixture();
+  const answer = f.entry.turn.items[2];
+  answer.content = `::chatgpt-content-reference{index="0" source_message_id="${ANSWER}"}`;
+  const read = async (fallbackMarkdown: string) => {
+    answer.contentReferences = [{ type: 'dil', source_message_id: ANSWER, model_dil_v2: { fallbackMarkdown } }];
+    return (await f.ask()).turns[0].messages.find((m: any) => m.rawMessageId === ANSWER).rawText;
+  };
+  expect(await read("The Lindhard dielectric function, as discussed in *Solid State Physics* by Ashcroft and Mermin, describes the electronic screening response of a noninteracting electron gas.\n\n\\[\n\\begin{aligned}\n\\varepsilon(\\mathbf{q},\\omega)\n\\\\\n=\n\\\\\n1-\\frac{4\\pi e^2}{q^2}\n\\frac{2}{V}\n\\sum_{\\mathbf{k}}\n\\frac{\nf\\!\\left(\\epsilon_{\\mathbf{k}+\\mathbf{q}}\\right)\n-\nf\\!\\left(\\epsilon_{\\mathbf{k}}\\right)\n}{\n\\epsilon_{\\mathbf{k}+\\mathbf{q}}\n-\n\\epsilon_{\\mathbf{k}}\n-\n\\hbar(\\omega+i0^+)\n}\n\\end{aligned}\n\\]\n\nHere, \\(\\mathbf{q}\\) is the wave vector of the perturbation, with magnitude \\(q=|\\mathbf{q}|\\)\\.\n\n\\[\n\\begin{aligned}\n\\epsilon_{\\mathbf{k}} &= \\frac{\\hbar^2 k^2}{2m}\n\\\\[10pt]\nf(\\epsilon) &= \\frac{1}{e^{(\\epsilon-\\mu)/(k_B T)}+1}\n\\end{aligned}\n\\]\n\n\\[ok\\] 2\\^10 = 1024 a\\_b \\*star\\*"))
+    .toBe("The Lindhard dielectric function, as discussed in *Solid State Physics* by Ashcroft and Mermin, describes the electronic screening response of a noninteracting electron gas.\n\n\\[\n\\begin{aligned}\n\\varepsilon(\\mathbf{q},\\omega)\n\\\\\n=\n\\\\\n1-\\frac{4\\pi e^2}{q^2}\n\\frac{2}{V}\n\\sum_{\\mathbf{k}}\n\\frac{\nf\\!\\left(\\epsilon_{\\mathbf{k}+\\mathbf{q}}\\right)\n-\nf\\!\\left(\\epsilon_{\\mathbf{k}}\\right)\n}{\n\\epsilon_{\\mathbf{k}+\\mathbf{q}}\n-\n\\epsilon_{\\mathbf{k}}\n-\n\\hbar(\\omega+i0^+)\n}\n\\end{aligned}\n\\]\n\nHere, \\(\\mathbf{q}\\) is the wave vector of the perturbation, with magnitude \\(q=|\\mathbf{q}|\\).\n\n\\[\n\\begin{aligned}\n\\epsilon_{\\mathbf{k}} &= \\frac{\\hbar^2 k^2}{2m}\n\\\\[10pt]\nf(\\epsilon) &= \\frac{1}{e^{(\\epsilon-\\mu)/(k_B T)}+1}\n\\end{aligned}\n\\]\n\n[ok] 2^10 = 1024 a_b *star*");
+  // Literal punctuation around formulas, a one-line formula ChatGPT made a block, and $$ … $$, which
+  // ChatGPT itself treats as plain text.
+  expect(await read("The RPA (random phase approximation) costs \\$5 or \\$10, see \\[note 1\\] and {braces} and 50% of a&#124;b, x = 1, a+b, \\#tag, \\~wave\\~.\n\\(x\\), \\(n=2\\) and \\(\\alpha+\\beta\\)\\.\n\n\\[\nE = mc^2\n\\]\n\n\\$\\$\n\\\\int\\_0\\^\\\\infty e\\^,dx = \\\\frac}2\n\\$\\$"))
+    .toBe("The RPA (random phase approximation) costs $5 or $10, see [note 1] and {braces} and 50% of a|b, x = 1, a+b, #tag, ~wave~.\n\\(x\\), \\(n=2\\) and \\(\\alpha+\\beta\\).\n\n\\[\nE = mc^2\n\\]\n\n$$\n\\int_0^\\infty e^,dx = \\frac}2\n$$");
+  // An opening without its closing is not a formula: the text is unescaped as before.
+  expect(await read('Odd \\( left open and \\[ too')).toBe('Odd ( left open and [ too');
+  expect(await read('\\[\nnever closed \\_here\\_')).toBe('[\nnever closed _here_');
 });
 it('requires the final item and successful turn, while retaining exact messages on reload', async () => {
   const f = fixture(); f.entry.turn.items[2].completed = true;
@@ -202,6 +348,91 @@ it('reports an explicit per-call completion without a synthetic result message',
   const f = fixture(); f.entry.turn.items[1].items[1].completed = true;
   const turn = (await f.ask()).turns[0]; expect(turn.calls[0].answered).toBe(true);
   expect(turn.messages).toHaveLength(2); expect(turn.endMessageId).toBeNull();
+});
+
+function generatedAnswer(f: ReturnType<typeof fixture>) {
+  const image = { type: 'generated-image', id: `${ANSWER}:image-asset:0`, chatGptMessageId: ANSWER,
+    src: 'sediment://file_1234567890abcdef', status: 'completed', isPreview: false, width: 1448, height: 1086 };
+  f.entry.turn.status = 'complete'; f.entry.turn.messageIds = [USER, ANSWER];
+  f.entry.turn.items = [f.entry.turn.items[0], image];
+  f.doc.querySelector('[data-content-search-unit-key$=":assistant"]')!.remove();
+  const group = f.doc.createElement('div'); group.className = 'group/generated-image-preview';
+  const node = f.doc.createElement('img'); node.src = 'blob:https://chatgpt.com/selected-image'; group.append(node);
+  f.doc.querySelector('[data-turn-key]')!.append(group);
+  const owner = f.chain({ item: image }, f.row);
+  (node as any).__reactFiber$fixture = f.chain({ imageId: image.id, isComplete: true, isPreview: false }, owner);
+  return { image, node, owner };
+}
+
+it.each(['complete', 'running turn', 'running image', 'preview', 'foreign message', 'invalid asset', 'retry'])(
+  'recognizes only a selected completed image answer (%s)', async scenario => {
+    const f = fixture(); const { image } = generatedAnswer(f);
+    if (scenario === 'running turn') f.entry.turn.status = 'in_progress';
+    if (scenario === 'running image') image.status = 'in_progress';
+    if (scenario === 'preview') image.isPreview = true;
+    if (scenario === 'foreign message') image.chatGptMessageId = OTHER;
+    if (scenario === 'invalid asset') image.src = 'https://example.com/private-url';
+    if (scenario === 'retry') f.entry.turn.items.push({ ...image, id: `${OTHER}:image-asset:0`,
+      chatGptMessageId: OTHER, status: 'in_progress' });
+    const turn = (await f.ask()).turns[0];
+    expect(turn.endMessageId).toBe(scenario === 'complete' ? ANSWER : null);
+    expect(turn.messages.every((message: any) => message.role === 'user')).toBe(true);
+    if (scenario === 'complete') expect(turn.images).toEqual([expect.objectContaining({ messageId: ANSWER,
+      assetId: 'file_1234567890abcdef', providerRole: 'tool', providerStatus: 'finished_successfully' })]);
+  });
+
+it('stamps blob pixels only for the exact mounted image item and retires replaced ownership', async () => {
+  const f = fixture(); const { image, node, owner } = generatedAnswer(f);
+  await f.ask();
+  expect(node.getAttribute('data-clf-fiber-image')).toContain(encodeURIComponent(ANSWER));
+  expect(node.getAttribute('data-clf-fiber-image-source')).toBe(node.src);
+  owner.memoizedProps.item = { ...image }; // Same-looking stale Fiber object is not this mounted item.
+  await f.ask();
+  expect(node.hasAttribute('data-clf-fiber-image')).toBe(false);
+  expect(node.hasAttribute('data-clf-fiber-image-source')).toBe(false);
+});
+
+it('rejects an image borrowing the authored user message identity', async () => {
+  const f = fixture(); const { image } = generatedAnswer(f);
+  image.chatGptMessageId = USER;
+  const turn = (await f.ask()).turns[0];
+  expect(turn?.endMessageId ?? null).toBeNull();
+  expect(turn?.images ?? []).toEqual([]);
+});
+
+it('closes a tracked image-only shell turn and releases its page generation state', async () => {
+  const f = fixture(), edit = editing(f);
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  let input = { id: OTHER, owner: 'image-request', text: 'Create an image', model: 'gpt-5-6-thinking',
+    reasoningEffort: 'high', purpose: 'user', images: [] };
+  let latest: ReturnType<typeof addExchange>;
+  let sends = 0;
+  f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
+    event.preventDefault(); latest = addExchange(f, ++sends, edit.serialize()); edit.box.replaceChildren();
+    latest.entry.turn.items = [latest.entry.turn.items[0]!, { type: 'generated-image',
+      chatGptMessageId: latest.answerId, id: `${latest.answerId}:image-asset:0`,
+      src: 'sediment://file_1234567890abcdef', status: 'in_progress', isPreview: false } as any];
+  });
+  const r = await recorder(f, { desktop_input: m => ({ ok: true,
+    data: m.authorize || m.ack || m.fail ? { ok: true } : { input } }) });
+  const sent = r.runtime({ type: 'clf-desktop-input', id: input.id, conversationId: THREAD });
+  await vi.waitFor(() => expect(latest).toBeTruthy());
+  await r.hook.refreshFiber(); r.hook.observe(); expect(await sent).toEqual({ ok: true });
+  await r.hook.refreshFiber(); r.hook.observe(); await r.hook.flush();
+  expect((await r.runtime({ type: 'clf-page-status' })).generating).toBe(true);
+  (latest!.entry.turn.items[1] as any).status = 'completed'; latest!.entry.turn.status = 'complete';
+  await r.hook.refreshFiber(); r.hook.observe(); await r.hook.flush();
+  expect(r.events().filter((event: any) => event.kind === 'turn_end')).toEqual([
+    expect.objectContaining({ outcome: 'completed', providerMessageId: latest!.answerId })
+  ]);
+  expect((await r.runtime({ type: 'clf-page-status' })).generating).toBe(false);
+  input = { ...input, id: CALL, owner: 'follow-up', text: 'Continue after the image' };
+  const followup = r.runtime({ type: 'clf-desktop-input', id: input.id, conversationId: THREAD });
+  await vi.waitFor(() => expect(sends).toBe(2));
+  await r.hook.refreshFiber(); r.hook.observe();
+  expect(await followup).toEqual({ ok: true });
+  expect(r.sent.filter(message => message.type === 'desktop_input' && message.ack && message.id === CALL)).toHaveLength(1);
+  (f.win as any).__CLF_CONTENT_RECORDER__.stop();
 });
 it('reads request metadata only for the mounted shell message ids in the exact native cache', async () => {
   const f = fixture();
@@ -312,6 +543,18 @@ it.each([false, true])('reads committed shell metadata across real React double-
   expect((tree.native as any).__reactFiber$fixture).toBe(tree.oldHost);
   expect(f.row.return).toBe(tree.owner);
   tree.state.current = tree.oldRoot;
+  expect((await f.ask()).turns[0].calls[0].requestId).toBe(OTHER);
+});
+
+it('reads committed shell metadata when the turn sits more than 400 levels below React\'s root (#969)', async () => {
+  // ChatGPT's tree measured 405 levels on 2026-10-02; the old 400-level walk never reached the root.
+  const f = fixture(), tree = bufferedShell(f);
+  let parent: any = tree.oldRoot;
+  for (let depth = 0; depth < 450; depth++) {
+    const wrapper: any = { tag: 0, memoizedProps: {}, return: parent };
+    parent.child = wrapper; parent = wrapper;
+  }
+  parent.child = tree.owner; tree.owner.return = parent;
   expect((await f.ask()).turns[0].calls[0].requestId).toBe(OTHER);
 });
 
@@ -607,6 +850,166 @@ it('uses typed running state rather than a translated Stop caption', async () =>
   await f.ask(); expect(f.api.generating()).toBe(true); expect(f.api.composerSubmitReady()).toBe(false);
   expect(f.api.stopButton()).toBeNull(); // No guessed action target.
 });
+/**
+ * Stop, on a composer that says it in another language.
+ *
+ * The newer composer puts voice, send and stop in one slot as the same `type="button"`; only the
+ * label and the icon change, and the label is translated. Captured from a Turkish page on
+ * 2026-09-25: `aria-label="Durdur"` while streaming, `aria-label="Sesli iletisimi baslat"` when
+ * idle. With only an English label list to go on, stop was never found — so `generating()` said
+ * no while a reply was streaming, and nothing could end the turn through the page.
+ *
+ * The square is the part nobody translates. The dictation control in the same slot draws four
+ * paths and carries `data-state`; this asserts both directions, because a send or voice button
+ * mistaken for stop would report a generation that never ends.
+ */
+it('finds the stop control by its square when the label is translated', () => {
+  const f = fixture();
+  const form = f.doc.querySelector('form[data-chatgpt-composer]')!;
+  const slot = 'cursor-interaction size-token-button-composer flex items-center justify-center rounded-full bg-composer-primary p-0.5';
+  form.insertAdjacentHTML('beforeend',
+    `<button type="button" class="${slot} relative" aria-label="Sesli iletisimi baslat" data-state="closed">` +
+    '<svg aria-hidden="true" class="icon-primary-action"><path d="M10 2.5v6"></path><path d="M6 6v2"></path>' +
+    '<path d="M14 6v2"></path><path d="M10 12v5"></path></svg></button>');
+  expect(f.api.generating(), 'the dictation control was read as stop').toBe(false);
+  expect(f.api.stopButton()).toBeNull();
+
+  form.querySelector('button[aria-label="Sesli iletisimi baslat"]')!.outerHTML =
+    `<button type="button" class="${slot}" aria-label="Durdur">` +
+    '<svg class="icon-primary-action" viewBox="0 0 20 20"><path d="M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25C14.9404 4.5 15.5 5.05964 15.5 5.75V14.25C15.5 14.9404 14.9404 15.5 14.25 15.5H5.75C5.05964 15.5 4.5 14.9404 4.5 14.25V5.75Z"></path></svg></button>';
+  expect(f.api.generating(), 'a translated stop button was not recognised').toBe(true);
+  expect(f.api.stopButton()?.getAttribute('aria-label')).toBe('Durdur');
+});
+
+/**
+ * Send, on the same composer, in another language.
+ *
+ * All three `SEND` strategies fail on the newer composer: the `data-testid` is gone, nothing in
+ * that slot is `type="submit"` any more, and `aria-label^="Send"` is translated. `submitDraft`
+ * waits on `sendButton()` and deliberately has no Enter fallback, so when it finds nothing the
+ * prompt simply stands in the composer for ever. Reported in #415 on an English install — "opens
+ * a new GPT web tab and doesnt send any messages" — and captured on a Turkish page in #393.
+ *
+ * Send has no icon signature worth trusting, so it is identified by the state it is the only
+ * occupant of: text in the composer and nothing generating. Both other tenants of the slot are
+ * asserted here to stay out of it, because a dictation button clicked as send starts a recording
+ * and a stop square clicked as send ends somebody's turn.
+ */
+/**
+ * A turn React still calls `in_progress`, hours after it died.
+ *
+ * `generating()` falls back to `data-clf-shell-running`, which fiber.js stamps from
+ * `shell.entry.turn.status === 'in_progress'`. That status outlives an interrupted exchange, and the
+ * existing guard — trust only the newest turn, and only for this pathname — does not help when the
+ * newest turn *is* the interrupted one.
+ *
+ * Measured on the live page on 2026-09-26 over the Chrome debugging port, in the chat this was found
+ * in: all three shell turns carried the stamp for the current pathname at once, `stopButton()` was
+ * null, and `generating()` said true. Three turns cannot be running. The consequence ran the whole
+ * night: `nowGenerating` never went false, so the observer's outcome branch — the only path that can
+ * end a turn — was unreachable, the turn stayed open for nine hours, and the compaction handoff and
+ * every queued follow-up behind it were blocked on it.
+ *
+ * The composer settles it without a label or a clock: voice, send and stop are one button in one slot
+ * on this shell, so a slot holding anything but the stop square is a page that is not generating.
+ */
+/**
+ * A turn identified by the key that is an identity, not by its position.
+ *
+ * `data-content-search-turn-key` belongs to the search index, and on the current shell it has
+ * degraded to a position. Measured on the live page on 2026-09-26 over the debugging port: three
+ * consecutive exchanges carried `fallback-turn-0`, `fallback-turn-1` and `fallback-turn-2`, while
+ * their own `data-turn-key` held real UUIDs — the same UUIDs `messages()` reported for those turns'
+ * user items.
+ *
+ * A position is not an identity. It renumbers when history virtualizes or an exchange is inserted,
+ * so every join keyed on it moves to a different turn without anything looking wrong.
+ */
+it('identifies a shell turn by data-turn-key when the search key is only a position', () => {
+  const f = fixture();
+  const native = f.doc.querySelector('[data-turn-key]')!;
+  const real = native.getAttribute('data-turn-key')!;
+  expect(real, 'the fixture has no turn key to prefer').toMatch(/^[0-9a-f-]{36}$/);
+
+  // The shell as it actually ships: the search key is a position.
+  native.querySelector('[data-content-search-turn-key]')!.setAttribute('data-content-search-turn-key', 'fallback-turn-0');
+  const shell = f.api.turns().filter((turn: any) => turn.id);
+  expect(shell.length, 'no shell turn was read at all').toBeGreaterThan(0);
+  expect([...new Set(shell.map((turn: any) => turn.id))],
+    'a positional search key was used as the turn identity').toEqual([real]);
+
+  // And the search key stays the fallback for the other direction: a shell whose *turn* key is the
+  // positional one and whose search key is real. `data-turn-key` cannot simply be dropped to test
+  // this — SHELL_TURN selects on it, so a node without it is not a shell turn at all.
+  native.setAttribute('data-turn-key', 'fallback-turn-3');
+  native.querySelector('[data-content-search-turn-key]')!.setAttribute('data-content-search-turn-key', 'a-real-search-key');
+  expect(f.api.turns().filter((turn: any) => turn.id).map((turn: any) => turn.id),
+    'the search key stopped being a fallback').toContain('a-real-search-key');
+});
+
+it('does not call a page generating when its composer offers voice, whatever React still says', () => {
+  const f = fixture();
+  const form = f.doc.querySelector('form[data-chatgpt-composer]')!;
+  const slot = 'cursor-interaction size-token-button-composer flex items-center justify-center rounded-full bg-composer-primary p-0.5';
+  f.doc.querySelector('button[type="submit"]')!.remove();
+
+  // Every shell turn stamped as running, exactly as the live page had it.
+  const turns = [...f.doc.querySelectorAll('[data-app-shell-main-surface] [data-thread-find-target="conversation"] [data-turn-key]')];
+  expect(turns.length, 'the fixture has no shell turns to stamp').toBeGreaterThan(0);
+  for (const turn of turns) turn.setAttribute('data-clf-shell-running', f.win.location.pathname);
+  expect(f.api.generating(), 'the stamp alone stopped meaning anything').toBe(true);
+
+  // The slot holds dictation: the composer is idle, so the page is not generating.
+  form.insertAdjacentHTML('beforeend',
+    `<button type="button" class="${slot} relative" aria-label="Sprachchat starten" data-state="closed">` +
+    '<svg aria-hidden="true" class="icon-primary-action"><path d="M8.22266 2.45825C8"></path><path d="M12.4443 4.62524C1"></path>' +
+    '<path d="M4 6.95825C4.48325"></path><path d="M16.667 7.45825C17"></path></svg></button>');
+  expect(f.api.generating(), 'a composer offering voice was still called generating').toBe(false);
+  expect(f.api.stopButton()).toBeNull();
+
+  // And the stop square in that same slot still means generating, stamp and all.
+  form.querySelector('button[aria-label="Sprachchat starten"]')!.outerHTML =
+    `<button type="button" class="${slot}" aria-label="Durdur">` +
+    '<svg class="icon-primary-action" viewBox="0 0 20 20"><path d="M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25C14.9404 4.5 15.5 5.05964 15.5 5.75V14.25C15.5 14.9404 14.9404 15.5 14.25 15.5H5.75C5.05964 15.5 4.5 14.9404 4.5 14.25V5.75Z"></path></svg></button>';
+  expect(f.api.generating(), 'a stop control stopped proving a live generation').toBe(true);
+});
+
+it('finds the send control by its slot when the label is translated', () => {
+  const f = fixture(), edit = editing(f);
+  const form = f.doc.querySelector('form[data-chatgpt-composer]')!;
+  const slot = 'cursor-interaction size-token-button-composer flex items-center justify-center rounded-full bg-composer-primary p-0.5';
+  // The newer composer has none of the three things SEND looks for.
+  f.doc.querySelector('button[type="submit"]')!.remove();
+  expect(f.api.sendButton(), 'a composer with no send control offered one anyway').toBeNull();
+
+  // Empty composer: this slot is dictation, and it is not a send target.
+  form.insertAdjacentHTML('beforeend',
+    `<button type="button" class="${slot} relative" aria-label="Sesli iletisimi baslat" data-state="closed">` +
+    '<svg aria-hidden="true" class="icon-primary-action"><path d="M10 2.5v6"></path><path d="M6 6v2"></path>' +
+    '<path d="M14 6v2"></path><path d="M10 12v5"></path></svg></button>');
+  expect(f.api.sendButton(), 'the dictation control was read as send').toBeNull();
+
+  // Text typed, and the slot now holds send with a translated label and an arrow.
+  form.querySelector('button[data-state="closed"]')!.remove();
+  expect(f.api.insertPrompt('Devam et', true)).toBe(true);
+  expect(edit.box.innerText).toContain('Devam et');
+  form.insertAdjacentHTML('beforeend',
+    `<button type="button" class="${slot}" aria-label="Gönder">` +
+    '<svg class="icon-primary-action" viewBox="0 0 20 20"><path d="M8.5 16.5v-9l-3.25 3.25"></path></svg></button>');
+  expect(f.api.sendButton()?.getAttribute('aria-label'), 'a translated send button was not recognised').toBe('Gönder');
+
+  // The stop square in that same slot is never a send target.
+  form.querySelector('button[aria-label="Gönder"]')!.outerHTML =
+    `<button type="button" class="${slot}" aria-label="Durdur">` +
+    '<svg class="icon-primary-action" viewBox="0 0 20 20"><path d="M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25C14.9404 4.5 15.5 5.05964 15.5 5.75V14.25C15.5 14.9404 14.9404 15.5 14.25 15.5H5.75C5.05964 15.5 4.5 14.9404 4.5 14.25V5.75Z"></path></svg></button>';
+  expect(f.api.sendButton(), 'the stop square was read as send').toBeNull();
+
+  // And an English label still wins outright, without consulting the slot at all.
+  form.querySelector('button[aria-label="Durdur"]')!.outerHTML =
+    '<button type="button" aria-label="Send prompt">send</button>';
+  expect(f.api.sendButton()?.getAttribute('aria-label')).toBe('Send prompt');
+});
+
 it('preserves prepared multiline text through the shell editor serializer', () => {
   const f = fixture(), edit = editing(f);
   const value = '[[COS_CONTEXT:42]]\n# Worker instructions\n- Keep **literal** text, C:\\work and `<tag>`.\n[[/COS_CONTEXT]]\n\nContinue the task.';
@@ -632,6 +1035,26 @@ it('hides only a verified shell prompt frame and restores a recycled user bubble
   expect(unit.querySelector('[data-clf-user-text]')).toBeNull();
   expect(raw.hasAttribute('data-clf-prompt-hidden')).toBe(false);
 });
+/**
+ * The same frame, as the composer gives it back.
+ *
+ * Reported as #374: the internal instructions stayed visible in the page and in ChatGPT's own
+ * conversation title. The editor escapes what it is handed — a backslash before ASCII
+ * punctuation, and one before a newline — so the frame this reader looks for matched nothing and
+ * the whole thing was left on screen as if the user had typed it.
+ */
+it('hides a prompt frame the composer escaped on readback', async () => {
+  const f = fixture(), unit = f.doc.querySelector('[data-content-search-unit-key$=":user"]')!;
+  const raw = unit.querySelector('.whitespace-pre-wrap')!;
+  const full = '[[COS_CONTEXT:13]]\nPrivate setup\n[[/COS_CONTEXT]]\n\nAuthored request';
+  const escaped = full.replace(/([!-/:-@[-`{-~])/g, '\\$1').replace(/\n/g, '\\\n');
+  f.entry.turn.items[0].message = escaped; raw.textContent = escaped;
+  await f.ask();
+  f.api.presentUserPrompts((message: { id: string }) => message.id === USER ? escaped : null);
+  expect(unit.querySelector('[data-clf-user-text]')?.textContent).toBe('Authored request');
+  expect(raw.hasAttribute('data-clf-prompt-hidden')).toBe(true);
+});
+
 it('delivers three successive shell inputs with exact receipts and completed answers', async () => {
   const f = fixture(), edit = editing(f);
   f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
@@ -660,6 +1083,136 @@ it('delivers three successive shell inputs with exact receipts and completed ans
   expect(r.events().filter((e: any) => e.kind === 'turn_end' && e.outcome === 'completed')).toHaveLength(3);
   (f.win as any).__CLF_CONTENT_RECORDER__.stop();
 }, 15000);
+it('sends the app the running turn\'s outline under its local turn, once per change, and never as a message (#942)', async () => {
+  const f = fixture(), edit = editing(f);
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  let offered: any, latest: ReturnType<typeof addExchange>;
+  f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
+    event.preventDefault(); latest = addExchange(f, 1, edit.serialize()); edit.box.replaceChildren();
+  });
+  const r = await recorder(f, { desktop_input: m => ({ ok: true, data: m.authorize || m.ack || m.fail ? { ok: true } : { input: offered } }) });
+  const outlines = () => r.events().filter((e: any) => e.kind === 'turn_trace');
+  try {
+    offered = { id: '88888888-1111-4111-8111-000000000001', owner: 'owner-1', text: 'First request',
+      model: 'gpt-5-6-thinking', reasoningEffort: 'high', purpose: 'user', images: [] };
+    const pending = r.runtime({ type: 'clf-desktop-input', id: offered.id, conversationId: THREAD });
+    await vi.waitFor(() => expect(latest).toBeTruthy(), { timeout: 5000 });
+    await r.hook.refreshFiber(); r.hook.observe();
+    expect(await pending).toEqual({ ok: true });
+    // ChatGPT shows a sentence it has not published as a message.
+    latest!.entry.turn.items.splice(1, 0, { type: 'chatgpt-reasoning-group', items: [
+      { type: 'reasoning', presentation: 'preamble', content: 'First command printed one.' }] } as any);
+    await r.hook.refreshFiber(); await r.hook.refreshFiber(); await r.hook.flush();
+    await vi.waitFor(() => expect(outlines().some((e: any) => JSON.stringify(e.trace).includes('First command printed one.'))).toBe(true), { timeout: 3000 });
+    const sent = outlines().filter((e: any) => JSON.stringify(e.trace).includes('First command printed one.'));
+    // Filed under the generation's own local turn id, and an unchanged outline is not sent again.
+    expect(sent).toHaveLength(1);
+    expect(sent[0].turnId).toMatch(/^g-/);
+    expect(sent[0].trace[0]).toEqual({ kind: 'say', text: 'First command printed one.', done: true });
+    // It is the turn's outline only: nothing of it became a message in the chat's history.
+    expect(r.events().filter((e: any) => e.kind === 'assistant_message' && String(e.text).includes('First command printed one.'))).toEqual([]);
+  } finally { (f.win as any).__CLF_CONTENT_RECORDER__.stop(); }
+}, 15000);
+
+it('keeps one lifecycle when the shell unmounts the question while its answer stays (#910)', async () => {
+  // #900 showed ChatGPT dropping an exchange's user slot while the answer stayed mounted. turns()
+  // then skipped the whole exchange, so its final and turn_end never arrived and the page stayed
+  // "Working". The answer keeps its exact data-turn-key identity; nothing is inferred from text.
+  const f = fixture(), edit = editing(f);
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  let offered: any, latest: ReturnType<typeof addExchange>, count = 0;
+  const submitted: string[] = [];
+  f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
+    event.preventDefault(); const text = edit.serialize(); submitted.push(text);
+    latest = addExchange(f, ++count, text); edit.box.replaceChildren();
+  });
+  const r = await recorder(f, { desktop_input: m => ({ ok: true, data: m.authorize || m.ack || m.fail ? { ok: true } : { input: offered } }) });
+  const deliver = async (at: number, text: string) => {
+    offered = { id: `88888888-1111-4111-8111-${String(at).padStart(12, '0')}`, owner: `owner-${at}`, text,
+      model: 'gpt-5-6-thinking', reasoningEffort: 'high', purpose: 'user', images: [] };
+    const pending = r.runtime({ type: 'clf-desktop-input', id: offered.id, conversationId: THREAD });
+    await vi.waitFor(() => expect(submitted).toHaveLength(at), { timeout: 5000 });
+    await r.hook.refreshFiber(); r.hook.observe();
+    expect(await pending).toEqual({ ok: true });
+  };
+  try {
+    await deliver(1, 'First request');
+    const started = r.events().filter((e: any) => e.kind === 'turn_start');
+    expect(started).toHaveLength(1);
+
+    // The question unmounts; the answer and its exchange stay.
+    const exchange = f.doc.querySelectorAll('[data-turn-key]')[1]!;
+    exchange.querySelector('[data-content-search-unit-key$=":user"]')!.remove();
+    expect(f.api.turns().at(-1)).toMatchObject({ role: 'assistant', id: latest!.userId });
+    latest!.finish(); await r.hook.refreshFiber(); r.hook.observe(); await r.hook.flush();
+    await vi.waitFor(() => expect(r.events()).toContainEqual(expect.objectContaining({ kind: 'assistant_message', providerMessageId: latest!.answerId, final: true })), { timeout: 3000 });
+    const ended = r.events().filter((e: any) => e.kind === 'turn_end');
+    expect(ended).toEqual([expect.objectContaining({ turnId: started[0].turnId, outcome: 'completed' })]);
+    expect(f.api.generating()).toBe(false);
+
+    // And the next ordinary message is accepted and gets its own lifecycle.
+    await deliver(2, 'Second request');
+    expect(r.events().filter((e: any) => e.kind === 'turn_start')).toHaveLength(2);
+    expect(r.sent.filter(m => m.type === 'desktop_input' && m.fail)).toEqual([]);
+  } finally { (f.win as any).__CLF_CONTENT_RECORDER__.stop(); }
+}, 15000);
+
+it('confirms an app send whose exchange ChatGPT draws without the user slot', async () => {
+  // 2026-10-02, live: a chat opened by Compact & Resume, a Goal helper and a Temporary Chat drew
+  // their first exchange with no user slot. The page model held the exact user message, but no
+  // reader saw one: the Send receipt was never confirmed, no turn opened, and the resumed chat
+  // later sat after a lost answer with nothing watching it.
+  const f = fixture(), edit = editing(f);
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  let offered: any, latest: ReturnType<typeof addExchange>;
+  const submitted: string[] = [];
+  f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
+    event.preventDefault(); const text = edit.serialize(); submitted.push(text);
+    latest = addExchange(f, 1, text, { userSlot: false }); edit.box.replaceChildren();
+  });
+  const r = await recorder(f, { desktop_input: m => ({ ok: true, data: m.authorize || m.ack || m.fail ? { ok: true } : { input: offered } }) });
+  try {
+    offered = { id: '88888888-1111-4111-8111-000000000001', owner: 'owner-1', text: 'Continue the recovery documentation',
+      model: 'gpt-5-6-thinking', reasoningEffort: 'high', purpose: 'user', images: [] };
+    const pending = r.runtime({ type: 'clf-desktop-input', id: offered.id, conversationId: THREAD });
+    await vi.waitFor(() => expect(submitted).toHaveLength(1), { timeout: 5000 });
+    await r.hook.refreshFiber(); r.hook.observe();
+    expect(await pending).toEqual({ ok: true });
+    expect(r.sent.filter(m => m.type === 'desktop_input' && m.ack && m.id === offered.id)).toHaveLength(1);
+    // The user message exists only once MAIN has stamped the exchange, so the turn opens on
+    // the next observation, as the live recorder's own observer does.
+    r.hook.observe(); await r.hook.flush();
+    const started = r.events().filter((e: any) => e.kind === 'turn_start');
+    expect(started).toHaveLength(1);
+    expect(r.events()).toContainEqual(expect.objectContaining({ kind: 'user_message', messageId: latest!.userId }));
+
+    latest!.finish(); await r.hook.refreshFiber(); r.hook.observe(); await r.hook.flush();
+    await vi.waitFor(() => expect(r.events()).toContainEqual(expect.objectContaining({ kind: 'assistant_message', providerMessageId: latest!.answerId, final: true })), { timeout: 3000 });
+    expect(r.events().filter((e: any) => e.kind === 'turn_end')).toEqual([expect.objectContaining({ turnId: started[0].turnId, outcome: 'completed' })]);
+    expect(r.sent.filter(m => m.type === 'desktop_input' && m.fail)).toEqual([]);
+  } finally { (f.win as any).__CLF_CONTENT_RECORDER__.stop(); }
+}, 15000);
+
+it('names no unrendered user message for a stale or foreign stamp', async () => {
+  const f = fixture();
+  const exchange = f.doc.querySelector('[data-turn-key]')!;
+  exchange.querySelector('[data-content-search-unit-key$=":user"]')!.remove();
+  await f.ask();
+  const named = () => f.api.messages().filter((m: any) => m.role === 'user').map((m: any) => m.id);
+  expect(named()).toEqual([USER]);
+  // A stamp that does not belong to this exchange's current scan names nothing.
+  exchange.setAttribute('data-clf-fiber-user', `other-scan:0:${encodeURIComponent(OTHER)}`);
+  expect(named()).toEqual([]);
+});
+
+it('still refuses an exchange whose user slot is ambiguous (#910)', () => {
+  const f = fixture();
+  const exchange = f.doc.querySelector('[data-turn-key]')!;
+  const user = exchange.querySelector('[data-content-search-unit-key$=":user"]')!;
+  user.after(user.cloneNode(true));
+  expect(f.api.turns()).toEqual([]);
+});
+
 it.each([false, true])('bootstraps a shell worker with literal instructions and the exact native conversation (cold=%s)', async cold => {
   const f = fixture(), edit = editing(f), commandId = 'shell-worker-command';
   const options = f.props.modelListConfig;
@@ -872,6 +1425,43 @@ it.each([false, true])('commits a shell resume and records its response before i
   (f.win as any).__CLF_CONTENT_RECORDER__.stop();
 }, 10000);
 
+it('ends a turn it claimed without a Send on the final ChatGPT gave inside the settle window (#1226)', async () => {
+  // 2026-10-09, macOS: no Send receipt, so the turn opened only after Stop had stayed for the
+  // settle window. ChatGPT had already finished: the shell's own exchange held the final before
+  // the answer's slot mounted. That final was filed as history and the turn stayed open until
+  // the ten-minute watchdog.
+  const f = fixture();
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  const r = await recorder(f);
+  let offset = 0;
+  const clock = f.win.Date.now.bind(f.win.Date);
+  vi.spyOn(f.win.Date, 'now').mockImplementation(() => clock() + offset);
+  try {
+    const next = addExchange(f, 1, 'Run one command');
+    const exchange = [...f.doc.querySelectorAll('[data-turn-key]')].at(-1)!;
+    const answer = exchange.querySelector('[data-content-search-unit-key$=":assistant"]')!;
+    const start = exchange.querySelector('[data-chatgpt-agent-turn-start]')!;
+    answer.remove(); start.remove();
+    f.doc.querySelector('button[type="submit"]')!.insertAdjacentHTML('afterend', '<button type="button" data-testid="stop-button" aria-label="Stop streaming"></button>');
+    await r.hook.refreshFiber(); r.hook.observe(); await r.hook.flush();
+
+    // ChatGPT finishes inside the window. Stop lingers and the answer's slot has not mounted.
+    next.entry.turn.status = 'complete';
+    Object.assign(next.entry.turn.items[1]!, { completed: true, content: 'Finished' });
+    await r.hook.refreshFiber();
+    offset += r.hook.TURN_SETTLE_MS;
+    r.hook.observe(); await r.hook.flush();
+    const starts = r.events().filter((event: any) => event.kind === 'turn_start');
+    expect(starts).toHaveLength(1);
+
+    answer.querySelector('[data-markdown-text-style]')!.textContent = 'Finished';
+    exchange.querySelector('[data-content-search-turn-key]')!.append(start, answer);
+    await r.hook.refreshFiber(); r.hook.observe(); await r.hook.flush();
+    expect(r.events().filter((event: any) => event.kind === 'turn_end')).toEqual([
+      expect.objectContaining({ turnId: starts[0].turnId, outcome: 'completed' })]);
+  } finally { (f.win as any).__CLF_CONTENT_RECORDER__.stop(); }
+}, 10000);
+
 it('leaves classic messages readable when quoted markup contains shell-looking attributes', () => {
   const f = fixture(); f.doc.body.innerHTML = '<section data-testid="conversation-turn-1" data-turn="assistant"><div data-message-id="actual" data-message-author-role="assistant"><div class="markdown">real answer<div id="app-shell-sidebar"></div><div data-turn-key="quoted"></div></div></div></section>';
   expect(f.api.turns()).toHaveLength(1); expect(f.api.messages()[0].text).toContain('real answer');
@@ -896,6 +1486,58 @@ it('discovers both native versions, selects exact worker lanes and restores the 
   expect(await f.api.selectModelSettings('future-pro', 'high')).toBe(false);
   expect(f.doc.querySelector('[data-model-picker-view]')).toBeNull();
   expect(f.api.visibleModelSelection()).toEqual({ model: 'future-pro', reasoningEffort: 'pro' });
+});
+it('maps native lane labels over transport effort values (Pro/Extra High lanes)', async () => {
+  const f = fixture();
+  // The live Pro and Extra High lanes report medium/max as transport reasoningEffort;
+  // the picker's own lane label is the offered effort identity.
+  Object.assign(f.selections[0]![0]!, { reasoningEffort: 'medium', sliderLabel: 'Pro', labels: { effort: 'Pro' } });
+  Object.assign(f.selections[0]![1]!, { reasoningEffort: 'max', sliderLabel: 'Extra High', labels: { effort: 'Extra High' } });
+  const models = await f.api.inspectModelSettings();
+  expect(models.find((m: any) => m.id === 'gpt-5-6-thinking')?.efforts).toEqual(['pro', 'xhigh']);
+  expect(models.find((m: any) => m.id === 'future-pro')?.efforts).toEqual(['pro']);
+  expect(await f.api.selectModelSettings('gpt-5-6-thinking', 'xhigh')).toBe(true);
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-5-6-thinking', reasoningEffort: 'xhigh' });
+});
+it('joins one model\'s Instant and thinking lanes into one family, and selects each lane by its effort', async () => {
+  const f = fixture();
+  // ChatGPT's GPT-6 as observed (2026-10-07): two slugs under one name, with distinct efforts.
+  (f.selections[0] as any[]).splice(0, 2,
+    { model: 'gpt-6', modelLabel: 'GPT-6', reasoningEffort: 'none', sliderLabel: 'Instant', labels: { effort: 'Instant' }, powerSettingIndex: 0 },
+    { model: 'gpt-6-thinking', modelLabel: 'GPT-6', reasoningEffort: 'medium', powerSettingIndex: 1 },
+    { model: 'gpt-6-thinking', modelLabel: 'GPT-6', reasoningEffort: 'high', powerSettingIndex: 2 });
+  f.props.selectedLabelCandidate = f.selections[0]![1];
+  const models = await f.api.inspectModelSettings();
+  expect(models.find((m: any) => m.id === 'gpt-6')).toEqual({ id: 'gpt-6', label: 'GPT-6', efforts: ['none', 'medium', 'high'], aliases: ['gpt-6', 'gpt-6-thinking'] });
+  // Each effort still selects its own lane, by the family or by the lane's exact id.
+  expect(await f.api.selectModelSettings('gpt-6', 'none')).toBe(true);
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-6', reasoningEffort: 'none' });
+  expect(await f.api.selectModelSettings('gpt-6', 'high')).toBe(true);
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-6-thinking', reasoningEffort: 'high' });
+  expect(await f.api.selectModelSettings('gpt-6-thinking', 'medium')).toBe(true);
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-6-thinking', reasoningEffort: 'medium' });
+  // Different names never merge.
+  expect(models.map((m: any) => m.id)).toEqual(['gpt-6', 'future-thinking', 'future-pro']);
+});
+it('names a model the shell lists by number alone in full, as the September picker did', async () => {
+  const f = fixture();
+  // The shell labels older models "5.6"; the list reads GPT-6, GPT-5.6, GPT-5.5 alike.
+  for (const lane of f.selections[0]!) lane.modelLabel = '5.6';
+  const models = await f.api.inspectModelSettings();
+  expect(models.find((m: any) => m.id === 'gpt-5-6-thinking')?.label).toBe('GPT-5.6');
+  expect(models.find((m: any) => m.id === 'future-thinking')?.label).toBe('未来モデル');
+});
+it('identifies a Pro shell lane from its execution id when the effort label is localized', async () => {
+  const f = fixture();
+  Object.assign(f.selections[0]![0]!, {
+    model: 'gpt-6-pro', modelLabel: '6 Pro', reasoningEffort: 'medium',
+    sliderLabel: 'LOCALIZED_PRO', labels: { effort: 'LOCALIZED_PRO' }
+  });
+  const models = await f.api.inspectModelSettings();
+  expect(models.find((m: any) => m.id === 'gpt-6-pro')?.efforts).toEqual(['pro']);
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-6-pro', reasoningEffort: 'pro' });
+  expect(await f.api.selectModelSettings('gpt-6-pro', 'pro')).toBe(true);
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-6-pro', reasoningEffort: 'pro' });
 });
 it.each([false, true])('rechecks the cold shell picker owner when its account state hydrates (cancelled=%s)', async cancelled => {
   const f = fixture(), options = f.props.modelListConfig;
@@ -956,4 +1598,61 @@ it('records a native shell conversation and UUID tool origin through the real is
   expect(f.doc.querySelector('[data-turn-key] .clf-stream')).toBeNull();
   expect(JSON.stringify(events())).not.toContain('NEVER_COPY_TOOL_ARGS');
   win.__CLF_CONTENT_RECORDER__.stop();
+});
+it('reports a chat on a model the account no longer lists as unreadable for discovery', async () => {
+  // VM 2026-10-08: a chat still on GPT-5.6 Sol after GPT-6 has no selected version and no effort
+  // lanes. Discovery elected that tab and timed out with picker_unavailable after 15 seconds.
+  const f = fixture();
+  expect(await f.api.modelPickerReadable()).toBe(true);
+  f.versions.forEach(version => { version.selected = false; });
+  f.props.powerSelections = []; f.props.selectedLabelCandidate = { model: 'gpt-5-6', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'medium' };
+  expect(await f.api.modelPickerReadable()).toBe(false);
+  // The Chat/Work toggle swaps the picker before inspection, so it defers to that transition.
+  const toggle = f.doc.createElement('button'); toggle.setAttribute('role', 'radio'); toggle.setAttribute('data-tpp-toggle-value', 'work');
+  f.doc.body.append(toggle);
+  expect(await f.api.modelPickerReadable()).toBe(true);
+});
+it('reads a translated Extra High lane as xhigh, as the English label does', async () => {
+  // German pages label the lanes "Sofort", "Mittel", "Hoch" and "Sehr hoch"; English pages say
+  // "Extra High". Both send max for that lane, so the catalog must not depend on the UI language.
+  const f = fixture();
+  const lanes = [
+    { model: 'gpt-6', modelLabel: 'GPT-6', reasoningEffort: 'none', powerSettingIndex: 0, labels: { effort: 'Sofort' } },
+    { model: 'gpt-6-thinking', modelLabel: 'GPT-6', reasoningEffort: 'medium', powerSettingIndex: 1, labels: { effort: 'Mittel' } },
+    { model: 'gpt-6-thinking', modelLabel: 'GPT-6', reasoningEffort: 'max', powerSettingIndex: 2, labels: { effort: 'Sehr hoch' } }];
+  f.props.powerSelections = lanes; f.props.selectedLabelCandidate = lanes[2]; f.props.selectedPowerSelection = lanes[2];
+  const { picker } = await f.ask('clf-picker-ask');
+  expect(picker.choices.map((c: any) => c.effort)).toEqual(['none', 'medium', 'xhigh']);
+  expect(picker.currentBucket).toBe(2);
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-6-thinking', reasoningEffort: 'xhigh' });
+  lanes[2]!.labels.effort = 'Extra High';
+  expect((await f.ask('clf-picker-ask')).picker.choices[2].effort).toBe('xhigh');
+});
+
+// Measured live 2026-10-11 (VM 141): ChatGPT's shell turns reach the app with stripped request
+// metadata, so app sightings must come from the shell's own mapping, or no connector is ever proven.
+it('reports app sightings for shell turns from the native mapping', async () => {
+  const f = fixture();
+  const { mapping, resultId } = pairedShellCall(f);
+  // ChatGPT stamps the result with its invocation's request id (live data); OTHER is the fixture's.
+  mapping[resultId].message.metadata.request_id = OTHER;
+  mapping[resultId].message.metadata.invoked_resource.resource_uri = '/asdk_app_x1/link_x/read';
+  const turn = (await f.ask()).turns[0];
+  expect(turn.sightings).toEqual([{ requestId: OTHER, appId: 'asdk_app_x1', linkId: 'link_x', appName: 'Chat On Steroids Core' }]);
+  expect(JSON.stringify(turn)).not.toContain('PRIVATE_TOOL_RESULT');
+});
+
+// Measured live 2026-10-11: in a new chat the result row is in ChatGPT's mapping but not among the
+// turn's message ids, so it is found by this turn's own request id instead.
+it('reports an app sighting for a shell result outside the turn\'s message ids, matched by this turn\'s request id', async () => {
+  const f = fixture();
+  const { mapping, resultId } = pairedShellCall(f);
+  mapping[resultId].message.metadata.request_id = OTHER;
+  mapping[resultId].message.metadata.invoked_resource.resource_uri = '/asdk_app_x1/link_x/read';
+  f.entry.turn.messageIds = f.entry.turn.messageIds.map((id: string) => id === resultId ? CALL : id);
+  mapping['99999999-0000-4000-8000-000000000000'] = { id: '99999999-0000-4000-8000-000000000000', message: { id: '99999999-0000-4000-8000-000000000000',
+    author: { role: 'tool', name: 'api_tool.call_tool' }, recipient: 'all',
+    metadata: { request_id: 'another-turns-request', invoked_resource: { app_name: 'Gmail', resource_uri: '/asdk_app_gmail/link_g/search' } } } };
+  const turn = (await f.ask()).turns[0];
+  expect(turn.sightings).toEqual([{ requestId: OTHER, appId: 'asdk_app_x1', linkId: 'link_x', appName: 'Chat On Steroids Core' }]);
 });

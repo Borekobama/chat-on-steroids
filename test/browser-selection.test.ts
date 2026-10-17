@@ -61,3 +61,19 @@ it('finds Brave installations on each platform without mixing in Chrome or Edge'
   expect(linux).toContain('/snap/bin/brave');
   expect(linux.every(candidate => !/chrome|chromium|edge/.test(candidate))).toBe(true);
 });
+
+
+it('keeps Helium selected and never substitutes Chrome on macOS', async () => {
+  const config = defaultConfig();
+  await saveConfig({ ...config, ui: { ...config.ui, chatBrowser: 'helium' } });
+  expect((await loadConfig()).ui.chatBrowser).toBe('helium');
+  const candidates = preferredBrowserCandidates('darwin', {}, '/home', 'helium');
+  expect(candidates).toContain('/Applications/Helium.app/Contents/MacOS/Helium');
+  expect(candidates.every(candidate => candidate.includes('Helium'))).toBe(true);
+  const launch = vi.fn();
+  const opened = await openInPreferredBrowser('https://chatgpt.com/', {
+    platform: 'darwin', env: {}, home: '/home', usable: () => true, launch
+  });
+  expect(opened).toBe('/Applications/Helium.app/Contents/MacOS/Helium');
+  expect(launch).toHaveBeenCalled();
+});

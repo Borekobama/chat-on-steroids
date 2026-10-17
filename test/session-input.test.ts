@@ -8,7 +8,8 @@ import { flushDurable, initDurableStore, readDurable, resetDurableForTests, writ
 import {
   fileSilenceInput, deferSilenceInput, revokeSilenceInputs, pendingQueuedPickups, inputBeforeGoal, inputArgs, acknowledgeBrowserInput, cancelInput, claimBrowserInput, completeBrowserDecision, enqueueInput,
   failBrowserInput, listInputs, offerToolInput as offerToolInputBatch, acknowledgeToolInput, pendingBrowserInputs, requestBrowserDecision, resetInputForTests, configureInputDelivery,
-  authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy
+  authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy, retryUnclaimedInput,
+  noteInputStartupError, fileRotationInput
 } from '../src/main/session/input.js';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import { noteChatOrigin } from '../src/main/session/recorder.js';
@@ -20,7 +21,7 @@ const offerToolInput = async (...args: Parameters<typeof offerToolInputBatch>) =
 vi.mock('../src/main/session/recorder.js', () => ({ noteChatOrigin: vi.fn(async () => undefined) }));
 
 const openings = vi.hoisted(() => new Map<string, { id: string; conversationId: string | null; origin: { kind: string } }>());
-const binding = vi.hoisted(() => ({ origin: 'desktop', conversationId: 'conversation-a', blocked: false, recorded: true, activeTurnId: null as string | null, lastToolCallAt: null as number | null, finishEnabled: true, goalEnabled: false, finishReleased: false, model: 'gpt-6-astra', leadMinutes: 5, impulseMinutes: 0, end: null as null | { kind: string; outcome: string; reason?: string; turnId: string; time: number; seq?: number } }));
+const binding = vi.hoisted(() => ({ origin: 'desktop', conversationId: 'conversation-a', blocked: false, recorded: true, activeTurnId: null as string | null, lastToolCallAt: null as number | null, finishEnabled: true, goalEnabled: false, finishReleased: false, recoveryAllowed: true, model: 'gpt-6-astra', leadMinutes: 5, impulseMinutes: 0, end: null as null | { kind: string; outcome: string; reason?: string; turnId: string; time: number; seq?: number } }));
 vi.mock('../src/main/session/store.js', () => ({
   sessionsRoot: () => path.join(directory, 'sessions'),
   listUsageSessions: vi.fn(async () => []),
@@ -38,7 +39,11 @@ vi.mock('../src/main/session/store.js', () => ({
     selectedModel: { conversationId: id === 'session-two' ? 'conversation-b' : binding.conversationId, model: binding.model } })),
   findSessionByConversation: vi.fn(async (id: string) => [...openings.values()].find(row => row.conversationId === id) ?? (binding.recorded && id === binding.conversationId ? { id: 'session-one', conversationId: id } : null))
 }));
-vi.mock('../src/main/config.js', () => ({ getConfig: () => ({ ui: { finishTool: binding.finishEnabled, finishAction: 'goal', finishLeadMinutes: binding.leadMinutes }, goal: { enabled: binding.goalEnabled, mode: 'goal', impulseMinutes: binding.impulseMinutes } }) }));
+vi.mock('../src/main/config.js', () => ({ getConfig: () => ({
+  ui: { finishTool: binding.finishEnabled, finishAction: 'goal', finishLeadMinutes: binding.leadMinutes },
+  goal: { enabled: binding.goalEnabled, mode: 'goal', impulseMinutes: binding.impulseMinutes },
+  multiAgent: { strictChatAllowlist: false }
+}) }));
 vi.mock('../src/main/session/blocked-chats.js', () => ({ isChatBlocked: () => binding.blocked }));
 let directory: string;
 let now: number;
@@ -61,7 +66,7 @@ beforeEach(async () => {
   resetInputForTests();
   automate.mockReset();
   changed.mockReset();
-  configureInputDelivery({ applyAutomation: automate, changed });
+  configureInputDelivery({ applyAutomation: automate, changed, recoveryAllowed: () => binding.recoveryAllowed });
   resetDurableForTests();
   directory = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-input-'));
   initDurableStore(directory);
@@ -72,6 +77,7 @@ beforeEach(async () => {
   binding.activeTurnId = null;
   binding.lastToolCallAt = null;
   binding.finishEnabled = true; binding.goalEnabled = false; binding.finishReleased = false; binding.model = 'gpt-6-astra'; binding.leadMinutes = 5; binding.impulseMinutes = 0;
+  binding.recoveryAllowed = true;
   binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 0 };
   now = 1000;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
@@ -84,6 +90,143 @@ afterEach(async () => {
 });
 
 describe('durable user input ownership', () => {
+  it.each([
+    ['held for Setup', 'Message queued. Finish Setup to send: Enter a tunnel ID that looks like tunnel_ followed by 32 hex characters.', 'queued'],
+    ['held after a failed browser start', 'Message queued. Browser startup failed: Chrome refused startup', 'queued'],
+    ['simply never picked up', null, 'failed']
+  ] as const)('applies the 60-second browser pickup deadline only to a message the app is not holding (%s)', async (_case, held, state) => {
+    // Seen on Windows without Setup: the follow-up said "Message queued. Finish Setup to send" and
+    // a minute later failed as "the browser did not pick up this message", losing the queue entry
+    // and naming the wrong cause.
+    binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    expect(row.transportIntent).toBe('browser');
+    if (held) await noteInputStartupError(row.id, held);
+    now += 60_001;
+    resetInputForTests();
+    const after = (await listInputs()).find(entry => entry.id === row.id);
+    expect(after?.state).toBe(state);
+    if (held) expect(after?.error).toBe(held);
+    else expect(after?.error).toContain('did not pick up this message');
+  });
+  it('requeues one proven pre-Send browser pickup timeout on the same row, then stops retrying', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    expect(row.transportIntent).toBe('browser');
+    now += 60_001;
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed', pickupFailedAt: now,
+      error: 'Not sent: the browser did not pick up this message within 60 seconds.' });
+    now += 120_000;
+    const retried = await retryUnclaimedInput(row.id);
+    expect(retried).toMatchObject({ id: row.id, state: 'queued', pickupRetryCount: 1 });
+    expect(retried).not.toHaveProperty('sendAuthorizedAt');
+    expect(retried).not.toHaveProperty('deliveredAt');
+    now += 60_001;
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ id: row.id, state: 'failed', pickupRetryCount: 1 });
+    now += 120_000;
+    expect(await retryUnclaimedInput(row.id)).toBeNull();
+  });
+  it('does not retry a pickup timeout after the user dismissed its browser chat', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    now += 60_001;
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed',
+      error: 'Not sent: the browser did not pick up this message within 60 seconds.' });
+
+    // retryUnclaimedBrowserInputs only opens the chat after retryUnclaimedInput returns a row.
+    // A manual browser dismissal must therefore leave this same row failed and produce no wake.
+    openings.set(sessionId, Object.assign({ id: sessionId, conversationId: binding.conversationId,
+      origin: { kind: binding.origin } }, { browserRecoveryDismissedAt: now }));
+    now += 120_000;
+    expect(await retryUnclaimedInput(row.id)).toBeNull();
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed' });
+    expect((await listInputs()).find(entry => entry.id === row.id)).not.toHaveProperty('pickupRetryCount');
+  });
+  it('does not requeue a never-claimed input after Automatic Continue is turned off', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    now += 60_001;
+    await listInputs();
+    now += 120_000;
+    binding.recoveryAllowed = false;
+    expect(await retryUnclaimedInput(row.id)).toBeNull();
+    const retained = (await listInputs()).find(entry => entry.id === row.id);
+    expect(retained?.state).toBe('failed');
+    expect(retained?.pickupRetryCount).toBeUndefined();
+  });
+  it('never auto-retries an authorized or legacy unmarked pickup failure', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const authorized = await enqueueInput(input());
+    now += 60_001;
+    await listInputs();
+    const rows = await listInputs();
+    await writeDurableNow('session-input', rows.map(row => row.id === authorized.id
+      ? { ...row, state: 'failed' as const, pickupFailedAt: now - 120_000, sendAuthorizedAt: now - 30_000 }
+      : row));
+    resetInputForTests();
+    now += 120_000;
+    expect(await retryUnclaimedInput(authorized.id)).toBeNull();
+    const legacy = await enqueueInput(input());
+    now += 60_001;
+    await listInputs();
+    const legacyRows = await listInputs();
+    await writeDurableNow('session-input', legacyRows.map(row => row.id === legacy.id
+      ? { ...row, state: 'failed' as const, pickupFailedAt: undefined, error: 'Not sent: the browser did not pick up this message within 60 seconds.' }
+      : row));
+    resetInputForTests();
+    now += 120_000;
+    expect(await retryUnclaimedInput(legacy.id)).toBeNull();
+  });
+  it('gives a released hold its full 60 seconds for the browser to pick it up', async () => {
+    binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    await noteInputStartupError(row.id, 'Message queued. Finish Setup to send: Add a folder before connecting.');
+    now += 10 * 60_000; // Setup takes a while.
+    await noteInputStartupError(row.id, null); // Setup done: the browser may take it now.
+    now += 59_000;
+    resetInputForTests();
+    expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe('queued');
+    now += 2_000;
+    resetInputForTests();
+    expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe('failed');
+  });
+  it('marks the person\'s own request for a picture to go out without the Core mention, and nothing else', async () => {
+    binding.finishEnabled = false;
+    const claim = async (args: Partial<InputArgs>) => {
+      const row = await enqueueInput(input(args));
+      const claimed = await claimBrowserInput(row.id, 'page', binding.conversationId);
+      await acknowledgeBrowserInput(row.id, 'page', binding.conversationId, `m-${row.id}`).catch(() => undefined);
+      return claimed as (InputEntry & { coreMention?: false }) | null;
+    };
+    expect(await claim({ text: 'Create an image of a fox in a misty forest' })).toMatchObject({ coreMention: false });
+    expect(await claim({ text: 'Fix the failing test in src/app.ts' })).not.toHaveProperty('coreMention');
+    // Generated openings and workers keep the mention.
+    expect(await claim({ text: 'Create an image of a fox', authoredSource: 'objective' })).not.toHaveProperty('coreMention');
+    binding.origin = 'worker';
+    try { expect(await claim({ text: 'Create an image of a fox' })).not.toHaveProperty('coreMention'); }
+    finally { binding.origin = 'desktop'; }
+    // "make it brighter" changes a picture only right after ChatGPT made one.
+    expect(await claim({ text: 'make it brighter' })).not.toHaveProperty('coreMention');
+    const store = await import('../src/main/session/store.js');
+    const original = vi.mocked(store.readRecentEvents).getMockImplementation()!;
+    vi.mocked(store.readRecentEvents).mockImplementation(async (id, count, options) => options?.kinds?.includes('native_image') ? [
+      { kind: 'user_message', seq: 1, time: now, source: 'extension', messageId: 'q', message: { text: 'draw a fox', chars: 10, truncated: false } },
+      { kind: 'native_image', seq: 2, time: now, source: 'extension', messageId: 'a', providerStatus: 'finished_successfully' }
+    ] as never : original(id, count, options));
+    try { expect(await claim({ text: 'make it brighter' })).toMatchObject({ coreMention: false }); }
+    finally { vi.mocked(store.readRecentEvents).mockImplementation(original); }
+    // One failed edit in between ("image generation is unavailable") still leaves the picture current.
+    const turns = (...kinds: string[]) => vi.mocked(store.readRecentEvents).mockImplementation(async (id, count, options) => options?.kinds?.includes('native_image')
+      ? kinds.map((kind, seq) => kind === 'q' ? { kind: 'user_message', seq, time: now, source: 'extension', messageId: `q${seq}`, message: { text: 'q', chars: 1, truncated: false } }
+        : { kind: 'native_image', seq, time: now, source: 'extension', messageId: `a${seq}`, providerStatus: 'finished_successfully' }) as never
+      : original(id, count, options));
+    try {
+      turns('q', 'image', 'q');
+      expect(await claim({ text: 'make the boat red' })).toMatchObject({ coreMention: false });
+      turns('q', 'image', 'q', 'q');
+      expect(await claim({ text: 'make the boat red' })).not.toHaveProperty('coreMention');
+    } finally { vi.mocked(store.readRecentEvents).mockImplementation(original); }
+  });
   it('preserves messages beyond the former composer limit through admission, restart and browser claim', async () => {
     binding.finishEnabled = false;
     const text = 'Long user request. '.repeat(2000);
@@ -100,6 +243,72 @@ describe('durable user input ownership', () => {
     await expect(editQueuedInput(row.id, 'x'.repeat(96_001))).rejects.toThrow();
     expect((await listInputs())[0]?.text).toBe(text);
     expect(inputArgs.safeParse(input({ text: 'x'.repeat(96_001) })).success).toBe(false);
+  });
+  it('sends a direct message once more when the page proves ChatGPT did not take the clicked Send', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    const direct = await enqueueInput(input());
+    expect(await claimBrowserInput(direct.id, 'native-page', binding.conversationId, true)).not.toBeNull();
+    expect(await authorizeBrowserInput(direct.id, 'native-page', binding.conversationId)).toBe(true);
+    // Clicked in the second the turn ended: ChatGPT kept the text in its composer (VM 141, 2026-10-09).
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'plain-turn', time: 1001 };
+    expect(await failBrowserInput(direct.id, 'native-page', 'Native Send did not take the message.')).toBe(true);
+    expect((await listInputs()).find(row => row.id === direct.id)).toMatchObject({ state: 'queued', owner: null, notTakenRetries: 1 });
+    expect((await listInputs()).find(row => row.id === direct.id)?.sendAuthorizedAt).toBeUndefined();
+    expect(await pendingBrowserInputs()).toEqual([expect.objectContaining({ id: direct.id })]);
+    // A second refusal is reported, never retried forever.
+    expect(await claimBrowserInput(direct.id, 'native-page', binding.conversationId, true)).not.toBeNull();
+    expect(await authorizeBrowserInput(direct.id, 'native-page', binding.conversationId)).toBe(true);
+    expect(await failBrowserInput(direct.id, 'native-page', 'Native Send did not take the message.')).toBe(true);
+    expect((await listInputs()).find(row => row.id === direct.id)).toMatchObject({ state: 'failed', error: 'Not sent: ChatGPT did not accept the message.' });
+    expect(await pendingBrowserInputs()).toEqual([]);
+  });
+  // #1402: turns past ~35 minutes break; a native send into the running turn ends it as interrupted
+  // and continues in a fresh one, a command in flight keeping its result (measured 2026-10-09).
+  it('files one rotation into the running turn as an automatic message, only when nothing else waits', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    expect(await fileRotationInput(sessionId, 'other-turn')).toBeNull();
+    const row = await fileRotationInput(sessionId, 'plain-turn');
+    expect(row).toMatchObject({ purpose: 'rotation', authoredSource: 'none', mode: 'auto', transportIntent: 'browser',
+      directTurn: { id: 'plain-turn' }, conversationId: binding.conversationId, state: 'queued' });
+    expect(row!.text).toMatch(/continue/i);
+    // One at a time: a second rotation, or one beside another pending message, is not filed.
+    expect(await fileRotationInput(sessionId, 'plain-turn')).toBeNull();
+    // A message of the user's own replaces a rotation that was never handed out.
+    const own = await enqueueInput(input({ text: 'Also check the tests' }));
+    expect((await listInputs()).find(entry => entry.id === row!.id)).toMatchObject({ state: 'cancelled' });
+    expect(own.state).toBe('queued');
+  });
+  it('files no rotation for a Pro turn or a blocked chat', async () => {
+    binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    binding.model = 'gpt-5.6-pro';
+    expect(await fileRotationInput(sessionId, 'plain-turn')).toBeNull();
+    binding.model = 'gpt-5.6-sol'; binding.blocked = true;
+    expect(await fileRotationInput(sessionId, 'plain-turn')).toBeNull();
+  });
+  it('drops a rotation the page could not take, instead of keeping it for after the turn', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    const row = await fileRotationInput(sessionId, 'plain-turn');
+    expect(await claimBrowserInput(row!.id, 'native-page', binding.conversationId, true)).not.toBeNull();
+    now += 60_001;
+    const after = (await listInputs()).find(entry => entry.id === row!.id);
+    expect(after?.state).not.toBe('queued');
+    expect(after?.mode).toBe('auto');
+  });
+
+  it('still never replays a clicked Send whose result the page could not prove', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    const direct = await enqueueInput(input());
+    expect(await claimBrowserInput(direct.id, 'native-page', binding.conversationId, true)).not.toBeNull();
+    expect(await authorizeBrowserInput(direct.id, 'native-page', binding.conversationId)).toBe(true);
+    expect(await failBrowserInput(direct.id, 'native-page', 'Native Send receipt was not confirmed.')).toBe(true);
+    expect((await listInputs()).find(row => row.id === direct.id)).toMatchObject({ state: 'cancelled' });
+    expect(await pendingBrowserInputs()).toEqual([]);
   });
   it('sends a tool-free non-Pro correction through one durable browser claim and native receipt', async () => {
     binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
@@ -120,8 +329,41 @@ describe('durable user input ownership', () => {
     expect((await listInputs())[0]).toMatchObject({ state: 'sent', messageId: 'native-message' });
   });
 
-  it('queues an explicit injection before the first tool for that exact turn without browser fallback', async () => {
+  // A message inside a tool result never reached the model on GPT-5.6/6 (#1231): Inject now goes
+  // through ChatGPT's composer whenever the running turn takes a message, tool calls or not.
+  it('sends an explicit Inject now into the running turn through the composer, tool calls or not', async () => {
     binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    binding.lastToolCallAt = 950;
+    const row = await enqueueInput(input({ delivery: 'tool' }));
+    expect(row).toMatchObject({ state: 'queued', transportIntent: 'browser', directTurn: { id: 'plain-turn' } });
+    expect(row.delivery).toBeUndefined();
+    expect(row.toolTurnId).toBeUndefined();
+    expect(await pendingBrowserInputs()).toEqual([expect.objectContaining({ id: row.id, directTurn: row.directTurn })]);
+    expect(await offerToolInput(sessionId, binding.conversationId, 'later-call', now)).toEqual([]);
+  });
+
+  // 2026-10-12, GPT-6 Thinking: the page kept closing a turn whose request kept calling tools, and four
+  // messages in a row were folded into tool results the user never saw and the model did not act on.
+  it.each([false, true])('never folds your text into a tool result on a model that is not Pro, even without a direct turn (explicit Inject now: %s)', async explicit => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    // The newest boundary is an end the page reported early: there is no direct turn to join.
+    binding.end = { kind: 'turn_end', outcome: 'stopped', turnId: 'plain-turn', time: 900 };
+    const row = await enqueueInput(input({ text: 'Use the reference code', ...(explicit ? { delivery: 'tool' as const } : {}) }));
+    expect(row).toMatchObject({ state: 'queued' });
+    expect(row.directTurn).toBeUndefined();
+    expect(row.delivery).toBeUndefined();
+    expect(row.toolTurnId).toBeUndefined();
+    expect(row.transportIntent).not.toBe('tool');
+    expect(await offerToolInput(sessionId, binding.conversationId, 'busy-call', now)).toEqual([]);
+    expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe('queued');
+    // Once the turn is over, the browser sends it through ChatGPT's composer.
+    binding.activeTurnId = null;
+    expect((await pendingBrowserInputs()).map(entry => entry.id)).toContain(row.id);
+  });
+
+  it('keeps an explicit injection on a Pro turn in its tool result without browser fallback', async () => {
+    binding.model = 'gpt-5.6-pro'; binding.activeTurnId = 'plain-turn';
     binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
     binding.lastToolCallAt = 800;
     const row = await enqueueInput(input({ delivery: 'tool' }));
@@ -136,7 +378,7 @@ describe('durable user input ownership', () => {
   });
 
   it('fails an explicit injection visibly when its exact turn ends without a tool', async () => {
-    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.model = 'gpt-5.6-pro'; binding.activeTurnId = 'plain-turn';
     binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
     const row = await enqueueInput(input({ delivery: 'tool' }));
     resetInputForTests();
@@ -153,7 +395,7 @@ describe('durable user input ownership', () => {
   });
 
   it('does not leak a restarted explicit injection into a newer inactive turn', async () => {
-    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'original-turn';
+    binding.model = 'gpt-5.6-pro'; binding.activeTurnId = 'original-turn';
     binding.end = { kind: 'turn_start', outcome: '', turnId: 'original-turn', time: 900 };
     const row = await enqueueInput(input({ delivery: 'tool' }));
     resetInputForTests();
@@ -177,28 +419,36 @@ describe('durable user input ownership', () => {
     expect(await sessionInputPolicy(sessionId, { exact: true, possible: true, model })).toMatchObject({ canInject: true, directTurn: null });
   });
 
-  it.each(['tool', 'turn', 'rebind', 'blocked'])('revokes an unsubmitted direct correction after %s changes', async change => {
+  it('keeps an unsubmitted direct correction when its turn calls a tool', async () => {
     binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
     binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
     const direct = await enqueueInput(input());
     await claimBrowserInput(direct.id, 'native-page', binding.conversationId, true);
-    if (change === 'tool') binding.lastToolCallAt = 950;
+    binding.lastToolCallAt = 950;
+    expect(await authorizeBrowserInput(direct.id, 'native-page', 'conversation-a')).toBe(true);
+  });
+
+  it.each(['turn', 'rebind', 'blocked'])('revokes an unsubmitted direct correction after %s changes', async change => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    const direct = await enqueueInput(input());
+    await claimBrowserInput(direct.id, 'native-page', binding.conversationId, true);
     if (change === 'turn') { binding.activeTurnId = 'new-turn'; binding.end = { ...binding.end, turnId: 'new-turn', time: 1001 }; }
     if (change === 'rebind') binding.conversationId = 'conversation-b';
     if (change === 'blocked') binding.blocked = true;
     expect(await authorizeBrowserInput(direct.id, 'native-page', 'conversation-a')).toBe(false);
   });
 
-  it('switches at the first running MCP call, retains injection afterward, and resets on the next turn', async () => {
+  it('keeps direct delivery through the turn\'s running and finished MCP calls, and moves to the next turn', async () => {
     binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
     binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
     const context: CallContext = { startedAt: 950, transportKey: null, agent: null, outcome: null,
       caller: { conversationId: binding.conversationId, requestId: 'first-call', transportKey: null }, evidence: emptyEvidence() };
     await trackInFlight(context, async () => {
-      expect(await sessionInputPolicy(sessionId)).toMatchObject({ canInject: true, directTurn: null });
+      expect(await sessionInputPolicy(sessionId)).toMatchObject({ canInject: false, directTurn: { id: 'plain-turn' } });
       binding.lastToolCallAt = 950;
     });
-    expect(await sessionInputPolicy(sessionId)).toMatchObject({ canInject: true, directTurn: null });
+    expect(await sessionInputPolicy(sessionId)).toMatchObject({ canInject: false, directTurn: { id: 'plain-turn' } });
     binding.activeTurnId = 'next-turn'; binding.end = { ...binding.end, turnId: 'next-turn', time: 1001 };
     expect(await sessionInputPolicy(sessionId)).toMatchObject({ canInject: false, directTurn: { id: 'next-turn' } });
     const after = await enqueueInput(input({ mode: 'after-turn' }));
@@ -250,7 +500,8 @@ describe('durable user input ownership', () => {
     if (condition === 'helper' || condition === 'worker') binding.origin = condition;
     await enqueueInput(input());
     const result = await offerToolInputBatch(sessionId, binding.conversationId, 'ordinary-tool', now, true);
-    expect(result.messages).toHaveLength(1);
+    // On a model that is not Pro your text waits for the composer instead of a tool result (#1231).
+    expect(result.messages).toHaveLength(condition === 'other-model' ? 0 : 1);
     expect(result.reminder).toBe('');
   });
 
@@ -460,6 +711,27 @@ describe('durable user input ownership', () => {
     const durable = JSON.stringify(await readDurable('session-input'));
     expect(durable).not.toContain('PRIVATE');
     expect(durable).toContain('temporary-planner');
+  });
+  // #1471: on a Free plan ChatGPT took the helper prompt and showed "message too long" instead of
+  // answering. Goal can only learn the size from a prompt that was sent and never answered.
+  it('tells the caller when a helper prompt ChatGPT took is abandoned unanswered, and only then', async () => {
+    configureInputDelivery({ applyAutomation: automate, changed, wakeDecision: vi.fn(async () => undefined) });
+    const sent = new AbortController(), sentUnanswered = vi.fn();
+    const answer = requestBrowserDecision('TAKEN BUT UNANSWERED', sent.signal, { lifetime: 'temporary-planner', onSentUnanswered: sentUnanswered });
+    await vi.waitFor(async () => expect(await pendingBrowserInputs()).toHaveLength(1));
+    const row = (await listInputs()).find(entry => entry.text === 'TAKEN BUT UNANSWERED')!;
+    await claimBrowserInput(row.id, 'temporary-page', null);
+    expect(await acknowledgeBrowserInput(row.id, 'temporary-page', null)).toBe(true);
+    sent.abort();
+    await expect(answer).rejects.toThrow();
+    expect(sentUnanswered).toHaveBeenCalledTimes(1);
+
+    const unsent = new AbortController(), unsentUnanswered = vi.fn();
+    const never = requestBrowserDecision('NEVER SENT', unsent.signal, { lifetime: 'temporary-planner', onSentUnanswered: unsentUnanswered });
+    await vi.waitFor(async () => expect((await listInputs()).some(entry => entry.text === 'NEVER SENT')).toBe(true));
+    unsent.abort();
+    await expect(never).rejects.toThrow();
+    expect(unsentUnanswered).not.toHaveBeenCalled();
   });
   it('retains the opening Loop delivery preference across restart, Off and the exact send receipt', async () => {
     const entry = await enqueueInput(input({ sessionId: null, automation: 'loop', loopAfterTurn: true }));
@@ -929,12 +1201,12 @@ describe('browser decision lifetime', () => {
     expect(await claimBrowserInput(entry.id, 'fresh-marker-document', null)).toMatchObject({ id: entry.id, state: 'browser' });
   });
   it('requires a deliberate exact-source retry and never revives the previous owner', async () => {
-    const controller = new AbortController();
-    const first = requestBrowserDecision('Choose', controller.signal, { sourceSessionId: sessionId });
+    const first = requestBrowserDecision('Choose', new AbortController().signal, { sourceSessionId: sessionId });
     const rejected = expect(first).rejects.toThrow('cancelled');
     const row = (await listInputs())[0]!;
     await claimBrowserInput(row.id, 'old-document', null);
-    controller.abort(); await rejected;
+    // Only a person's cancellation of a claimed helper pauses it for a deliberate retry.
+    expect(await cancelInput(row.id)).toBe(true); await rejected;
     expect(await pausedBrowserHelpers()).toEqual([{ id: row.id, sourceSessionId: sessionId }]);
     expect(await authorizeBrowserHelperRetry(row.id, 'wrong-source')).toBe(false);
     vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('disk busy'));
@@ -967,18 +1239,53 @@ describe('browser decision lifetime', () => {
     expect(await completeBrowserDecision(row.id, 'helper', 'reply', 'helper-conversation')).toBe(true);
     await expect(answer).resolves.toBe('reply');
   });
-  it('blocks duplicate source helpers and new tabs after an ambiguous fresh cancellation', async () => {
-    const controller = new AbortController();
-    const answer = requestBrowserDecision('Choose', controller.signal, { sourceSessionId: sessionId });
+  it('blocks a duplicate helper while one runs, and after a person cancelled a claimed one', async () => {
+    const answer = requestBrowserDecision('Choose', new AbortController().signal, { sourceSessionId: sessionId });
     const rejected = expect(answer).rejects.toThrow('goal_browser_cancelled');
     const row = (await listInputs())[0]!;
     await expect(requestBrowserDecision('Again', new AbortController().signal, { sourceSessionId: sessionId })).rejects.toThrow('goal_browser_busy');
     await claimBrowserInput(row.id, 'document', null);
-    controller.abort();
+    expect(await cancelInput(row.id)).toBe(true);
     await rejected;
     await expect(requestBrowserDecision('Retry', new AbortController().signal, { sourceSessionId: sessionId })).rejects.toThrow('goal_browser_send_unconfirmed');
     expect(await listInputs()).toHaveLength(1);
   });
+  it('starts the next helper on its own after the app cancelled a claimed one (user decision 2026-10-09)', async () => {
+    // VM 2026-10-09: a new turn superseded a claimed Loop helper, and every later decision failed
+    // with "Helper delivery was not confirmed" until someone pressed "Start a new helper".
+    const controller = new AbortController();
+    const answer = requestBrowserDecision('Choose', controller.signal, { sourceSessionId: sessionId });
+    const rejected = expect(answer).rejects.toThrow('goal_browser_cancelled');
+    const row = (await listInputs())[0]!;
+    await claimBrowserInput(row.id, 'document', null);
+    controller.abort();
+    await rejected;
+    expect(await pausedBrowserHelpers()).toEqual([]);
+    const next = requestBrowserDecision('Retry', new AbortController().signal, { sourceSessionId: sessionId });
+    const fresh = (await listInputs()).find(entry => entry.state === 'queued')!;
+    expect(fresh.id).not.toBe(row.id);
+    await claimBrowserInput(fresh.id, 'new-document', null);
+    expect(await completeBrowserDecision(fresh.id, 'new-document', 'accepted', 'helper-new-chat')).toBe(true);
+    await expect(next).resolves.toBe('accepted');
+  });
+  it('lets a source retry after a confirmed temporary helper send timed out', async () => {
+    // 2026-10-02, live: a Temporary Chat helper confirmed its prompt, its answer was never taken,
+    // and the draft timed out. The retry was then refused as "could not confirm whether ChatGPT
+    // received the helper prompt" although it had been confirmed, and Goal stopped for good.
+    // Only a cancellation before any receipt is ambiguous enough to block a second helper.
+    const controller = new AbortController();
+    const answer = requestBrowserDecision('Choose', controller.signal, { sourceSessionId: sessionId, lifetime: 'temporary-planner' });
+    const rejected = expect(answer).rejects.toThrow('goal_browser_cancelled');
+    const row = (await listInputs())[0]!;
+    expect(await claimBrowserInput(row.id, 'document', null)).not.toBeNull();
+    expect(await acknowledgeBrowserInput(row.id, 'document', null, 'helper-user-message')).toBe(true);
+    controller.abort();
+    await rejected;
+    const retry = requestBrowserDecision('Retry', new AbortController().signal, { sourceSessionId: sessionId, lifetime: 'temporary-planner' });
+    void retry.catch(() => undefined);
+    await vi.waitFor(async () => expect((await listInputs()).filter(entry => entry.state === 'queued')).toHaveLength(1));
+  });
+
   it('accepts only its exact claimant answer, with idempotent send ACK', async () => {
     const controller = new AbortController();
     const answer = requestBrowserDecision('Choose one', controller.signal);
@@ -1373,14 +1680,17 @@ describe('Astra delivery boundaries and stacked direct input', () => {
     active = false;
     expect(await authorizeBrowserInput(row.id, 'page', binding.conversationId)).toBe(true);
   });
-  it.each([null, { kind: 'turn_end', outcome: 'unknown', turnId: 'unknown', time: 1000 }])('requires confirmed terminal evidence for an existing Astra chat (%j)', async end => {
+  it.each([null, { kind: 'turn_end', outcome: 'unknown', turnId: 'unknown', time: 1000 }])('delivers explicit input in an idle adopted Astra chat without manufacturing completion (%j)', async end => {
     binding.end = end;
+    const checkpoint = await enqueueInput(input({ mode: 'after-turn', text: 'Automatic checkpoint' }));
     const row = await enqueueInput(input());
-    expect(await claimBrowserInput(row.id, 'page', binding.conversationId)).toBeNull();
-    expect(await pendingBrowserInputs()).toEqual([]);
-    await cancelInput(row.id);
-    const initial = await enqueueInput(input({ sessionId: null, model: 'gpt-6-astra' }));
-    expect(await claimBrowserInput(initial.id, 'fresh', null)).not.toBeNull();
+    expect(await sessionInputPolicy(sessionId)).toMatchObject({ browserAllowed: true, settled: false });
+    expect((await pendingBrowserInputs()).map(entry => entry.id)).toEqual([row.id]);
+    resetInputForTests();
+    expect(await claimBrowserInput(row.id, 'page', binding.conversationId, true)).not.toBeNull();
+    expect(await authorizeBrowserInput(row.id, 'page', binding.conversationId)).toBe(true);
+    expect(await claimBrowserInput(checkpoint.id, 'page', binding.conversationId)).toBeNull();
+    expect((await listInputs()).find(entry => entry.id === checkpoint.id)?.state).toBe('queued');
   });
   it('retains non-Astra browser behavior with unknown terminal evidence', async () => {
     binding.model = 'gpt-5.6-sol'; binding.end = null;
@@ -1666,6 +1976,14 @@ describe('one silence delivery for a correction and its next checkpoint', () => 
     now = listenUntil;
     return { head, later, correction };
   }
+
+  it('keeps the Core mention on a picture request that goes out together with a queued checkpoint', async () => {
+    // The combined message also carries the next instruction, which may need the app.
+    const { correction } = await bundle({ text: 'Create an image of a red cube' });
+    const claim = await claimBrowserInput(correction.id, 'first-page', binding.conversationId, true);
+    expect(claim?.text).toBe('Create an image of a red cube\n\nNext queued instruction:\nCheck geometry');
+    expect(claim).not.toHaveProperty('coreMention');
+  });
 
   it('claims only the next checkpoint, restores exact bytes, and records one combined native receipt', async () => {
     const { head, later, correction } = await bundle();

@@ -16,20 +16,20 @@ const handlers = new Map<string, Handler>();
 vi.mock('electron', () => ({
   ipcMain: { handle: (name: string, handler: Handler) => handlers.set(name, handler), removeHandler: (name: string) => handlers.delete(name) },
   BrowserWindow: class {}, clipboard: {}, dialog: {}, shell: {}, nativeTheme: { themeSource: 'system' },
-  app: { on: vi.fn(), getPath: () => '', getVersion: () => '0.0.0', getAppPath: () => process.cwd(), isPackaged: false },
+  app: { on: vi.fn(), once: vi.fn(), getPath: () => '', getVersion: () => '0.0.0', getAppPath: () => process.cwd(), isPackaged: false },
   safeStorage: {
     isAsyncEncryptionAvailable: async () => true, getSelectedStorageBackend: () => 'gnome_libsecret',
     encryptStringAsync: async (text: string) => Buffer.from(text),
     decryptStringAsync: async (data: Buffer) => ({ result: data.toString(), shouldReEncrypt: false })
   }
 }));
-vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd() }));
+vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd(), shippedExtensionBuild: () => null, extensionUpdateOffer: () => null, prepareExtensionUpdate: () => null }));
 vi.mock('../src/main/connection.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/main/connection.js')>();
   return { ...actual, connect: async () => {}, getStatus: () => ({ ...actual.getStatus(), state: 'connected' }) };
 });
 vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: async () => 'chrome.exe', isPreferredBrowserRunning: async () => null }));
-const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath } = await import('../src/main/secrets.js');
 const { initDurableStore, flushDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
 const { createSession, getSession, rebindSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
@@ -125,6 +125,173 @@ it('keeps automatic Continue attached to the native question after injected corr
     expect(row.recovery?.questionId).toBe(questionId);
     expect((await input.pendingBrowserInputs()).find(item => item.id === row.id)?.recovery?.questionId).toBe(questionId);
     expect(await input.claimBrowserInput(row.id, 'replacement-document', conversationId, true)).not.toBeNull();
+  } finally { clock.mockRestore(); }
+});
+
+/**
+ * The reason a recovery message could not be sent, kept instead of dropped.
+ *
+ * A Continue that was never authorized is still owed, so `releaseRecoveryClaim` hands the ticket back
+ * to the queue on purpose and keeps its pickup budget. What went with it was the explanation: the page
+ * tells the app exactly why it could not send, `failBrowserInput` receives that string, and this one
+ * branch was the only one that discarded it — every other branch there stores it as `error`.
+ *
+ * Measured on 2026-09-26: one recovery row claimed twelve times in three minutes, back to `queued`
+ * every time, with no `error` on the receipt and not a single line in the log. The loop was visible
+ * only because the *claims* are logged; the reason for the release was nowhere.
+ */
+it('keeps the reason a recovery claim was released, and says it once', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const bridge = await import('../src/main/bridge.js');
+    const { getLog } = await import('../src/main/logger.js');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+    const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+    const session = await createSession({ title: 'Released recovery claim', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: questionId, text: 'Finish the task', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    now += 120_000;
+    await bridge.sweepStaleSwarm(now);
+    const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs
+      .find((item: any) => item.conversationId === conversationId);
+    expect(repair?.reason, 'no silence repair, so no recovery row to release').toBe('silence');
+    expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+    await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+    const row = (await input.listInputs()).find(item => item.sessionId === session.id && item.recovery)!;
+    expect(row, 'no recovery row was filed').toBeTruthy();
+
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    const reason = 'The composer refused the prepared text.';
+    expect(await input.failBrowserInput(row.id, 'a-document', reason)).toBe(true);
+
+    // The ticket survives — that is the point of releasing rather than failing it — and now it
+    // carries why it came back.
+    const released = (await input.listInputs()).find(item => item.id === row.id)!;
+    expect(released.state, 'the ticket was not handed back to the queue').toBe('queued');
+    expect(released.owner).toBeNull();
+    expect(released.error, 'the reason the browser gave was discarded').toBe(reason);
+
+    const said = getLog().filter(entry => entry.message.includes('could not send this recovery message'));
+    expect(said, 'the release was not reported at all').toHaveLength(1);
+    expect(said[0]!.message).toContain(reason);
+
+    // Said once per reason, not once per attempt: the schedule re-offers the same ticket in seconds.
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect(await input.failBrowserInput(row.id, 'a-document', reason)).toBe(true);
+    expect(getLog().filter(entry => entry.message.includes('could not send this recovery message')),
+      'it repeated itself once per attempt').toHaveLength(1);
+
+    // A different reason is new information and is said.
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect(await input.failBrowserInput(row.id, 'a-document', 'The tab moved to another chat.')).toBe(true);
+    expect(getLog().filter(entry => entry.message.includes('could not send this recovery message'))).toHaveLength(2);
+  } finally { clock.mockRestore(); }
+});
+
+it('says why a page withdrew a Continue and ends it after three minutes of withdrawals (#820)', async () => {
+  // Measured in #820: a page released the same automatic Continue about once a second for many
+  // minutes, its text left in the composer, and the log never said why after the first time.
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const bridge = await import('../src/main/bridge.js');
+    const { getLog } = await import('../src/main/logger.js');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+    const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+    const session = await createSession({ title: 'Withdrawn recovery claim', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: questionId, text: 'Finish the task', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    now += 120_000;
+    await bridge.sweepStaleSwarm(now);
+    const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs
+      .find((item: any) => item.conversationId === conversationId);
+    expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+    await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+    const row = (await input.listInputs()).find(item => item.sessionId === session.id && item.recovery)!;
+    const withdrawn = 'After-turn pickup was withdrawn before Send.';
+
+    // Through the bridge route, as the extension reports it: the reason travels with the release.
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect((await post('/input/fail', { id: row.id, owner: 'a-document', conversationId, error: withdrawn, detail: 'send-not-ready' })).body.ok).toBe(true);
+    expect(getLog().filter(entry => entry.message.includes('could not send this recovery message')).at(-1)?.message)
+      .toContain('(send-not-ready)');
+    const firstRelease = now;
+    expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued',
+      recovery: { withdrawnSince: firstRelease } });
+
+    // Repeated withdrawals inside the window keep handing the ticket back, from the same start.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      now += 30_000;
+      expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+      expect(await input.failBrowserInput(row.id, 'a-document', withdrawn, 'page-unreadable')).toBe(true);
+      expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued',
+        recovery: { withdrawnSince: firstRelease } });
+    }
+    // Past three minutes of nothing but withdrawals the Continue ends, and the log says why.
+    now = firstRelease + input.RECOVERY_WITHDRAW_LIMIT_MS;
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect(await input.failBrowserInput(row.id, 'a-document', withdrawn, 'page-unreadable')).toBe(true);
+    expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'failed',
+      error: 'Automatic Continue was not sent: page-unreadable' });
+    expect(getLog().some(entry => entry.message.includes('automatic Continue ended') && entry.message.includes('page-unreadable'))).toBe(true);
+    input.resetInputForTests();
+    expect((await input.pendingBrowserInputs()).filter(item => item.id === row.id)).toEqual([]);
+  } finally { clock.mockRestore(); }
+});
+
+/** Files the automatic Continue for a silent turn exactly as the app does, and returns its row. */
+async function silentTurnContinue(title: string, advance: (ms: number) => number) {
+  const bridge = await import('../src/main/bridge.js');
+  const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+  const session = await createSession({ title, conversationId });
+  await post('/events', { conversationId, events: [
+    { kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() },
+    { kind: 'user_message', messageId: questionId, text: 'Finish the task', time: Date.now() },
+    { kind: 'turn_start', turnId, time: Date.now() }
+  ] });
+  await attributedMcp(conversationId);
+  await bridge.sweepStaleSwarm(advance(120_000));
+  const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs
+    .find((item: any) => item.conversationId === conversationId);
+  expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+  await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+  const row = (await input.listInputs()).find(item => item.sessionId === session.id && item.recovery)!;
+  expect(row).toMatchObject({ state: 'queued' });
+  return { conversationId, turnId, session, row };
+}
+
+it('ends a Continue the page refuses before claiming because its answer is finished', async () => {
+  // Measured 2026-10-02: a Continue filed for a turn whose final the app had missed was refused by
+  // every page before claiming, because ChatGPT showed that final. Nothing was reported, so the
+  // app reloaded the chat every fifteen minutes for six hours.
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+    const { conversationId, turnId, session, row } = await silentTurnContinue('Finished before Continue', ms => now += ms);
+
+    // Only for its own chat.
+    expect((await post('/input/claim', { id: row.id, owner: 'a-document', conversationId: randomUUID(), recoveryVeto: 'page-final' })).body.ok).toBe(false);
+    expect((await post('/input/claim', { id: row.id, owner: 'a-document', conversationId, recoveryVeto: 'page-final' })).body.ok).toBe(true);
+    expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'cancelled',
+      error: 'Automatic Continue was not needed: the page shows a finished answer.', recovery: { ended: 'page-final' } });
+
+    // Nothing changed since: the same turn does not get the same Continue back.
+    expect(await input.fileRecoveryInput(session.id, conversationId, turnId, false, () => true)).toBe(false);
+    // New work is a new situation, and may earn a restart again.
+    await attributedMcp(conversationId);
+    expect(await input.fileRecoveryInput(session.id, conversationId, turnId, false, () => true)).toBe(true);
+
+    // And only for an automatic Continue: a typed message is never ended by a page's verdict.
+    const typed = await input.enqueueInput({ ...message(session.id, 'off'), text: 'typed while waiting', mode: 'after-turn' });
+    expect((await post('/input/claim', { id: typed.id, owner: 'a-document', conversationId, recoveryVeto: 'page-final' })).body.ok).toBe(false);
+    expect((await input.listInputs()).find(item => item.id === typed.id)?.state).toBe('queued');
   } finally { clock.mockRestore(); }
 });
 
@@ -227,10 +394,21 @@ it('shows the approval reminder only after an authorized discovery handoff succe
     await vi.waitFor(() => expect(catalog.getChatModels().state).toBe('unavailable'));
     expect(notices()).toHaveLength(0);
 
+    // A fresh install has no Core tunnel yet, so ChatGPT cannot call a tool and has nothing to approve.
+    const config = getConfig();
+    await saveConfig({ ...config, tunnel: { ...config.tunnel, tunnelId: '' } });
+    catalog.resetChatModelsForTests();
+    await catalog.startChatModelDiscovery(true);
+    await vi.waitFor(() => expect(wake).toHaveBeenCalledTimes(2));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(notices()).toHaveLength(0);
+
+    await saveConfig({ ...config, tunnel: { ...config.tunnel, tunnelId: 'tunnel_test_core' } });
     catalog.resetChatModelsForTests();
     await catalog.startChatModelDiscovery(true);
     await vi.waitFor(() => expect(notices()).toHaveLength(1));
     expect(wake).toHaveBeenLastCalledWith(expect.stringContaining('https://chatgpt.com/?cos-model-catalog='), true, true);
+    await saveConfig(config);
   } finally { wake.mockRestore(); catalog.resetChatModelsForTests(); }
 });
 
@@ -257,8 +435,111 @@ it.each([false, true])('collects an exact recorded helper final across document 
   } finally { controller.abort(); await answer.catch(() => undefined); }
 });
 
+it('sends an immediate message into a running GPT-5.6 turn through the composer after its calls (#1231)', async () => {
+  const conversationId = randomUUID(), turnId = randomUUID();
+  const session = await createSession({ title: 'Message for the running turn', conversationId });
+  await post('/events', { conversationId, events: [
+    { kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() },
+    { kind: 'user_message', messageId: randomUUID(), text: 'Inspect the current task', time: Date.now() },
+    { kind: 'turn_start', turnId, time: Date.now() }
+  ] });
+  await attributedMcp(conversationId);
+  const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto' });
+  expect(row).toMatchObject({ transportIntent: 'browser', directTurn: { id: turnId } });
+  expect((await input.pendingBrowserInputs()).find(item => item.id === row.id)).toMatchObject({ directTurn: { id: turnId } });
+  expect((await post('/input/claim', { id: row.id, owner: 'turn-page', conversationId, requiresAuthorization: true })).body.input)
+    .toMatchObject({ id: row.id, directTurn: { id: turnId } });
+});
+
+it('hands a message for the running turn to the browser while one of its calls is still running (#1231)', async () => {
+  const { trackInFlight, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+  const conversationId = randomUUID(), turnId = randomUUID();
+  const session = await createSession({ title: 'Message during a running call', conversationId });
+  await post('/events', { conversationId, events: [
+    { kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() },
+    { kind: 'user_message', messageId: randomUUID(), text: 'Run the long command', time: Date.now() },
+    { kind: 'turn_start', turnId, time: Date.now() }
+  ] });
+  await trackInFlight({ startedAt: Date.now(), transportKey: null, agent: null, outcome: null, evidence: emptyEvidence(),
+    caller: { requestId: randomUUID(), transportKey: null, conversationId } }, async () => {
+    const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', delivery: 'tool' });
+    expect(row).toMatchObject({ transportIntent: 'browser', directTurn: { id: turnId } });
+    const status = await post('/status', { openConversations: [conversationId] });
+    expect(status.body.inputs).toEqual(expect.arrayContaining([expect.objectContaining({ id: row.id, directTurn: { id: turnId, startedAt: expect.any(Number) } })]));
+    // The page's claim must succeed during the call too: VM 141, 2026-10-09, the claim was refused
+    // until the call returned, so the message waited ~35 s and reached the turn only between calls.
+    expect((await post('/input/claim', { id: row.id, owner: 'turn-page', conversationId, requiresAuthorization: true })).body.input)
+      .toMatchObject({ id: row.id, directTurn: { id: turnId } });
+  });
+});
+
+// Like Codex's Steer: a message queued for after the turn can be sent into the running turn instead.
+it('sends a queued follow-up into the running turn when asked, as Send directly would', async () => {
+  const conversationId = randomUUID(), turnId = randomUUID();
+  const session = await createSession({ title: 'Queued follow-up sent now', conversationId });
+  await post('/events', { conversationId, events: [
+    { kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() },
+    { kind: 'user_message', messageId: randomUUID(), text: 'Inspect the current task', time: Date.now() },
+    { kind: 'turn_start', turnId, time: Date.now() }
+  ] });
+  await attributedMcp(conversationId);
+  const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn' });
+  expect(row.directTurn).toBeUndefined();
+  expect((await post('/input/claim', { id: row.id, owner: 'turn-page', conversationId, requiresAuthorization: true })).body.input).toBeNull();
+
+  expect(await input.sendQueuedInputNow(row.id)).toBe(true);
+  expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'queued', mode: 'auto', transportIntent: 'browser', directTurn: { id: turnId } });
+  expect((await post('/input/claim', { id: row.id, owner: 'turn-page', conversationId, requiresAuthorization: true })).body.input)
+    .toMatchObject({ id: row.id, directTurn: { id: turnId } });
+  // Already on its way: a second press changes nothing.
+  expect(await input.sendQueuedInputNow(row.id)).toBe(false);
+});
+
+it('leaves a queued follow-up waiting when there is no running turn to send it into', async () => {
+  const conversationId = randomUUID();
+  const session = await createSession({ title: 'Nothing running', conversationId });
+  await post('/events', { conversationId, events: [{ kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() }] });
+  const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn' });
+  expect(await input.sendQueuedInputNow(row.id)).toBe(false);
+  expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'queued', mode: 'after-turn' });
+  expect((await input.listInputs()).find(entry => entry.id === row.id)?.directTurn).toBeUndefined();
+});
+
+it('still holds an ordinary queued message for a chat while one of its calls is running', async () => {
+  const { trackInFlight, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+  const conversationId = randomUUID();
+  const session = await createSession({ title: 'Queued message during a call', conversationId });
+  await trackInFlight({ startedAt: Date.now(), transportKey: null, agent: null, outcome: null, evidence: emptyEvidence(),
+    caller: { requestId: randomUUID(), transportKey: null, conversationId } }, async () => {
+    const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto' });
+    expect(row.directTurn).toBeUndefined();
+    expect((await post('/input/claim', { id: row.id, owner: 'idle-page', conversationId, requiresAuthorization: true })).body.input).toBeNull();
+  });
+});
+
+it('holds a message for an existing chat until a new tunnel-client has taken over its route (#1220)', async () => {
+  const { noteTunnelClientConnected, resetRouteSettleForTests, ROUTE_SETTLE_MS } = await import('../src/main/tunnel/route-settle.js');
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID();
+    const session = await createSession({ title: 'Message right after a tunnel restart', conversationId });
+    const existing = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto' });
+    const fresh = await input.enqueueInput({ ...message(null, 'off'), mode: 'auto' });
+    noteTunnelClientConnected();
+    const held = await post('/status', { openConversations: [conversationId] });
+    expect(held.body.inputs.map((row: { id: string }) => row.id)).toEqual([fresh.id]);
+    expect((await post('/input/claim', { id: existing.id, owner: 'chat-page', conversationId, requiresAuthorization: true })).body.input).toBeNull();
+    now += ROUTE_SETTLE_MS;
+    const released = await post('/status', { openConversations: [conversationId] });
+    expect(released.body.inputs.map((row: { id: string }) => row.id)).toContain(existing.id);
+    expect((await post('/input/claim', { id: existing.id, owner: 'chat-page', conversationId, requiresAuthorization: true })).body.input)
+      .toMatchObject({ id: existing.id });
+  } finally { clock.mockRestore(); resetRouteSettleForTests(); }
+});
+
+// A running GPT-5.6 turn takes an immediate message directly (above); these cover the boundary.
 it.each([
-  { mode: 'auto', earlyEnd: false }, { mode: 'after-turn', earlyEnd: false }, { mode: 'finish', earlyEnd: false },
+  { mode: 'after-turn', earlyEnd: false }, { mode: 'finish', earlyEnd: false },
   { mode: 'auto', earlyEnd: true }, { mode: 'after-turn', earlyEnd: true }, { mode: 'finish', earlyEnd: true }
 ] as const)('delivers $mode queued during a delayed report of the current final (early end: $earlyEnd)', async ({ mode, earlyEnd }) => {
   let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
@@ -612,9 +893,9 @@ it.each(['auto', 'after-turn'] as const)('reserves the failed-view five-minute w
   } finally { clock.mockRestore(); }
 });
 
+// Pro keeps tool injection; a GPT-5.6 turn takes the same message directly (test above).
 it.each([
-  ['gpt-6-pro', false], ['gpt-5.6-sol', false],
-  ['gpt-6-pro', true], ['gpt-5.6-sol', true]
+  ['gpt-6-pro', false], ['gpt-6-pro', true]
 ] as const)('delivers after the full final or recovers after %s silence (full final: %s)', async (model, nativeCompleted) => {
   const bridge = await import('../src/main/bridge.js');
   let now = Date.now();
@@ -659,11 +940,6 @@ it.each([
     expect(repair?.reason).toBe('silence');
     await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
     input.resetInputForTests();
-    if (model === 'gpt-5.6-sol') {
-      expect((await input.pendingBrowserInputs()).some(r => r.conversationId === conversationId)).toBe(false);
-      now += 60_000;
-      await bridge.sweepStaleSwarm(now);
-    }
     expect((await input.pendingBrowserInputs()).filter(r => r.conversationId === conversationId)).toEqual([expect.objectContaining({ id: manual.id })]);
     expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
     const claim = { id: manual.id, owner: 'recovered-page', conversationId, requiresAuthorization: true };
@@ -1033,6 +1309,44 @@ it.each(['open', 'stalled', 'final-during-listen', 'failure-during-listen', 'fai
   } finally { clock.mockRestore(); }
 });
 
+it('continues an Extra High chat whose turn ended as failed after two minutes, not twenty', async () => {
+  // Measured 2026-10-01: an Extra High prime lost its stream twice; each turn ended as failed and
+  // the chat then sat toward its twenty-minute thinking window until its owner typed "continue".
+  const bridge = await import('../src/main/bridge.js');
+  await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoContinue: true } });
+  let now = Date.now();
+  const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID();
+    const session = await createSession({ title: 'Failed Extra High', conversationId });
+    const questionId = randomUUID(), turnId = randomUUID();
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh', time: now },
+      { kind: 'user_message', messageId: questionId, text: 'Finish the long task', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    now += 5 * 60_000;
+    await bridge.sweepStaleSwarm(now);
+    expect((await post('/status', { openConversations: [conversationId] })).body.repairs
+      .some((row: any) => row.conversationId === conversationId)).toBe(false);
+
+    await post('/events', { conversationId, events: [
+      { kind: 'chat_error', text: 'Resume stream unavailable', recoverable: true, time: now },
+      { kind: 'turn_end', turnId, outcome: 'failed', time: now }
+    ] });
+    now += 2 * 60_000 + 1;
+    await bridge.sweepStaleSwarm(now);
+    const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs
+      .find((row: any) => row.conversationId === conversationId && row.reason === 'silence');
+    expect(repair, 'the failed turn waited for the long thinking window').toBeDefined();
+    if (repair.requiresClaim) expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+    await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+    expect((await input.listInputs()).find(row => row.sessionId === session.id && row.recovery))
+      .toMatchObject({ state: 'queued', recovery: { questionId, phase: 'ready' } });
+  } finally { clock.mockRestore(); }
+});
+
 it('commits a failed-source listening deadline while another chat observation is still recording', async () => {
   const bridge = await import('../src/main/bridge.js');
   const recorder = await import('../src/main/session/recorder.js');
@@ -1252,6 +1566,21 @@ it('completes only an explicitly temporary planner over HTTP without inventing a
   expect(await answer).toBe('Transient plan answer');
   expect((await input.listInputs())[0]).toMatchObject({ conversationId: null, deliveredSessionId: null, state: 'sent' });
 });
+it('hands a sent temporary planner back for closing with the chat ChatGPT moved it to', async () => {
+  // VM 2026-10-09: after Send, ChatGPT moves a helper to /c/<id>?temporary-chat=true without the
+  // cos-input marker. A close retry that names only the input id can never find that tab again.
+  const controller = new AbortController();
+  const answer = input.requestBrowserDecision('Routed plan context', controller.signal, { lifetime: 'temporary-planner' });
+  await vi.waitFor(async () => expect(await input.pendingBrowserInputs()).toHaveLength(1));
+  const row = (await input.listInputs()).find(item => item.text === 'Routed plan context')!;
+  const conversationId = randomUUID();
+  expect((await post('/input/claim', { id: row.id, owner: 'routed-page', conversationId: null, requiresAuthorization: true })).body.input).toBeTruthy();
+  expect((await post('/input/ack', { id: row.id, owner: 'routed-page', conversationId })).body.ok).toBe(true);
+  expect((await post('/input/answer', { id: row.id, owner: 'routed-page', conversationId, response: 'Routed plan answer' })).body.ok).toBe(true);
+  expect(await answer).toBe('Routed plan answer');
+  expect((await post('/status', { openConversations: [] })).body.inputs).toContainEqual(
+    expect.objectContaining({ id: row.id, close: true, conversationId }));
+});
 afterAll(async () => {
   await stopBridge(); await flushDurable(); resetSessionStoreForTests(); resetDurableForTests();
   await removeTempDir(directory);
@@ -1444,8 +1773,8 @@ describe('IPC input delivery and Goal control integration', () => {
   });
   it('requires an exact plugin claim and matching schema before a refresh completion', async () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: true } });
-    const { publishPluginSurface, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
-    resetPluginRefreshForTests();
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
     const tools = [{ name: 'read', description: 'Read a file', inputSchema: { type: 'object', properties: {} } }];
     publishPluginSurface('core', 'Chat On Steroids Core', 'test', 'Synthetic instructions', tools);
     const requests = (await post('/plugin-refresh', { action: 'pending' })).body.requests;
@@ -1458,9 +1787,57 @@ describe('IPC input delivery and Goal control integration', () => {
     expect((await post('/plugin-refresh', { ...identity, action: 'complete', tools, versionId: 'asdk_app_v_synthetic' })).body.ok).toBe(true);
     resetPluginRefreshForTests();
   });
-  it('defaults automatic plugin refresh off and revokes an already offered claim without removing the backend', async () => {
+  it.each([false, true])('migrates a legacy consumed refresh only through an exact read-only tunnel receipt (automatic=%s)', async automatic => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, ui: { ...base.ui, autoRefreshPlugins: automatic }, tunnel: { ...base.tunnel, tunnelId: 'tunnel_core00001' } });
     const plugin = await import('../src/main/plugin-refresh.js');
-    plugin.resetPluginRefreshForTests();
+    const { readDurable } = await import('../src/main/durable.js');
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
+    try {
+      const tools = [{ name: 'read', description: 'Current', inputSchema: { type: 'object', properties: {} } }];
+      plugin.publishPluginSurface('core', 'Chat On Steroids Core', 'test', '', tools);
+      const schemaId = plugin.pluginRefreshPublications()[0]!.schemaId;
+      await writeDurableNow('plugin-refresh', [{ surface: 'core', id: randomUUID(), schemaId,
+        appId: 'asdk_app_legacy_consumed', completedSchemaId: null, attempted: true, manual: false }]);
+      if (!automatic) await plugin.requestPluginRefreshes(APP_VERSION, ['core']);
+      const [request] = (await post('/plugin-refresh', { action: 'pending' })).body.requests;
+      expect(request).toMatchObject({ observeOnly: true, appId: 'asdk_app_legacy_consumed' });
+      expect((await plugin.pluginRefreshStatuses()).core?.state).toBe('unknown');
+      const receipt = { id: request.id, appId: request.appId, connectorName: request.connectorName, tools };
+      expect((await post('/plugin-refresh', { ...receipt, action: 'claim', tools: [{ ...tools[0], description: 'Old' }], tunnelId: 'tunnel_core00001' })).body.ok).toBe(false);
+      for (const override of [{}, { tunnelId: 'tunnel_foreign01' },
+        { tunnelId: 'tunnel_core00001', appId: 'asdk_app_foreign' },
+        { tunnelId: 'tunnel_core00001', tools: [{ ...tools[0], description: 'Different schema' }] }]) {
+        expect((await post('/plugin-refresh', { ...receipt, action: 'current', ...override })).body.ok).toBe(false);
+      }
+      expect((await readDurable('plugin-refresh') as any[])[0]).toMatchObject({ attempted: true, appId: receipt.appId });
+      expect((await post('/plugin-refresh', { ...receipt, action: 'current', tunnelId: 'tunnel_core00001' })).body.ok).toBe(true);
+      expect((await plugin.pluginRefreshStatuses()).core?.state).toBe('current');
+      expect((await post('/plugin-refresh', { action: 'pending' })).body.requests).toEqual([]);
+    } finally { plugin.resetPluginRefreshForTests(); }
+  });
+
+  it('accepts a stale connector only by the tunnel id configured for its surface', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, ui: { ...base.ui, autoRefreshPlugins: true }, tunnel: { ...base.tunnel, tunnelId: 'tunnel_core00001', desktopTunnelId: 'tunnel_desk00001' } });
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
+    await writeDurableNow('plugin-refresh', []);
+    const tools = [{ name: 'computer', description: 'Current', inputSchema: { type: 'object', properties: {} } }];
+    publishPluginSurface('desktop', 'Chat On Steroids Desktop', 'test', '', tools);
+    const [request] = (await post('/plugin-refresh', { action: 'pending' })).body.requests;
+    const claim = (tunnelId?: string) => post('/plugin-refresh', { id: request.id, appId: 'asdk_app_desktop', action: 'claim', connectorName: 'Chat On Steroids Desktop', tools: [{ name: 'observe', description: 'Old', inputSchema: { type: 'object' } }], tunnelId });
+    expect((await claim()).body.ok).toBe(false);
+    expect((await claim('tunnel_core00001')).body.ok).toBe(false); // Core's tunnel is not Desktop's
+    expect((await claim('tunnel_desk00001')).body.ok).toBe(true);
+    resetPluginRefreshForTests();
+  });
+  it('offers nothing while automatic plugin refresh is off and revokes an already offered claim without removing the backend', async () => {
+    const plugin = await import('../src/main/plugin-refresh.js');
+    // Fresh installs start with it on (config.test.ts); this is the switch turned off.
+    const configure = (enabled: boolean) => saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: enabled } });
+    await configure(false);
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
     await writeDurableNow('plugin-refresh', []);
     const tools = [{ name: 'read', description: 'Current declaration', inputSchema: { type: 'object', properties: {} } }];
     plugin.publishPluginSurface('core', 'Chat On Steroids Core', 'test', '', tools);
@@ -1468,7 +1845,6 @@ describe('IPC input delivery and Goal control integration', () => {
     expect(saved).toBeDefined();
     expect((await post('/plugin-refresh', { action: 'pending' })).body.requests).toEqual([]);
     expect((await post('/status', { openConversations: [] })).body.pluginRefreshRequests).toEqual([]);
-    const configure = (enabled: boolean) => saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: enabled } });
     await configure(true);
     expect((await post('/plugin-refresh', { action: 'pending' })).body.requests[0].id).toBe(saved.id);
     expect((await post('/status', { openConversations: [] })).body.pluginRefreshRequests).toHaveLength(1);
@@ -1480,12 +1856,33 @@ describe('IPC input delivery and Goal control integration', () => {
     await configure(false);
     // A click already accepted while enabled may still report its real result.
     expect((await post('/plugin-refresh', { ...claim, action: 'complete', tools })).body.ok).toBe(true);
-    plugin.resetPluginRefreshForTests();
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
+  });
+  it('delivers an explicit Update all refresh over the bridge while the automatic preference remains off', async () => {
+    const config = { ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: false } };
+    await saveConfig(config);
+    const plugin = await import('../src/main/plugin-refresh.js');
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
+    await writeDurableNow('plugin-refresh', []);
+    const tools = [{ name: 'read', description: 'Current', inputSchema: { type: 'object', properties: {} } }];
+    plugin.publishPluginSurface('core', 'Chat On Steroids Core', 'test', '', tools);
+    await plugin.requestPluginRefreshes(APP_VERSION);
+    const pending = (await post('/plugin-refresh', { action: 'pending' })).body.requests;
+    expect(pending).toHaveLength(1);
+    expect((await post('/status', { openConversations: [] })).body.pluginRefreshRequests).toHaveLength(1);
+    const claim = { action: 'claim', id: pending[0].id, appId: 'asdk_app_explicit_update', connectorName: 'Chat On Steroids Core', tools: [{ ...tools[0], description: 'Old' }] };
+    expect((await post('/plugin-refresh', claim)).body.ok).toBe(true);
+    expect((await post('/plugin-refresh', { ...claim, action: 'complete', tools })).body.ok).toBe(true);
+    expect(getConfig().ui.autoRefreshPlugins).toBe(false);
+    expect((await post('/plugin-refresh', { action: 'pending' })).body.requests).toEqual([]);
+    plugin.publishPluginSurface('desktop', 'Desktop', 'test', '', tools);
+    expect((await post('/status', { openConversations: [] })).body.pluginRefreshRequests.map((row: any) => row.surface)).toEqual(['core']);
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
   });
   it('accepts a manual plugin-refresh terminal state and removes it from browser pickup', async () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: true } });
-    const { publishPluginSurface, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
-    resetPluginRefreshForTests();
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
     const tools = [{ name: 'read', description: 'Read current', inputSchema: { type: 'object', properties: {} } }];
     const installed = [{ ...tools[0], description: 'Read old' }];
     publishPluginSurface('core', 'Chat On Steroids Core', 'test', 'Synthetic instructions', tools);
@@ -1529,7 +1926,7 @@ describe('IPC input delivery and Goal control integration', () => {
     pushed.mockClear();
     expect((await post('/models', { nonce, models })).body.ok).toBe(true);
     expect((await handlers.get('chatModels:get')!(null, {})).data.models).toEqual(models);
-    expect(pushed).toHaveBeenCalledWith('state:changed', expect.anything());
+    await vi.waitFor(() => expect(pushed).toHaveBeenCalledWith('state:changed', expect.anything()));
     expect((await post('/models', { nonce, models })).status).toBe(409);
   });
   it('releases only the expected actual turn through IPC', async () => {
@@ -1842,6 +2239,34 @@ describe('native progress silence authority', () => {
     if (repair.requiresClaim) expect((await post('/repairs/claim', { conversationId, token: repair.token })).body.allowed).toBe(true);
     await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
   }
+
+  /**
+   * A rescue that was withdrawn must not stand in for the one the chat still needs.
+   *
+   * The ticket is cancelled for a good reason — the chat resumed on its own, so typing into it
+   * would be noise — but the check that keeps one ticket per turn counted the cancelled row all
+   * the same. Watched live on 2026-09-23: a rescue filed at 20:32:35, cancelled fifteen seconds
+   * later as "the source received new work", and the same turn broke again two minutes after
+   * that. The second rescue was refused on the strength of the first, and the chat sat until its
+   * owner typed into it.
+   */
+  it('files a second rescue for a turn whose first was cancelled without ever sending', async () => {
+    const source = await open('gpt-5.6-sol');
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+    const first = (await input.listInputs()).find(row => row.recovery)!;
+    expect(first.silenceBoundary?.turnId).toBe(source.turnId);
+
+    // Withdrawn because the chat carried on by itself — nothing was ever sent.
+    expect(await input.cancelInput(first.id)).toBe(true);
+    expect((await input.listInputs()).find(row => row.id === first.id)?.state).toBe('cancelled');
+
+    // The same turn breaks again. This is the rescue that used to be refused.
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true),
+      'a cancelled ticket still blocked the turn it never answered').toBe(true);
+    const live = (await input.listInputs()).filter(row => row.recovery && row.state === 'queued');
+    expect(live).toHaveLength(1);
+    expect(live[0]!.id).not.toBe(first.id);
+  });
 
   it('keeps authored queued work ahead of automatic Continue after a committed handoff', async () => {
     let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
@@ -2531,23 +2956,38 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
     } finally { clock.mockRestore(); }
   });
 
-  it('retains the same frozen ticket across restore and the shared 2/5/10/15 pickup schedule', async () => {
+  it('retains the same frozen ticket across restore and stops after the shared 2/5/10 pickup schedule', async () => {
     let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
     const bridge = await import('../src/main/bridge.js');
     try {
       const { row, conversationId } = await silent('gpt-5.6-sol', ms => { now += ms; });
-      for (const minutes of [2, 5, 10, 15]) {
+      for (const minutes of [2, 5, 10]) {
         input.resetInputForTests();
         now += minutes * 60_000;
         expect(await input.pendingQueuedPickups()).toEqual(expect.arrayContaining([expect.objectContaining({ conversationId })]));
         await bridge.sweepStaleSwarm(now);
         const status = (await post('/status', { openConversations: [conversationId] })).body;
         const repair = status.repairs.find((item: any) => item.conversationId === conversationId);
-        expect(repair?.reason).toBe('goal'); // Existing shared pickup wire reason.
+        // Failed once on Linux CI (2026-10-12) and not since in 192 local runs under load, so a
+        // failure names what the sweep saw instead of only "undefined".
+        const seen = async () => JSON.stringify({
+          minutes, repairs: status.repairs,
+          pickup: (await input.listInputs()).find(item => item.id === row.id)?.pickupRecovery ?? null,
+          state: (await input.listInputs()).find(item => item.id === row.id)?.state,
+          log: (await import('../src/main/logger.js')).getLog().slice(-12).map(entry => entry.message.slice(0, 160))
+        });
+        expect(repair?.reason, repair ? undefined : await seen()).toBe('goal'); // Existing shared pickup wire reason.
         await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
         expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued', text: row.text });
         expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
       }
+      expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ pickupRecovery: { attempts: 3, stoppedAt: now } });
+      input.resetInputForTests();
+      expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ pickupRecovery: { attempts: 3, stoppedAt: now } });
+      now += 15 * 60_000;
+      await bridge.sweepStaleSwarm(now);
+      expect((await post('/status', { openConversations: [conversationId] })).body.repairs.some((item: any) => item.conversationId === conversationId)).toBe(false);
+      expect((await input.listInputs()).find(item => item.id === row.id)?.text).toBe(row.text);
       expect((await input.claimBrowserInput(row.id, 'restored-doc', conversationId, true))?.text).toBe(row.text);
       expect(await input.authorizeBrowserInput(row.id, 'restored-doc', conversationId)).toBe(true);
     } finally { clock.mockRestore(); }
@@ -2599,4 +3039,103 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
         if (change === 'question') expect(cancelled.error).toBe('Automatic Continue cancelled: another user message arrived.');
       } finally { clock.mockRestore(); }
     });
+});
+
+it('retires a lost authorized browser receipt so the session accepts and delivers the next user message', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID(), turnId = randomUUID();
+    const session = await createSession({ title: 'Lost send receipt', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'turn_start', turnId, time: now },
+      { kind: 'assistant_message', messageId: randomUUID(), turnId, text: 'Done.', state: 'final', final: true, time: ++now },
+      { kind: 'turn_end', turnId, outcome: 'completed', time: ++now }
+    ] });
+    const lost = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'First request' });
+    expect(await input.claimBrowserInput(lost.id, 'lost-document', conversationId, true)).not.toBeNull();
+    expect(await input.authorizeBrowserInput(lost.id, 'lost-document', conversationId)).toBe(true);
+    // The receipt never arrives, so the uncertain claim still owns the whole session.
+    await expect(input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Second request' }))
+      .rejects.toThrow('One message is already awaiting delivery');
+    now += 899_999;
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(item => item.id === lost.id)?.state).toBe('browser');
+    await expect(input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Second request' }))
+      .rejects.toThrow('One message is already awaiting delivery');
+    // The bounded wait elapses across a restart, and the lost outcome is now visible.
+    now += 1;
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(item => item.id === lost.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'Stopped waiting for delivery confirmation. The message may already have been sent; it will not be resent.'
+    });
+    // A terminal row is never offered or replayed, so at-most-once delivery is unchanged.
+    expect((await input.pendingBrowserInputs()).map(item => item.id)).not.toContain(lost.id);
+    expect(await input.claimBrowserInput(lost.id, 'replacement-document', conversationId, true)).toBeNull();
+    const next = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Second request' });
+    expect(await input.claimBrowserInput(next.id, 'replacement-document', conversationId, true)).not.toBeNull();
+  } finally { clock.mockRestore(); }
+});
+
+it('retires an opening send whose receipt never arrives after six hours, and not before', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    // Measured 2026-09-27: first messages of app-started chats stayed in `browser` for days.
+    const request = message(null, 'off');
+    expect((await handlers.get('sessions:send')!(null, request)).ok).toBe(true);
+    const owner = `document-${request.id}`;
+    expect((await post('/input/claim', { id: request.id, owner, conversationId: null, requiresAuthorization: true })).body.input).toMatchObject({ opening: true });
+    expect((await post('/input/claim', { id: request.id, owner, conversationId: null, authorize: true })).body.ok).toBe(true);
+    now += 15 * 60_000 + 1; // past the ordinary bound, which leaves openings in custody
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(row => row.id === request.id)?.state).toBe('browser');
+    now += 6 * 60 * 60_000;
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(row => row.id === request.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'Stopped waiting for delivery confirmation. The message may already have been sent; it will not be resent.'
+    });
+    expect((await input.pendingBrowserInputs()).map(row => row.id)).not.toContain(request.id);
+  } finally { clock.mockRestore(); }
+});
+
+describe('this install\'s connector names', () => {
+  it('reach the extension with every status reply, and follow a changed suffix at once', async () => {
+    await saveConfig(defaultConfig());
+    expect((await post('/status', { openConversations: [] })).body.connectorNames).toEqual({
+      core: 'Chat On Steroids Core', desktop: 'Chat On Steroids Desktop', plugins: 'Chat On Steroids Plugins'
+    });
+    await saveConfig({ ...defaultConfig(), connectorSuffix: 'Windows' });
+    expect((await post('/status', { openConversations: [] })).body.connectorNames).toEqual({
+      core: 'Chat On Steroids Core (Windows)', desktop: 'Chat On Steroids Desktop (Windows)', plugins: 'Chat On Steroids Plugins (Windows)'
+    });
+    await saveConfig(defaultConfig());
+  });
+});
+
+// 2026-10-14: a prime's answer broke ("Connection interrupted") and was reloaded; the user's
+// "weiter" for the running turn could not be taken by the page and was cancelled after 60 s.
+// Nothing was sent, so it is kept and delivered after the turn instead.
+it('keeps a message for the running turn that the page could not take, for after the turn', async () => {
+  const conversationId = randomUUID(), turnId = randomUUID();
+  const session = await createSession({ title: 'Message for a broken turn', conversationId });
+  await post('/events', { conversationId, events: [
+    { kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() },
+    { kind: 'user_message', messageId: randomUUID(), text: 'Inspect the current task', time: Date.now() },
+    { kind: 'turn_start', turnId, time: Date.now() }
+  ] });
+  await attributedMcp(conversationId);
+  const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto' });
+  expect(row).toMatchObject({ directTurn: { id: turnId } });
+  expect((await post('/input/claim', { id: row.id, owner: 'turn-page', conversationId, requiresAuthorization: true })).body.input)
+    .toMatchObject({ id: row.id });
+  vi.useFakeTimers({ toFake: ['Date'] });
+  try {
+    vi.setSystemTime(Date.now() + 61_000);
+    const kept = (await input.listInputs()).find(entry => entry.id === row.id);
+    expect(kept).toMatchObject({ state: 'queued', mode: 'after-turn', owner: null });
+    expect(kept?.directTurn).toBeUndefined();
+    expect(kept?.error).toMatch(/after the running answer/);
+  } finally { vi.useRealTimers(); }
 });

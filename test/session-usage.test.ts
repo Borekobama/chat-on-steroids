@@ -6,6 +6,8 @@ const catalog = vi.hoisted(() => ({ getChatModels: vi.fn() }));
 vi.mock('../src/main/chat-models.js', () => catalog);
 const durable = vi.hoisted(() => ({ readDurable: vi.fn(), writeDurableSoon: vi.fn() }));
 vi.mock('../src/main/durable.js', () => durable);
+const logger = vi.hoisted(() => ({ logInfo: vi.fn() }));
+vi.mock('../src/main/logger.js', async (importOriginal) => ({ ...(await importOriginal<object>()), logInfo: logger.logInfo }));
 let usage: typeof import('../src/main/session/usage.js');
 let now: number;
 const limit = (overrides: Record<string, unknown> = {}) => ({ model: 'Shared ChatGPT usage', scope: 'shared', remaining: null, remainingPercent: 40, resetAt: null, windowSeconds: 18000, ...overrides });
@@ -20,6 +22,16 @@ beforeEach(async () => {
   usage = await import('../src/main/session/usage.js');
 });
 afterEach(() => vi.restoreAllMocks());
+it('logs an overview pass only when it rebuilt something, not each refresh of the open page', async () => {
+  store.listUsageSessions.mockResolvedValue([{ id: 'one', updatedAt: 1, events: 1, estimatedTokens: 0 }]);
+  logger.logInfo.mockReset();
+  await usage.usageOverview();
+  expect(logger.logInfo).toHaveBeenCalledTimes(1);
+  expect(logger.logInfo.mock.calls[0]![0]).toContain('rebuilt=1');
+  await usage.usageOverview();
+  await usage.usageOverview();
+  expect(logger.logInfo).toHaveBeenCalledTimes(1);
+});
 describe('verified native message counts', () => {
   const message = (messageId: string | undefined, model: string | undefined, time: number, extra = {}) =>
     ({ kind: 'user_message', messageId, model, time, message: { text: '' }, ...extra });
@@ -42,6 +54,23 @@ describe('verified native message counts', () => {
     const result = await usage.usageOverview();
     expect(usageMessageTotals(result.messages, 1)).toMatchObject({ gpt56: 2, gpt6: 2 });
     expect(result.tokens).toBe(0);
+  });
+
+  it('proves a page-typed send by the model ChatGPT resolved for its own reply, and only that reply', async () => {
+    const reply = (resolvedModel: string | undefined, extra = {}) =>
+      ({ kind: 'assistant_message', time: now, final: true, message: { text: '' }, ...(resolvedModel ? { resolvedModel } : {}), ...extra });
+    store.readEvents.mockResolvedValue([
+      // Counted: the first reply after the send names a known model.
+      message('typed-56', undefined, now), reply('gpt-5-6-thinking'), reply('gpt-6-pro'),
+      message('typed-6', undefined, now), reply(undefined), reply('gpt-6-astra'),
+      // Not counted: an unknown slug, a reply after the next send, and an injected app message.
+      message('typed-other', undefined, now), reply('gpt-5-4-auto-thinking'),
+      message('no-reply', undefined, now), message('input:injected', undefined, now, { inputDelivery: 'confirmed' }), reply('gpt-6-pro'),
+      // An explicit but unrecognised own model abstains instead of borrowing the reply's.
+      message('own-unknown', 'gpt-6-pro-future', now), reply('gpt-6-pro')
+    ]);
+    const result = await usage.usageOverview();
+    expect(usageMessageTotals(result.messages, 1)).toMatchObject({ gpt56: 1, gpt6: 1 });
   });
 
   it('uses the original timestamp and an inclusive midnight boundary, excluding older and future sends', async () => {
@@ -108,14 +137,19 @@ describe('passive usage limits and canonical token totals', () => {
     // Four context tokens, two real exchanges. Children add neither text nor billing calls.
     expect((await usage.usageOverview()).tokens).toBe(4);
   });
-  it('keeps shared windows distinct and does not manufacture model-specific counts', async () => {
-    usage.observeUsage([limit(), limit({ windowSeconds: 604800, remainingPercent: 70 }), limit({ model: 'gpt-example', scope: 'model', remaining: 3, remainingPercent: null })]);
+  it('keeps Codex windows distinct and does not manufacture model-specific counts', async () => {
+    usage.observeUsage([limit({ scope: 'codex' }), limit({ windowSeconds: 604800, remainingPercent: 70, scope: 'codex' }), limit({ model: 'gpt-example', scope: 'model', remaining: 3, remainingPercent: null })]);
     const result = await usage.usageOverview();
     expect(result.limits).toHaveLength(3);
-    expect(result.limits.filter(row => row.scope === 'shared').map(row => row.remaining)).toEqual([null, null]);
+    expect(result.limits.filter(row => row.scope === 'codex').map(row => row.remaining)).toEqual([null, null]);
     expect(result.limits.filter(row => row.scope === 'model')).toEqual([expect.objectContaining({ model: 'gpt-example', remaining: 3, remainingPercent: null })]);
     result.limits[0]!.remainingPercent = 99;
     expect((await usage.usageOverview()).limits[0]?.remainingPercent).toBe(40);
+  });
+  // An extension from before 2.1.40 still sends wham/usage windows as "shared"; they were Codex's.
+  it('reads the old "shared" rows as Codex', () => {
+    usage.observeUsage([limit({ model: 'Shared usage', scope: 'shared' })]);
+    expect(usage.reportedUsageLimits()).toEqual([expect.objectContaining({ model: 'Codex', scope: 'codex', remainingPercent: 40 })]);
   });
   it.each([{ remaining: -1 }, { remaining: Infinity }, { remainingPercent: 101 }, { remainingPercent: NaN }, { resetAt: -1 }, { windowSeconds: 0 }, { scope: 'guessed' }])('rejects malformed batch atomically (%j)', async (bad) => {
     usage.observeUsage([limit()]);
@@ -453,4 +487,13 @@ describe('model attribution and equivalent cost', () => {
     expect(usageEstimate(rows.slice(-1), DEFAULT_USAGE_FORMULA).unpricedTokens).toBe(1e6);
     expect(rows[0]!.model).toBe('5.6');
   });
+});
+
+it('prices ChatGPT 5.5 IDs as GPT-5.5 and knows the GPT-6 Sol and Luna rates, without guessing plain gpt-6', async () => {
+  const { DEFAULT_USAGE_FORMULA: formula, usageRate } = await import('../src/shared/usage.js');
+  for (const id of ['5.5', 'gpt-5-5', 'gpt-5-5-instant', 'gpt-5-5-thinking']) expect(usageRate(id, formula)).toBe(0.5);
+  expect(usageRate('gpt-6-sol', formula)).toBe(0.2);
+  expect(usageRate('gpt-6-luna', formula)).toBe(0.01);
+  // Which API model ChatGPT's plain GPT-6 corresponds to is not established; it stays user-priced.
+  expect(usageRate('gpt-6', formula)).toBeUndefined();
 });

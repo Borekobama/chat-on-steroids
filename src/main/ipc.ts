@@ -1,23 +1,37 @@
 import { registerWorkspaceTerminalIpc } from './workspace-terminal-ipc.js';
+import { forgetSurfaceTokens } from './mcp/persistent-paths.js';
+import { firefoxAddonUrl } from '../shared/firefox-addon.js';
+import { approvalCardView, requestApprovalAnswer } from './approval-wait.js';
+import { registerDictationIpc } from './dictation.js';
+import { CONNECTOR_SUFFIX_MAX, CONNECTOR_SUFFIX_PATTERN } from '../shared/connector-names.js';
+import { setStopNoticeTranslations } from './stuck-notice.js';
+import { setMainTextTranslations } from './main-texts.js';
 import { applyLoginStartup, supportsLoginStartup } from './window-lifecycle.js';
+import { startControlApi, stopControlApi } from './control-api.js';
 import { appearanceSchema } from './appearance-schema.js';
 import { mergeAppearance } from '../shared/appearance.js';
 import { prepareSessionPrompt, prepareSkillFollowup } from './session/prompt.js';
-import { listSkills } from './skills.js';
+import { importSkillFile, importSkillPackage, listManagedSkills, listSkills, removeSkill } from './skills.js';
+import { checkGitHubSkillUpdates, importGitHubSkill, linkGitHubSkill, updateGitHubSkill } from './skill-github.js';
+import { SKILL_ID_PATTERN } from '../shared/skills.js';
 import { listSkillLibrary } from './skill-library.js';
+import { installRecommendedSkill, listRecommendedSkills } from './recommended-skills.js';
 import { noteChatOrigin } from './session/recorder.js';
-import { REASONING_EFFORTS } from '../shared/session.js';
+import { refreshAppProxy } from './app-proxy.js';
+import { committedResumeAncestorsFromSummary, DEFAULT_RECORDING_STORAGE_GIB, REASONING_EFFORTS, RECORDING_STORAGE_LIMITS_GIB, type RecordingStorageLimitGiB, type SessionChange } from '../shared/session.js';
 import { safeExternalLink } from '../shared/external-link.js';
 import { wakeBrowserWork } from './browser-wake.js';
+import { refreshKeepAwake } from './keep-awake.js';
 import { getChatModels, startChatModelDiscovery, configureChatModelDiscovery } from './chat-models.js';
 import { releaseSessionFinish, requestSessionFinishGoal } from './session/finish.js';
 import { GOAL_MARKER_INSTRUCTION } from '../shared/goal-templates.js';
 import { validateInputImages } from './session/input-images.js';
-import { stageInputAttachment, type AttachmentSource } from './session/input-attachments.js';
+import { stageInputAttachment, stageInputAttachments, type AttachmentSource } from './session/input-attachments.js';
 import { recordDeliveredInput, recordedInputImage } from './session/input-history.js';
 import { UI_BASE_ZOOM, titleBarOverlayForTheme, windowBackgroundForTheme } from './window-layout.js';
 import { usageOverview } from './session/usage.js';
-import { inputArgs, listInputs, editQueuedInput, reorderQueuedInputs, setInputAutomation, configureInputDelivery, pausedBrowserHelpers, cancelFinishInputs } from './session/input.js';
+import { readProviderUsage } from './provider-usage.js';
+import { inputArgs, listInputs, editQueuedInput, sendQueuedInputNow, reorderQueuedInputs, setInputAutomation, configureInputDelivery, pausedBrowserHelpers, cancelFinishInputs } from './session/input.js';
 import { draftOpeningMessage, onGoalChange, nativeGoalFailure } from './goal.js';
 import { cancelTaskRequest, runTaskRequest } from './task-request.js';
 import { randomUUID } from 'node:crypto';
@@ -26,6 +40,9 @@ import { requestBrowserPreferences } from './browser-preferences.js';
 import { sendDesktopInput, cancelDesktopInput, retryQueuedInputBrowser } from './session/start-input.js';
 import { wakeBrowserUrl } from './browser-startup.js';
 import { registerPluginIpc } from './plugins-ipc.js';
+import { deletePet, importPet, loadPetAsset, petLibraryState, setPetEnabled, setPetFavorite } from './pet-library.js';
+import { petOverlayControlState, refreshPetOverlayActivities, refreshPetOverlayAppearance, setPetOverlayVisible } from './pet-overlay.js';
+import { confirmedPluginSchemas, pluginRefreshPublications, pluginRefreshStatuses, onPluginRefreshChange, pluginRefreshUnreadable, resetPluginRefreshLedger } from './plugin-refresh.js';
 /**
  * IPC surface.
  *
@@ -36,7 +53,8 @@ import { registerPluginIpc } from './plugins-ipc.js';
  * key but can never read it back.
  */
 
-import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, shell } from 'electron';
+import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, nativeTheme, shell } from 'electron';
+import { repairMacOSPermissions, resetMacOSPermissions } from './computer/macos-grants.js';
 import { z } from 'zod';
 import {
   CAPABILITIES,
@@ -49,18 +67,32 @@ import {
   type Config
 } from '../shared/types.js';
 import { MAX_GOAL_SYSTEM_PROMPT_CHARS } from '../shared/goal.js';
-import { applySettings, connect, disconnect, getStatus, onStatusChange } from './connection.js';
-import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CHARS, browserBridgePortSchema } from './config.js';
+import { DEFAULT_HANDOFF_LENGTH, HANDOFF_LENGTHS, MAX_HANDOFF_PROMPT_CHARS } from '../shared/handoff.js';
+import { applySettings, connect, disconnect, getStatus, onStatusChange, rememberRunningSurfaceTokens } from './connection.js';
+import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CHARS, browserBridgePortSchema, settingsRecovered } from './config.js';
+import { UI_LANGUAGES } from '../shared/ui-language.js';
+import { PROJECT_COLORS } from '../shared/projects.js';
 import { bridgePortSelection } from './bridge-ports.js';
 import { clearAllGoalSwitches, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
+import { runningToolActivity } from './mcp/call-context.js';
+import { onBackgroundExecChange, runningExecProcesses, stopExecProcess } from './codex/ownership.js';
+import { keychainNoticeReady } from './keychain-notice.js';
 import { runDiagnostics } from './diagnostics.js';
-import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
+import { collectReportFacts, readRecentLog, renderDiagnosticsReport, saveDiagnosticsReport, systemFacts, memoryFacts } from './diagnostics-report.js';
+import { listSessions, readTurnTraces } from './session/store.js';
+import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, logWarn, onLog } from './logger.js';
+import { managedWorktreeCleanupOffers, acknowledgeManagedWorktreeCleanupOffer } from './agents.js';
+import { listOfferedWorkerWorktrees, disposeOfferedWorkerWorktree, WorkerWorktreeError } from './worktrees/index.js';
+import type { WorkerWorktreeCleanupOffer } from '../shared/session.js';
+import { unifiedExecManager } from './codex/manager.js';
+import { inFlightToolCalls } from './mcp/call-context.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
-import { addProject, getSessionProject, listProjects, projectWorkspace, removeProject } from './projects.js';
-import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, saveProjectTextFile } from './project-files.js';
+import { addProject, addRemoteProject, expireArmedProjectCreates, getSessionProject, listProjects, localProjectPath, onProjectLinkChange, projectWorkspace, removeProject, retryProjectCreate, setProjectColor } from './projects.js';
+import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, revalidateProjectFileTarget, saveProjectTextFile, serverFileSnapshot } from './project-files.js';
 import { ProjectFileWatchSet } from './project-file-watcher.js';
-import { hasSecret, isEncryptionAvailable, secureStorageStatus, setSecret } from './secrets.js';
+import { ProjectGitWatchSet, readProjectGitDiff, readProjectGitSnapshot } from './project-git.js';
+import { hasSecret, isEncryptionAvailable, secureStorageStatus, setAsideUnreadableSecrets, setSecret, storedSecretsUnreadable } from './secrets.js';
 import { setupApiKeySlot } from '../shared/setup-profile.js';
 import { addSetupProfile, removeSetupProfile, switchSetupProfile } from './setup-profiles.js';
 import { bundledVersion, locateBinary } from './tunnel/locate.js';
@@ -69,47 +101,65 @@ import {
   bridgeStatus,
   publishBridgePortChange,
   companionDiagnostics,
-  sessionActivityExpiresAt,
   sessionInputActivity,
-  recoveryInputAllowed,
-  sessionControlsFor, stopSessionTurn, setSessionAutomation, setSessionObjective, compactSession, cancelSessionCompaction,
+  recoveryHeldByCalls, recoveryInputAllowed,
+  sessionControlsFor, cancelAssistantRecovery, stopSessionTurn, setSessionAutomation, setSessionObjective, compactSession, resumeFromSavedSummary, cancelSessionCompaction,
   cancelWorkerCommands,
   chatUrl,
+  revealChatInBrowser,
+  pendingCommands,
   onBridgeChange,
   startBridge,
   stopBridge,
   sweepStaleSwarm,
-  unpair
+  unpair,
+  followChatInBackground
 } from './bridge.js';
 import { extensionDir } from './extension-path.js';
-import { extensionDownloadUrl } from './version.js';
+import { APP_VERSION, extensionDownloadUrl } from './version.js';
 import {
   deleteSession,
   clearImageStorage,
+  onRecordingStorageFullChange,
+  recordingStorageFull,
+  clearSessionName,
+  renameSession,
   getSession,
   getImageStorage,
-  listSessionPage,
-  findSessionByConversation,
-  readEvents,
-  readRecentEvents,
-  readHandoff
+  setRecordingStorageLimit,
+  readHandoff,
+  readToolEditReview,
+  withSessionMutationFence
 } from './session/store.js';
-import { activeSessionId, forgetSession, onSessionChange } from './session/recorder.js';
-import { blockedChatIds, setChatBlocked } from './session/blocked-chats.js';
+import { forgetSession, notifyChanged, onSessionChange } from './session/recorder.js';
+import { findInSession, locateSearchMatch, searchSessions } from './session/search.js';
+import { readSessionEvents, readSessionList, sessionListCursorSchema } from './session/read-model.js';
+import { exportSessionMarkdown } from './session/markdown-export.js';
+import { blockedChatIds, setChatsBlocked } from './session/blocked-chats.js';
+import { setChatsTrusted, trustedChatIds } from './session/trusted-chats.js';
 import {
   clearAgent,
-  primeForOwnedConversation,
   onSwarmChange,
   pauseSwarmForDisable,
   persistAgentAuthorityNow,
+  workerPrimeOwner,
   resetSwarm,
   swarmState
 } from './agents.js';
-import { tokenPressure } from '../shared/session.js';
 import { forgetWorkspaceRoot, renameWorkspaceRoot } from './workspace.js';
 import { hostPlatformInfo } from './platform.js';
+import {
+  MAX_COMMAND_ALLOWLIST_RULES,
+  MAX_COMMAND_ALLOWLIST_RULE_CHARS,
+  validateCommandAllowlistRule
+} from '../shared/command-allowlist.js';
+import { cosBrowserSignedIn, onCosBrowserSignInChange } from './cos-browser/sign-in.js';
+import { loadCosBrowser, syncCosBrowser } from './cos-browser/selection.js';
+import { onConnectorProofChange } from './connector-proof.js';
+import { opensInCosBrowser } from '../shared/cos-browser-sites.js';
 import { openInPreferredBrowser } from './browser.js';
-import { markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
+import { checkForUpdatesIfStale, manualDownloadUrl, markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
+import { updateAll } from './update-all.js';
 import {
   getMacOSDesktopAccess,
   onMacOSDesktopAccessChange,
@@ -130,8 +180,20 @@ const capabilityPatch = z.object(
 );
 
 const settingsPatch = z.object({
+  // This computer's connector name suffix; see shared/connector-names.ts. Spaces are collapsed.
+  connectorSuffix: z.string().max(64).transform(value => value.trim().replace(/\s+/g, ' '))
+    .refine(value => value.length <= CONNECTOR_SUFFIX_MAX && CONNECTOR_SUFFIX_PATTERN.test(value),
+      'Use up to 32 letters, digits, spaces, dots, dashes or underscores').optional(),
   capabilities: capabilityPatch,
   readOnly: z.boolean(),
+  commandAllowlist: z.object({
+    enabled: z.boolean(),
+    mode: z.enum(['allow', 'deny']).optional().default('allow'),
+    rules: z.array(z.string().max(MAX_COMMAND_ALLOWLIST_RULE_CHARS).superRefine((rule, ctx) => {
+      const message = validateCommandAllowlistRule(rule);
+      if (message) ctx.addIssue({ code: 'custom', message });
+    })).max(MAX_COMMAND_ALLOWLIST_RULES)
+  }),
   tunnel: z.object({
     profileId: z.string().max(64).optional(),
     profileEpoch: z.number().int().nonnegative().optional(),
@@ -152,20 +214,41 @@ const settingsPatch = z.object({
   ui: z.object({
     appearance: appearanceSchema.optional(),
     autoContinue: z.boolean().optional(),
+    defaultChatModel: z.string().trim().min(1).max(80).optional(),
+    defaultChatReasoning: z.enum(REASONING_EFFORTS).optional(),
     chatBrowser: z.enum(CHAT_BROWSERS).optional(),
+    cosBrowserMinimize: z.enum(['taskbar', 'tray']).optional(),
     developerMode: z.boolean().optional(),
+    playfulStatus: z.boolean().optional(),
+    playfulContinue: z.boolean().optional(),
+    followOutput: z.boolean().optional(),
+    mentionCore: z.boolean().optional(),
+    mentionPlugins: z.boolean().optional(),
+    language: z.enum(UI_LANGUAGES).optional(),
+    browserPreferences: z.object({ overwrite: z.boolean(), durations: z.boolean() }).strict().optional(),
+    cosBrowserTrayHint: z.boolean().optional(),
     finishTool: z.boolean().optional(),
     planBackend: z.enum(['chatgpt', 'api']).optional(),
     finishAction: z.enum(['notify', 'goal']).optional(),
     finishLeadMinutes: z.number().int().min(3).max(5).optional(),
     backgroundChats: z.boolean().optional(),
+    backgroundPlacement: z.enum(['window', 'group']).optional(),
+    followUp: z.enum(['steer', 'queue']).optional(),
+    enterSends: z.boolean().optional(),
     browserBridgePort: browserBridgePortSchema.optional(),
     browserOnly: z.boolean().optional(),
     autoRefreshPlugins: z.boolean().optional(),
+    autoRefreshPluginsAsked: z.boolean().optional(),
+    autoSelectSkills: z.boolean().optional(),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
     minimizeToTray: z.boolean(),
     autoConnect: z.boolean(),
     startAtLogin: z.boolean().optional(),
+    turnNotifications: z.boolean().optional(),
+    rotateTurnMinutes: z.number().int().min(0).max(120).optional(),
+    localAppUsage: z.boolean().optional(),
+    keepAwake: z.boolean().optional(),
+    keepScreenAwake: z.boolean().optional(),
     privacyScreenshots: z.boolean(),
     theme: z.enum(['light', 'dark'])
   }),
@@ -173,23 +256,34 @@ const settingsPatch = z.object({
     record: z.boolean(),
     retainDays: z.number().int().min(0).max(3650),
     advisoryTokens: z.number().int().min(10_000).max(4_000_000),
-    limitTokens: z.number().int().min(10_000).max(4_000_000)
+    limitTokens: z.number().int().min(10_000).max(4_000_000),
+    storageLimitGiB: z.number().refine(size => (RECORDING_STORAGE_LIMITS_GIB as readonly number[]).includes(size))
+      .transform(size => size as RecordingStorageLimitGiB).optional()
   }),
   compaction: z.object({
     auto: z.boolean(),
     // Floored well above what a fresh chat holds, so a threshold cannot be set somewhere
     // every conversation is already past the moment it opens.
-    autoTokens: z.number().int().min(10_000).max(4_000_000)
+    autoTokens: z.number().int().min(10_000).max(4_000_000),
+    handoffPrompt: z.string().trim().min(1).max(MAX_HANDOFF_PROMPT_CHARS),
+    handoffLength: z.enum(HANDOFF_LENGTHS).optional()
   }),
   multiAgent: z.object({
     enabled: z.boolean(),
     defaultModel: z.string().max(80).optional(),
     defaultReasoning: z.enum(['', ...REASONING_EFFORTS]).optional(),
     maxWorkers: z.number().int().min(1).max(8),
+    globalMaxWorkers: z.number().int().min(0).max(64).optional(),
     allowUnattributedCalls: z.boolean(),
-    recoverAgentTabs: z.boolean()
+    strictChatAllowlist: z.boolean().optional(),
+    recoverAgentTabs: z.boolean(),
+    waitForSubAgents: z.boolean().optional(),
+    autoWorktrees: z.boolean().optional(),
+    endSleepingWorkerProcesses: z.boolean().optional(),
+    archiveWorkerChats: z.boolean().optional()
   }),
-  mcp: z.object({ instructions: z.string().trim().max(MAX_MCP_INSTRUCTIONS_CHARS) }).strict().optional(),
+  mcp: z.object({ instructions: z.string().trim().max(MAX_MCP_INSTRUCTIONS_CHARS), persistentUrls: z.boolean().optional() }).strict().optional(),
+  controlApi: z.object({ enabled: z.boolean(), allowActions: z.boolean().optional() }).strict().optional(),
   goal: z.object({
     impulseMinutes: z.number().int().min(0).max(60).optional(),
     includeToolCalls: z.boolean().optional(),
@@ -245,7 +339,7 @@ type SettingsSnapshot = z.infer<typeof settingsPatch>;
  * unchanged between `base` and `wanted` was not edited by this renderer save and therefore keeps
  * the current main-process value. A field that differs was deliberately edited here and wins.
  */
-function mergeSettings(current: Config, base: SettingsSnapshot, wanted: SettingsSnapshot): SettingsSnapshot {
+function mergeSettings(current: Config, base: SettingsSnapshot, wanted: SettingsSnapshot): Omit<SettingsSnapshot, 'controlApi'> & { controlApi: Config['controlApi'] } {
   const tunnelEdited = (['tunnelId', 'desktopTunnelId', 'pluginsTunnelId'] as const)
     .some(key => (base.tunnel[key] ?? '') !== (wanted.tunnel[key] ?? ''));
   if (tunnelEdited && ((base.tunnel.profileId ?? 'default') !== (current.tunnel.profileId ?? 'default') ||
@@ -253,16 +347,38 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
     throw new Error('Setup profile changed. Edit the tunnel ID in the selected profile again.');
   }
   const pick = <T>(live: T, before: T, next: T): T => (Object.is(before, next) ? live : next);
+  const pickRules = (live: string[], before: string[], next: string[]): string[] =>
+    before.length === next.length && before.every((rule, index) => rule === next[index]) ? live : next;
   const capabilities = Object.fromEntries(
     CAPABILITIES.map((capability) => [
       capability,
       pick(current.capabilities[capability], base.capabilities[capability], wanted.capabilities[capability])
     ])
   ) as Config['capabilities'];
+  // The two switches merge independently, and actions never outlive the API. A form that omits
+  // `allowActions` leaves it as it is.
+  let controlApi = current.controlApi;
+  if (wanted.controlApi) {
+    const enabled = pick(current.controlApi.enabled, base.controlApi?.enabled ?? false, wanted.controlApi.enabled);
+    const allowActions = wanted.controlApi.allowActions === undefined
+      ? current.controlApi.allowActions
+      : pick(current.controlApi.allowActions, base.controlApi?.allowActions ?? false, wanted.controlApi.allowActions);
+    controlApi = { enabled, allowActions: enabled && allowActions === true };
+  }
   return {
-    mcp: wanted.mcp ? { instructions: pick(current.mcp.instructions, base.mcp?.instructions ?? '', wanted.mcp.instructions) } : current.mcp,
+    ...(wanted.connectorSuffix === undefined ? {} : {
+      connectorSuffix: pick(current.connectorSuffix ?? '', base.connectorSuffix ?? '', wanted.connectorSuffix)
+    }),
+    mcp: wanted.mcp ? { instructions: pick(current.mcp.instructions, base.mcp?.instructions ?? '', wanted.mcp.instructions),
+      persistentUrls: pick(current.mcp.persistentUrls === true, base.mcp?.persistentUrls === true, wanted.mcp.persistentUrls ?? current.mcp.persistentUrls === true) } : current.mcp,
+    controlApi,
     capabilities,
     readOnly: pick(current.readOnly, base.readOnly, wanted.readOnly),
+    commandAllowlist: {
+      enabled: pick(current.commandAllowlist.enabled, base.commandAllowlist.enabled, wanted.commandAllowlist.enabled),
+      mode: pick(current.commandAllowlist.mode, base.commandAllowlist.mode, wanted.commandAllowlist.mode),
+      rules: pickRules(current.commandAllowlist.rules, base.commandAllowlist.rules, wanted.commandAllowlist.rules)
+    },
     tunnel: {
       ...current.tunnel,
         pluginsTunnelId: wanted.tunnel.pluginsTunnelId === undefined ? current.tunnel.pluginsTunnelId ?? ''
@@ -279,21 +395,44 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
     ui: {
       appearance: mergeAppearance(current.ui.appearance, base.ui.appearance, wanted.ui.appearance),
       autoContinue: pick(current.ui.autoContinue, base.ui.autoContinue, wanted.ui.autoContinue),
+      defaultChatModel: pick(current.ui.defaultChatModel, base.ui.defaultChatModel, wanted.ui.defaultChatModel),
+      defaultChatReasoning: pick(current.ui.defaultChatReasoning, base.ui.defaultChatReasoning, wanted.ui.defaultChatReasoning),
       chatBrowser: pick(current.ui.chatBrowser, base.ui.chatBrowser, wanted.ui.chatBrowser),
+      cosBrowserMinimize: pick(current.ui.cosBrowserMinimize, base.ui.cosBrowserMinimize, wanted.ui.cosBrowserMinimize),
       developerMode: pick(current.ui.developerMode, base.ui.developerMode, wanted.ui.developerMode),
+      playfulStatus: pick(current.ui.playfulStatus, base.ui.playfulStatus, wanted.ui.playfulStatus),
+      playfulContinue: pick(current.ui.playfulContinue, base.ui.playfulContinue, wanted.ui.playfulContinue),
+      followOutput: pick(current.ui.followOutput, base.ui.followOutput, wanted.ui.followOutput),
+      mentionCore: pick(current.ui.mentionCore, base.ui.mentionCore, wanted.ui.mentionCore),
+      mentionPlugins: pick(current.ui.mentionPlugins, base.ui.mentionPlugins, wanted.ui.mentionPlugins),
+      // Not part of the settings form: reported by the window and the extension, carried through.
+      language: current.ui.language,
+      browserPreferences: current.ui.browserPreferences,
+      cosBrowserTrayHint: current.ui.cosBrowserTrayHint,
       finishTool: pick(current.ui.finishTool, base.ui.finishTool, wanted.ui.finishTool),
       planBackend: pick(current.ui.planBackend, base.ui.planBackend, wanted.ui.planBackend),
       finishAction: pick(current.ui.finishAction, base.ui.finishAction, wanted.ui.finishAction),
       finishLeadMinutes: pick(current.ui.finishLeadMinutes, base.ui.finishLeadMinutes, wanted.ui.finishLeadMinutes),
       backgroundChats: pick(current.ui.backgroundChats, base.ui.backgroundChats, wanted.ui.backgroundChats),
+      backgroundPlacement: pick(current.ui.backgroundPlacement, base.ui.backgroundPlacement, wanted.ui.backgroundPlacement),
+      followUp: pick(current.ui.followUp, base.ui.followUp, wanted.ui.followUp),
+      enterSends: pick(current.ui.enterSends, base.ui.enterSends, wanted.ui.enterSends),
       browserBridgePort: wanted.ui.browserBridgePort === undefined ? current.ui.browserBridgePort
         : pick(current.ui.browserBridgePort ?? 'auto', base.ui.browserBridgePort ?? 'auto', wanted.ui.browserBridgePort),
       browserOnly: pick(current.ui.browserOnly, base.ui.browserOnly, wanted.ui.browserOnly),
       autoRefreshPlugins: pick(current.ui.autoRefreshPlugins, base.ui.autoRefreshPlugins, wanted.ui.autoRefreshPlugins),
+      // Only the offer's own call answers it; a settings save never takes it back.
+      autoRefreshPluginsAsked: current.ui.autoRefreshPluginsAsked === true || wanted.ui.autoRefreshPluginsAsked === true,
+      autoSelectSkills: pick(current.ui.autoSelectSkills, base.ui.autoSelectSkills, wanted.ui.autoSelectSkills),
       tabsToKeepOpen: pick(current.ui.tabsToKeepOpen, base.ui.tabsToKeepOpen, wanted.ui.tabsToKeepOpen),
       minimizeToTray: pick(current.ui.minimizeToTray, base.ui.minimizeToTray, wanted.ui.minimizeToTray),
       autoConnect: pick(current.ui.autoConnect, base.ui.autoConnect, wanted.ui.autoConnect),
       startAtLogin: pick(current.ui.startAtLogin, base.ui.startAtLogin, wanted.ui.startAtLogin),
+      turnNotifications: pick(current.ui.turnNotifications, base.ui.turnNotifications, wanted.ui.turnNotifications),
+      rotateTurnMinutes: pick(current.ui.rotateTurnMinutes, base.ui.rotateTurnMinutes, wanted.ui.rotateTurnMinutes),
+      localAppUsage: pick(current.ui.localAppUsage, base.ui.localAppUsage, wanted.ui.localAppUsage),
+      keepAwake: pick(current.ui.keepAwake, base.ui.keepAwake, wanted.ui.keepAwake),
+      keepScreenAwake: pick(current.ui.keepScreenAwake, base.ui.keepScreenAwake, wanted.ui.keepScreenAwake),
       privacyScreenshots: pick(
         current.ui.privacyScreenshots,
         base.ui.privacyScreenshots,
@@ -309,26 +448,67 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
         base.sessions.advisoryTokens,
         wanted.sessions.advisoryTokens
       ),
-      limitTokens: pick(current.sessions.limitTokens, base.sessions.limitTokens, wanted.sessions.limitTokens)
+      limitTokens: pick(current.sessions.limitTokens, base.sessions.limitTokens, wanted.sessions.limitTokens),
+      storageLimitGiB: pick(current.sessions.storageLimitGiB, base.sessions.storageLimitGiB, wanted.sessions.storageLimitGiB)
     },
     compaction: {
       auto: pick(current.compaction.auto, base.compaction.auto, wanted.compaction.auto),
-      autoTokens: pick(current.compaction.autoTokens, base.compaction.autoTokens, wanted.compaction.autoTokens)
+      autoTokens: pick(current.compaction.autoTokens, base.compaction.autoTokens, wanted.compaction.autoTokens),
+      handoffPrompt: pick(
+        current.compaction.handoffPrompt,
+        base.compaction.handoffPrompt,
+        wanted.compaction.handoffPrompt
+      ),
+      handoffLength: pick(
+        current.compaction.handoffLength ?? DEFAULT_HANDOFF_LENGTH,
+        base.compaction.handoffLength ?? DEFAULT_HANDOFF_LENGTH,
+        wanted.compaction.handoffLength ?? DEFAULT_HANDOFF_LENGTH
+      )
     },
     multiAgent: {
       defaultModel: pick(current.multiAgent.defaultModel, base.multiAgent.defaultModel, wanted.multiAgent.defaultModel),
       defaultReasoning: pick(current.multiAgent.defaultReasoning, base.multiAgent.defaultReasoning, wanted.multiAgent.defaultReasoning),
       enabled: pick(current.multiAgent.enabled, base.multiAgent.enabled, wanted.multiAgent.enabled),
       maxWorkers: pick(current.multiAgent.maxWorkers, base.multiAgent.maxWorkers, wanted.multiAgent.maxWorkers),
+      globalMaxWorkers: pick(
+        current.multiAgent.globalMaxWorkers ?? 0,
+        base.multiAgent.globalMaxWorkers ?? 0,
+        wanted.multiAgent.globalMaxWorkers ?? 0
+      ),
       allowUnattributedCalls: pick(
         current.multiAgent.allowUnattributedCalls,
         base.multiAgent.allowUnattributedCalls,
         wanted.multiAgent.allowUnattributedCalls
       ),
+      strictChatAllowlist: pick(
+        current.multiAgent.strictChatAllowlist ?? false,
+        base.multiAgent.strictChatAllowlist ?? false,
+        wanted.multiAgent.strictChatAllowlist ?? false
+      ),
       recoverAgentTabs: pick(
         current.multiAgent.recoverAgentTabs,
         base.multiAgent.recoverAgentTabs,
         wanted.multiAgent.recoverAgentTabs
+      ),
+      waitForSubAgents: pick(
+        current.multiAgent.waitForSubAgents,
+        base.multiAgent.waitForSubAgents,
+        wanted.multiAgent.waitForSubAgents
+      ),
+      autoWorktrees: pick(
+        current.multiAgent.autoWorktrees ?? false,
+        base.multiAgent.autoWorktrees ?? false,
+        wanted.multiAgent.autoWorktrees ?? false
+      ),
+      endSleepingWorkerProcesses: pick(
+        current.multiAgent.endSleepingWorkerProcesses ?? false,
+        base.multiAgent.endSleepingWorkerProcesses ?? false,
+        wanted.multiAgent.endSleepingWorkerProcesses ?? false
+      ),
+      archiveWorkerChats: pick(
+        current.multiAgent.archiveWorkerChats ?? false,
+        base.multiAgent.archiveWorkerChats ?? false,
+        wanted.multiAgent.archiveWorkerChats ?? false
       )
     },
     goal: {
@@ -358,6 +538,12 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
 }
 
 const sessionIdArg = z.object({ id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i) });
+/** A chat's own name in the app (#1107): one line, no control characters; null or blank clears it. */
+const sessionNameArg = sessionIdArg.extend({ title: z.string().max(2000).nullable() });
+export function cleanSessionName(title: string | null): string | null {
+  const clean = (title ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120).trim();
+  return clean || null;
+}
 const agentIdArg = z.string().min(1).max(64).regex(/^[0-9a-z-]+$/i);
 
 const renameRoot = z.object({
@@ -380,17 +566,28 @@ async function buildState(): Promise<AppState> {
   return {
     config,
     status: getStatus(),
+    connectorSchemas: Object.fromEntries(
+      pluginRefreshPublications().map(({ surface, schemaId }) => [surface, schemaId])
+    ),
+    connectorRefresh: await pluginRefreshStatuses(),
+    confirmedConnectorSchemas: confirmedPluginSchemas(),
+    pluginRefreshUnreadable: await pluginRefreshUnreadable(),
+    recordingStorageFull: recordingStorageFull(),
     platform: hostPlatformInfo(),
     loginStartupAvailable: supportsLoginStartup(process.platform, app.isPackaged),
     secureStorage: await secureStorageStatus(),
     hasApiKey: await hasSecret(setupApiKeySlot(config.tunnel.profileId)),
     hasGoalKey: await hasSecret('openRouterApiKey'),
     hasCustomProviderKey: await hasSecret('customProviderApiKey'),
+    // After the reads above: only a read can find the file unreadable.
+    credentialsUnreadable: storedSecretsUnreadable(),
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
     bridge: await bridgeStatus(),
+    cosBrowserSignedIn: cosBrowserSignedIn(),
     update: updateStatus(),
-    desktopAccess: getMacOSDesktopAccess()
+    desktopAccess: getMacOSDesktopAccess(),
+    settingsRecovered: settingsRecovered()
   };
 }
 
@@ -413,14 +610,47 @@ function handle<T>(channel: string, fn: (payload: unknown) => Promise<T>): void 
   });
 }
 
+/** Shows a recorded chat's ChatGPT page: its open tab when there is one, else a new one. */
+export async function openSessionChat(id: string): Promise<void> {
+  const summary = await getSession(id);
+  const conversationId = summary?.conversationId;
+  if (!conversationId || !/^[0-9a-z-]{8,64}$/i.test(conversationId)) {
+    throw new Error('This session has no valid ChatGPT conversation');
+  }
+  // The selected browser owns this explicit action. In particular, a connected companion in
+  // Chrome/Edge must not override the user's choice to open the chat in the CoS browser.
+  if (getConfig().ui.chatBrowser === 'cos') {
+    await openInPreferredBrowser(chatUrl(conversationId), { reveal: true });
+    return;
+  }
+  // For an explicitly selected external browser, reveal its existing chat first; otherwise open
+  // the conversation in that same preferred browser (never the system default by accident).
+  if (!(await revealChatInBrowser(conversationId))) await openInPreferredBrowser(chatUrl(conversationId), { reveal: true });
+}
+
 export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall: () => void): void {
   registerWorkspaceTerminalIpc(getWindow);
+  registerDictationIpc(getWindow);
+  // A session row remains visible until its delete IPC resolves. Fence Trust while deletion is
+  // in flight so a second click cannot recreate permission after the row's durable revoke.
+  const deletingSessionIds = new Set<string>();
   let watchedWindow: BrowserWindow | null = null;
   const projectFileWatches = new ProjectFileWatchSet(event => {
     const target = getWindow();
     if (!target || target !== watchedWindow || target.isDestroyed() || target.webContents.isDestroyed()) return;
     target.webContents.send('projectFiles:changed', event);
   });
+  const projectGitWatches = new ProjectGitWatchSet(event => {
+    const target = getWindow();
+    if (!target || target !== watchedWindow || target.isDestroyed() || target.webContents.isDestroyed()) return;
+    target.webContents.send('projectGit:changed', event);
+  });
+  let projectWatchRequest = 0;
+  const closeProjectWatches = (): void => {
+    projectWatchRequest++;
+    projectFileWatches.close();
+    projectGitWatches.close();
+  };
   handle('setup:profile', async payload => {
     const request = z.discriminatedUnion('action', [
       z.object({ action: z.literal('add'), name: z.string().trim().min(1).max(80) }),
@@ -437,8 +667,17 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     });
     return buildState();
   });
-  registerPluginIpc(handle, getWindow);
   handle('usage:get', () => usageOverview());
+  handle('usage:providers', (payload) => readProviderUsage({ fresh: z.object({ fresh: z.boolean() }).parse(payload).fresh }));
+  handle('plugin-refresh:reset', async () => {
+    await resetPluginRefreshLedger();
+    return buildState();
+  });
+  // The renderer asks the person first. Nothing is set aside when the file can be read after all.
+  handle('credentials:start-fresh', async () => {
+    const setAside = (await setAsideUnreadableSecrets()) !== null;
+    return { state: await buildState(), setAside };
+  });
   handle('state:get', async () => {
     const state = await buildState();
     // Native package smoke uses this as the end-to-end renderer readiness barrier. Unlike
@@ -469,6 +708,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // Renderer palette changes are immediate, so keep OS/Electron-owned chrome in lock-step too.
     // Without this, selecting Dark on macOS left the title bar, menus and file picker in the
     // system theme until restart (and startup still defaulted to system before index.ts applies it).
+    // A changed Goal provider address may be one the system reaches directly.
+    void refreshAppProxy();
+    setRecordingStorageLimit(next.sessions.storageLimitGiB ?? DEFAULT_RECORDING_STORAGE_GIB);
+    if ((before.ui.keepAwake !== false) !== (next.ui.keepAwake !== false) || (before.ui.keepScreenAwake === true) !== (next.ui.keepScreenAwake === true)) refreshKeepAwake();
     nativeTheme.themeSource = next.ui.theme;
     if (process.platform === 'win32') getWindow()?.setTitleBarOverlay(titleBarOverlayForTheme(next.ui.theme, next.ui.appearance));
     // BrowserWindow's native backing color is fixed at construction unless updated explicitly.
@@ -476,6 +719,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // live theme switch an old opposite background otherwise flashes behind the renderer while it
     // paints again. This is also the color Electron shows during any later renderer reload/failure.
     getWindow()?.setBackgroundColor(windowBackgroundForTheme(next.ui.theme, next.ui.appearance));
+    refreshPetOverlayAppearance();
     if (
       before.goal.enabled !== next.goal.enabled ||
       // The mode is authority too: a draft started as a gate must not be typed after the user
@@ -527,6 +771,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // Startup and settings saves use one eligibility rule.
     if (browserExtensionRequired(next)) await startBridge();
     else await stopBridge();
+    if (before.ui.chatBrowser !== next.ui.chatBrowser) await syncCosBrowser();
     if (before.capabilities.screen !== next.capabilities.screen || before.capabilities.control !== next.capabilities.control || before.readOnly !== next.readOnly) wakeBrowserWork('browser-control');
     // Permissions and the second tunnel id both decide whether the optional Desktop
     // connector should be published. Without this, enabling desktop access or pasting its
@@ -546,8 +791,31 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       try { applyLoginStartup(app, next.ui.startAtLogin === true); }
       catch (error) { loginStartupError = error; }
     }
+    // The local control API is independent in the same way: only an actual change starts or
+    // stops it, and a listener that cannot bind never undoes the rest of the save.
+    let controlApiError: unknown;
+    if (before.controlApi.enabled !== next.controlApi.enabled) {
+      try { await (next.controlApi.enabled ? startControlApi() : stopControlApi()); }
+      catch (error) { controlApiError = error; }
+    }
+    // Stable connector URLs (#924): turning it on keeps the URLs running now, so nothing has to be
+    // re-entered in ChatGPT; turning it off forgets them, and the next start rotates again.
+    if ((before.mcp.persistentUrls === true) !== (next.mcp.persistentUrls === true)) {
+      if (next.mcp.persistentUrls === true) {
+        if (!(await rememberRunningSurfaceTokens())) logWarn('connector URLs: secure storage is unavailable, so they still change at the next start');
+        else logInfo('connector URLs: kept across restarts from now on');
+      } else {
+        await forgetSurfaceTokens();
+        logInfo('connector URLs: forgotten; the next start gives each connector a new one');
+      }
+    }
+    // The listener reads this switch on every request, so a flip needs no restart; it is logged.
+    if (before.controlApi.allowActions !== next.controlApi.allowActions) {
+      logInfo('control API: actions ' + (next.controlApi.allowActions ? 'allowed' : 'refused'));
+    }
     if (authorityPersistError) throw authorityPersistError;
     if (loginStartupError) throw loginStartupError;
+    if (controlApiError) throw controlApiError;
     return buildState();
   });
 
@@ -576,13 +844,113 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   handle('projects:list', () => listProjects());
+  handle('ui:language', async payload => {
+    // The renderer owns the choice; the main process keeps it for the browser extension.
+    const language = z.enum(UI_LANGUAGES).parse(payload);
+    if (getConfig().ui.language !== language) await updateConfig(config => ({ ...config, ui: { ...config.ui, language } }));
+  });
+  // The one-time offer to turn automatic plugin refresh on (installs from before it existed have
+  // it saved as off). Either answer is kept, so the offer never comes back.
+  handle('pluginRefresh:offer', async (payload) => {
+    const { turnOn } = z.object({ turnOn: z.boolean() }).strict().parse(payload);
+    await updateConfig(config => ({ ...config, ui: { ...config.ui, autoRefreshPluginsAsked: true, ...(turnOn ? { autoRefreshPlugins: true } : {}) } }));
+    if (turnOn) wakeBrowserWork();
+    return buildState();
+  });
+  handle('ui:whatsNewSeen', async () => {
+    // Only this version can be recorded; the renderer cannot write another one (#1172).
+    if (getConfig().ui.lastSeenVersion !== APP_VERSION) await updateConfig(config => ({ ...config, ui: { ...config.ui, lastSeenVersion: APP_VERSION } }));
+  });
+  handle('ui:stopNoticeTexts', async payload => {
+    // The renderer's catalogs translate the stopped-chat notices (#855); bounded and allowlisted.
+    setStopNoticeTranslations(z.record(z.string().max(200), z.string().max(400)).refine(value => Object.keys(value).length <= 16).parse(payload));
+  });
+  handle('ui:mainTexts', async payload => {
+    // The tray menu and Session finish notice in the interface language; bounded and allowlisted.
+    setMainTextTranslations(z.record(z.string().max(200), z.string().max(200)).refine(value => Object.keys(value).length <= 32).parse(payload));
+  });
+  handle('pets:list', async () => petLibraryState());
+  handle('pets:overlayState', async () => petOverlayControlState());
+  handle('pets:overlayVisible', async payload => {
+    const { visible } = z.object({ visible: z.boolean() }).strict().parse(payload);
+    return setPetOverlayVisible(visible);
+  });
+  handle('pets:import', async () => {
+    const options: Electron.OpenDialogOptions = { title: 'Import CoS Pet folder', properties: ['openDirectory'] };
+    const owner = getWindow();
+    const selected = owner && !owner.isDestroyed()
+      ? await dialog.showOpenDialog(owner, options)
+      : await dialog.showOpenDialog(options);
+    if (selected.canceled || !selected.filePaths[0]) return null;
+    return importPet(selected.filePaths[0]);
+  });
+  handle('pets:enabled', async payload => {
+    const { id, enabled } = z.object({ id: z.string().min(1).max(100), enabled: z.boolean() }).strict().parse(payload);
+    const state = setPetEnabled(id, enabled);
+    // Enabling shows the overlay, without restoring other pets dismissed for this run.
+    if (enabled) await setPetOverlayVisible(true, false);
+    return state;
+  });
+  handle('pets:favorite', async payload => {
+    const { id, favorite } = z.object({ id: z.string().min(1).max(100), favorite: z.boolean() }).strict().parse(payload);
+    return setPetFavorite(id, favorite);
+  });
+  handle('pets:delete', async payload => {
+    const { id } = z.object({ id: z.string().min(1).max(100) }).strict().parse(payload);
+    return deletePet(id);
+  });
+  handle('pets:asset', async payload => {
+    const { id, preview } = z.object({ id: z.string().min(1).max(100), preview: z.boolean() }).strict().parse(payload);
+    return loadPetAsset(id, preview);
+  });
   handle('skills:list', () => listSkills());
+  handle('skills:managed', () => listManagedSkills());
+  handle('skills:recommended', () => listRecommendedSkills());
+  handle('skills:installRecommended', async payload => {
+    const { id } = z.object({ id: z.string().regex(SKILL_ID_PATTERN) }).strict().parse(payload);
+    return installRecommendedSkill(id);
+  });
+  handle('skills:import', async payload => {
+    const { kind } = z.object({ kind: z.enum(['folder', 'file']) }).strict().parse(payload);
+    const options: Electron.OpenDialogOptions = kind === 'folder'
+      ? { title: 'Import Skill folder', properties: ['openDirectory'] }
+      : { title: 'Import SKILL.md', properties: ['openFile'], filters: [{ name: 'Markdown skills', extensions: ['md'] }] };
+    const owner = getWindow();
+    const selected = owner && !owner.isDestroyed()
+      ? await dialog.showOpenDialog(owner, options)
+      : await dialog.showOpenDialog(options);
+    if (selected.canceled || !selected.filePaths[0]) return null;
+    if (kind === 'folder') await importSkillPackage(selected.filePaths[0]);
+    else await importSkillFile(selected.filePaths[0]);
+    return listManagedSkills();
+  });
+  handle('skills:githubImport', async payload => {
+    const { url } = z.object({ url: z.string().trim().min(1).max(2048) }).strict().parse(payload);
+    return importGitHubSkill(url);
+  });
+  handle('skills:githubLink', async payload => {
+    const { id, url } = z.object({ id: z.string().regex(SKILL_ID_PATTERN), url: z.string().trim().min(1).max(2048) }).strict().parse(payload);
+    return linkGitHubSkill(id, url);
+  });
+  handle('skills:githubCheck', async payload => {
+    const { id } = z.object({ id: z.string().regex(SKILL_ID_PATTERN) }).strict().parse(payload);
+    return checkGitHubSkillUpdates(id);
+  });
+  handle('skills:githubUpdate', async payload => {
+    const { id } = z.object({ id: z.string().regex(SKILL_ID_PATTERN) }).strict().parse(payload);
+    return updateGitHubSkill(id, directory => shell.trashItem(directory));
+  });
+  handle('skills:remove', async payload => {
+    const { id } = z.object({ id: z.string().regex(SKILL_ID_PATTERN) }).strict().parse(payload);
+    await removeSkill(id, directory => shell.trashItem(directory));
+    return listManagedSkills();
+  });
   handle('skills:library', async payload => {
     const scope = z.object({ sessionId: z.string().min(1).max(80).nullable().optional(), projectId: z.string().uuid().nullable().optional() }).strict().parse(payload ?? {});
     const folder = () => scope.sessionId ? getSessionProject(scope.sessionId)
       : scope.projectId ? projectWorkspace(scope.projectId) : Promise.resolve(null);
     const before = await folder();
-    const library = await listSkillLibrary({ projectPath: before?.real ?? null });
+    const library = await listSkillLibrary({ projectPath: localProjectPath(before), refreshCodexPlugins: true });
     if ((await folder())?.real !== before?.real) throw new Error('The project changed while Skills were loading');
     return library;
   });
@@ -605,6 +973,30 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       push('state:changed', state);
     }
     const project = await addProject(folder);
+    push('session:changed');
+    // Its native ChatGPT Project is created by the browser; tell it there is work.
+    if (project.chatgpt?.state === 'requested') wakeBrowserWork();
+    return project;
+  });
+  // A folder on a server (#1469): the address and folder as typed; the server is asked once.
+  handle('projects:addRemote', async payload => {
+    const { address, folder } = (payload ?? {}) as { address?: unknown; folder?: unknown };
+    if (typeof address !== 'string' || typeof folder !== 'string' || address.length > 300 || folder.length > 4096) throw new Error('Enter an SSH address and a folder');
+    const project = await addRemoteProject(address, folder);
+    push('session:changed');
+    if (project.chatgpt?.state === 'requested') wakeBrowserWork();
+    return project;
+  });
+  handle('projects:chatgpt-retry', async payload => {
+    const { id } = z.object({ id: z.string().uuid() }).strict().parse(payload);
+    const project = await retryProjectCreate(id);
+    if (project) wakeBrowserWork();
+    push('session:changed');
+    return project;
+  });
+  handle('projects:color', async payload => {
+    const { id, color } = z.object({ id: z.string().uuid(), color: z.enum(PROJECT_COLORS).nullable() }).strict().parse(payload);
+    const project = await setProjectColor(id, color);
     push('session:changed');
     return project;
   });
@@ -660,19 +1052,40 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('projectFiles:watch', async payload => {
     const { projectId, directories } = z.object({ projectId: projectFileId.nullable(), directories: z.array(projectRelativePath).max(128) }).strict().parse(payload);
     const target = getWindow();
-    if (!target || target.isDestroyed()) { projectFileWatches.close(); return false; }
+    if (!target || target.isDestroyed()) { closeProjectWatches(); return false; }
     if (target !== watchedWindow) {
-      projectFileWatches.close();
+      closeProjectWatches();
       watchedWindow = target;
       target.webContents.once('destroyed', () => {
-        if (watchedWindow === target) { watchedWindow = null; projectFileWatches.close(); }
+        if (watchedWindow === target) { watchedWindow = null; closeProjectWatches(); }
       });
       target.webContents.on('did-start-loading', () => {
-        if (watchedWindow === target) projectFileWatches.close();
+        if (watchedWindow === target) closeProjectWatches();
       });
     }
+    const request = ++projectWatchRequest;
     await projectFileWatches.sync(projectId, projectId ? directories : []);
-    return true;
+    if (request !== projectWatchRequest || watchedWindow !== target) return false;
+    await projectGitWatches.sync(projectId);
+    return request === projectWatchRequest && watchedWindow === target;
+  });
+  handle('projectGit:snapshot', async payload => {
+    const { projectId, baseRef } = z.object({ projectId: projectFileId,
+      baseRef: z.string().min(1).max(256).optional() }).strict().parse(payload);
+    return readProjectGitSnapshot(projectId, baseRef);
+  });
+  handle('projectGit:diff', async payload => {
+    const { projectId, path, baseRef, expectedRevision } = z.object({ projectId: projectFileId, path: projectRelativePath.min(1),
+      baseRef: z.string().min(1).max(256).optional(), expectedRevision: z.string().length(64).regex(/^[0-9a-f]+$/).optional() }).strict().parse(payload);
+    return readProjectGitDiff(projectId, path, baseRef, expectedRevision);
+  });
+  handle('sessions:toolEditReview', async payload => {
+    const { sessionId, callId, changeIndex } = z.object({
+      sessionId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+      callId: z.string().uuid(),
+      changeIndex: z.number().int().min(0).max(63)
+    }).strict().parse(payload);
+    return readToolEditReview(sessionId, callId, changeIndex);
   });
   handle('projectFiles:preview', async payload => {
     const { projectId, path } = z.object({ projectId: projectFileId, path: projectRelativePath.min(1) }).strict().parse(payload);
@@ -697,6 +1110,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const { projectId, path } = z.object({ projectId: projectFileId, path: projectRelativePath.min(1) }).strict().parse(payload);
     const target = await projectFileTarget(projectId, path, { allowRoot: false });
     if (target.kind !== 'file' && target.kind !== 'directory') throw new Error('Only regular files and folders can be deleted');
+    await revalidateProjectFileTarget(target);
     await shell.trashItem(target.real);
     return true;
   });
@@ -708,6 +1122,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
   handle('projectFiles:attach', async payload => {
     const { projectId, path } = z.object({ projectId: projectFileId, path: projectRelativePath.min(1) }).strict().parse(payload);
+    // A file in a project on a server (#1469) is copied over SFTP first.
+    const snapshot = await serverFileSnapshot(projectId, path);
+    if (snapshot) {
+      const retained = new Set((await listInputs()).filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).flatMap(row => row.attachments?.map(file => file.id) ?? []));
+      try { return await stageInputAttachment(snapshot.file, retained); } finally { await snapshot.cleanup(); }
+    }
     const target = await projectFileTarget(projectId, path, { allowRoot: false, fileOnly: true });
     const retained = new Set((await listInputs()).filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).flatMap(row => row.attachments?.map(file => file.id) ?? []));
     const checked = await projectFileTarget(projectId, path, { allowRoot: false, fileOnly: true });
@@ -753,8 +1173,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
    * module's own, so the renderer cannot ask for the whole catalogue in one call.
    */
   handle('goal:models', async (payload) => {
-    const { offset } = z.object({ offset: z.number().int().min(0).max(2000).default(0) }).parse(payload ?? {});
-    return listGoalModels(offset, MODEL_PAGE_SIZE);
+    const { offset, query } = z.object({
+      offset: z.number().int().min(0).max(2000).default(0),
+      query: z.string().max(160).default('')
+    }).parse(payload ?? {});
+    return listGoalModels(offset, MODEL_PAGE_SIZE, query);
   });
 
   handle('binary:pick', async () => {
@@ -788,8 +1211,50 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   handle('diagnostics:run', async () => runDiagnostics());
+  // "Save diagnostics report": one plain-text file for a bug report, personal details removed
+  // (see diagnostics-report.ts). Revealed after saving so the user reads what they would share.
+  handle('diagnostics:saveReport', async () => {
+    const selfTest = await Promise.race([
+      runDiagnostics().catch(() => null),
+      new Promise<null>(resolve => setTimeout(() => resolve(null), 10_000).unref())
+    ]);
+    const workers = swarmState().agents;
+    const sessions = await listSessions().catch(() => []);
+    const now = Date.now();
+    const facts = await collectReportFacts({ update: updateStatus(), sessions,
+      inputs: await listInputs().catch(() => []), now }).catch(() => undefined);
+    const text = renderDiagnosticsReport({
+      app: systemFacts(app), home: app.getPath('home'),
+      bridge: await bridgeStatus(), extension: await companionDiagnostics().catch(() => null),
+      selfTest: selfTest && { summary: selfTest.summary, checks: selfTest.checks.map(({ name, status, detail }) => ({ name, status, detail })) },
+      commands: pendingCommands().map(({ id, what, lastError }) => ({ command: id, what, lastError })),
+      workers: workers.map(({ id, role, state, model, reasoningEffort, createdAt, activatedAt, finishedAt, pending, delivered, conversationId, revivable }) =>
+        ({ worker: id, role, state, model, reasoningEffort, createdAt, activatedAt, finishedAt, pending, delivered, conversationId, revivable })),
+      sessions,
+      projects: await listProjects().catch(() => []),
+      workerTexts: workers.flatMap(worker => [worker.task ?? '', worker.label ?? '', worker.result ?? '']),
+      log: await readRecentLog(),
+      memory: memoryFacts(getWindow()),
+      ...(facts ? { facts } : {}),
+      now
+    });
+    return saveDiagnosticsReport(text, getWindow());
+  });
   handle('desktop:requestAccessibility', async () => {
     await refreshMacOSDesktopAccess({ promptAccessibility: true });
+    return buildState();
+  });
+  // A grant from an earlier build no longer applies, yet System Settings shows it on: reset this
+  // app's own entries and ask again, so macOS files the grant under the build running now.
+  handle('desktop:repairPermissions', async () => {
+    const access = getMacOSDesktopAccess();
+    if (process.platform !== 'darwin' || !access) return buildState();
+    const reset = await repairMacOSPermissions(access, {
+      reset: resetMacOSPermissions,
+      requestScreen: async () => { await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } }); },
+      refresh: async options => { await refreshMacOSDesktopAccess(options); }
+    });
+    logInfo(`desktop macos permissions reset for a new prompt: ${reset.join(', ') || 'none'}`);
     return buildState();
   });
 
@@ -802,11 +1267,27 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return true;
   });
 
+  // Copy or save a completed turn's answer, or the session transcript, as Markdown. Main reads
+  // the full text of answers that were cut in the log, so neither comes out truncated.
+  handle('sessions:exportMarkdown', async (payload) => {
+    const request = z.object({
+      id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+      scope: z.enum(['answer', 'session']),
+      turnId: z.string().min(1).max(200).optional(),
+      target: z.enum(['clipboard', 'file'])
+    }).parse(payload);
+    return exportSessionMarkdown(request, getWindow());
+  });
+
   // The Install button. The renderer decides nothing about what is installed - it cannot
   // name a file, a version or a path - it only says "now", and only a staged, digest-checked
   // artifact makes that mean anything. The quit is what applies it, at the end of the same
   // shutdown sequence every other quit runs; refusing here is how a press with nothing staged
   // avoids closing the app for no reason.
+  // Update all. A downloaded update restarts only for the exact version the person approved in
+  // the app's own dialog; any other call answers `confirm`, so the window can ask first.
+  handle('update:all', async payload => updateAll(quitToInstall, url => shell.openExternal(url),
+    async version => typeof payload === 'string' && payload === version));
   handle('update:install', async () => {
     if (!markInstallOnQuit()) throw new Error('There is no downloaded update to install yet');
     logInfo('update: install requested; quitting to hand the update over');
@@ -814,63 +1295,84 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return true;
   });
 
+  // "Get update" for an installation that cannot update itself: the exact published file for
+  // this machine and the announced version, opened in the user's browser. The renderer names
+  // nothing; the URL is built here from the checked release and this process's platform.
+  // Opening Settings: ask GitHub again if the last answer is older than ten minutes. The status
+  // reaches the window through the ordinary state push; this returns before the check does.
+  handle('update:refresh', async () => {
+    void checkForUpdatesIfStale();
+    return true;
+  });
+
+  handle('update:download', async () => {
+    await shell.openExternal(manualDownloadUrl(updateStatus().latest));
+    return true;
+  });
+
   handle('link:open', async (payload) => {
-    const { url } = z.object({ url: z.string().max(8192) }).parse(payload);
+    const { url, external } = z.object({ url: z.string().max(8192), external: z.boolean().optional() }).parse(payload);
     if (!ALLOWED_LINKS.has(url) && !safeExternalLink(url)) throw new Error('That link is not allowed');
-    await shell.openExternal(url);
+    // Setup's ChatGPT and OpenAI pages open where the user is already signed in, unless the
+    // user asked for their own browser instead.
+    if (!external && getConfig().ui.chatBrowser === 'cos' && opensInCosBrowser(url)) await openInPreferredBrowser(url, { reveal: true });
+    else await shell.openExternal(url);
+    return true;
+  });
+
+  // Setup's "Open ChatGPT" for Chrome, Edge or Brave: the chosen browser, where the extension is.
+  handle('chatgpt:open', async () => {
+    await openInPreferredBrowser('https://chatgpt.com/', { reveal: true });
+    return true;
+  });
+
+  // Setup's button once ChatGPT is surely signed in: ChatGPT's own sign-out, where it runs. The
+  // status follows from that browser's own answer, as it does for any sign-out.
+  handle('chatgpt:signOut', async () => {
+    await openInPreferredBrowser('https://chatgpt.com/auth/logout', { reveal: true });
+    return true;
+  });
+
+  // Installation does not change the saved execution browser or load the CoS host.
+  handle('browser:setupOpen', async (payload) => {
+    const { browser, page } = z.object({ browser: z.enum(['chrome', 'edge', 'brave', 'firefox', 'helium']), page: z.enum(['extensions', 'chatgpt']) }).strict().parse(payload);
+    if (page === 'chatgpt') {
+      await openInPreferredBrowser('https://chatgpt.com/', { browser, reveal: true });
+      return true;
+    }
+    // Firefox installs the signed add-on from its release download; it asks before adding it.
+    if (browser === 'firefox') {
+      await openInPreferredBrowser(firefoxAddonUrl(APP_VERSION), { browser, reveal: true });
+      return true;
+    }
+    // A browser opens its own internal pages only from its address bar: given on the command line,
+    // chrome://extensions and edge://extensions both open a new tab instead (measured 2026-10-12).
+    // So the address goes on the clipboard and the browser comes up with a new tab to paste it into.
+    await clipboard.writeText(`${browser}://extensions`);
+    await openInPreferredBrowser('about:blank', { browser, reveal: true });
+    return true;
+  });
+
+  // Setup's first step: the CoS browser on screen, on ChatGPT's login when signed out.
+  handle('cosBrowser:show', async () => {
+    if (getConfig().ui.chatBrowser !== 'cos') throw new Error('The CoS browser is not the selected ChatGPT browser');
+    await (await loadCosBrowser()).showSignIn();
     return true;
   });
 
   // ------------------------------------------------------------- sessions
 
   handle('sessions:list', async (payload) => {
-    const { cursor, limit } = z
+    const { cursor, limit, projectId } = z
       .object({
-        cursor: z
-          .object({
-            updatedAt: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
-            id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i)
-          })
-          .optional(),
+        cursor: sessionListCursorSchema.optional(),
         // Keep one renderer payload small even when the store can index much more history.
-        limit: z.number().int().min(1).max(60).optional()
+        limit: z.number().int().min(1).max(60).optional(),
+        // One project's own pages: expanding a project must not page the whole history (#1190).
+        projectId: z.string().regex(/^[a-f0-9-]{36}$/i).optional()
       })
       .parse(payload ?? {});
-    const config = getConfig();
-    await listInputs(); // Restore exact helper origins before the first sidebar page.
-    const page = await listSessionPage({ cursor, limit: limit ?? 60 });
-    // Older recordings omitted worker origins' parent IDs. The broker's exact
-    // retained owner can repair that presentation without reviving a worker or
-    // guessing from reusable names such as worker-1.
-    const parents = new Map<string, ReturnType<typeof findSessionByConversation>>();
-    const sessions = await Promise.all(page.sessions.map(async (summary) => {
-      if (summary.origin?.kind !== 'worker' || summary.origin.fromSessionId || !summary.conversationId) return summary;
-      const prime = primeForOwnedConversation(summary.conversationId);
-      if (!prime || prime === summary.conversationId) return summary;
-      if (!parents.has(prime)) parents.set(prime, findSessionByConversation(prime, { requireUnique: true }));
-      const parent = await parents.get(prime);
-      return parent && parent.id !== summary.id ? { ...summary, origin: { ...summary.origin, fromSessionId: parent.id } } : summary;
-    }));
-    return {
-      sessions: sessions.map(summary => {
-        const activityExpiresAt = sessionActivityExpiresAt(summary);
-        return activityExpiresAt === undefined ? summary : { ...summary, activityExpiresAt };
-      }),
-      total: page.total,
-      nextCursor: page.nextCursor,
-      activeId: activeSessionId(),
-      // Live policy, not session history: a block is keyed by ChatGPT conversation and does
-      // not belong in any session's meta.json. It rides the list for the same reason
-      // `activeId` and `pressure` do — one paint, one round trip.
-      blocked: blockedChatIds(),
-      pressure: sessions.map((summary) => ({
-        id: summary.id,
-        // Pressure belongs to the currently attached ChatGPT context. `estimatedTokens` is
-        // deliberately lifetime history and therefore never resets across Compact & Resume;
-        // using it here made a fresh B look fuller than the A it had just replaced.
-        ...tokenPressure(summary.contextTokens, config.sessions.advisoryTokens, config.sessions.limitTokens)
-      }))
-    };
+    return readSessionList({ cursor, limit: limit ?? 60, ...(projectId ? { projectId } : {}) });
   });
 
   handle('sessions:image', async (payload) => {
@@ -881,11 +1383,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('sessions:clearImageStorage', async (payload) => {
     const { mode } = z.object({ mode: z.enum(['oldest-gib', 'all']) }).parse(payload);
     const result = await clearImageStorage(mode);
-    push('session:changed');
+    // Retired images can belong to any transcript; this is the explicit global invalidation.
+    push('session:changed', { allTranscripts: true } satisfies SessionChange);
     return result;
   });
   handle('sessions:events', async (payload) => {
-    const { id, from, before, after, limit } = z
+    const { id, ...options } = z
       .object({
         id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
         from: z.number().int().min(0).max(10_000_000).optional(),
@@ -894,30 +1397,14 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
         limit: z.number().int().min(1).max(1000).optional()
       })
       .parse(payload);
-    const summary = await getSession(id);
-    if (!summary) throw new Error('Session not found');
-    // The renderer draws a timeline, not the whole log: the tail is what matters and
-    // the rest stays one click away rather than being pushed over IPC every refresh.
-    // The renderer never paints more than 160 rows. Sending nearly twice that on every first
-    // load was pure cloning/IPC work; later refreshes use the sequence cursor below.
-    const cap = limit ?? 160;
-    if (from === undefined) {
-      // Navigation uses immutable origins. `from` alone is a publication cursor
-      // for live revisions and must never decide which history page owns a row.
-      const events = await readRecentEvents(id, cap, { before, after, orderByOrigin: true });
-      const nextFrom = events.reduce((cursor, event) => Math.max(cursor, event.seq + 1), 0);
-      return { summary, events, total: summary.events, nextFrom };
-    }
-    const events = await readEvents(id, { from, limit: cap });
-    const nextFrom = events.reduce((cursor, event) => Math.max(cursor, event.seq + 1), from);
-    return { summary, events, total: summary.events, nextFrom };
+    const page = await readSessionEvents(id, options);
+    if (!page) throw new Error('Session not found');
+    return page;
   });
 
   const stageFiles = async (sources: AttachmentSource[]) => {
     const retained = new Set((await listInputs()).filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).flatMap(row => row.attachments?.map(file => file.id) ?? []));
-    const result = [];
-    for (const source of sources) result.push(await stageInputAttachment(source, retained));
-    return result;
+    return stageInputAttachments(sources, retained);
   };
   handle('sessions:files', async () => {
     const chosen = await dialog.showOpenDialog({ title: 'Attach files', properties: ['openFile', 'multiSelections'] });
@@ -954,6 +1441,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('browser:preferences', async (payload) => requestBrowserPreferences(payload));
   handle('chatModels:request', async () => startChatModelDiscovery());
   handle('sessions:controls', async (payload) => sessionControlsFor(sessionIdArg.parse(payload).id));
+  // #1032: the user keeps this answer from being reloaded; false once the browser claimed it.
+  handle('sessions:cancelRecovery', async (payload) => cancelAssistantRecovery(sessionIdArg.parse(payload).id));
   handle('sessions:automation', async (payload) => {
     const { id, automation, afterTurn } = sessionIdArg.extend({ automation: z.enum(['off', 'goal', 'loop']), afterTurn: z.boolean().optional() }).parse(payload);
     return setSessionAutomation(id, automation, afterTurn);
@@ -963,6 +1452,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return setSessionObjective(id, text, mode);
   });
   handle('sessions:compact', async (payload) => compactSession(sessionIdArg.parse(payload).id));
+  handle('sessions:resumeFromHandoff', async (payload) => {
+    const input = sessionIdArg.extend({ handoffId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i) }).strict().parse(payload);
+    return resumeFromSavedSummary(input.id, input.handoffId);
+  });
   handle('sessions:cancelCompaction', async (payload) => cancelSessionCompaction(sessionIdArg.parse(payload).id));
   handle('sessions:plan', async (payload) => {
     const { text, backend, requestId } = z.object({ text: z.string().trim().min(1).max(16000), backend: z.enum(['api', 'chatgpt']), requestId: z.string().uuid().optional() }).parse(payload);
@@ -984,9 +1477,44 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
   handle('sessions:retryBrowser', async (payload) => retryQueuedInputBrowser(z.object({ id: z.string().uuid() }).parse(payload).id));
   handle('sessions:pausedHelpers', async () => pausedBrowserHelpers());
+  // What a working chat's tool calls are doing right now, for its live caption.
+  handle('sessions:runningTools', async (payload) => {
+    const { conversationIds } = z.object({ conversationIds: z.array(z.string().min(1).max(200)).max(16) }).parse(payload);
+    return runningToolActivity(conversationIds);
+  });
+  handle('sessions:runningProcesses', async (payload) => {
+    const { sessionId } = z.object({
+      sessionId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i)
+    }).parse(payload);
+    return runningExecProcesses(sessionId);
+  });
+  handle('sessions:stopProcess', async (payload) => {
+    const { sessionId, processId, incarnation } = z.object({
+      sessionId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+      processId: z.number().int().min(1_000).max(99_999),
+      incarnation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+    }).parse(payload);
+    return stopExecProcess(sessionId, processId, incarnation);
+  });
+  // The window armed its Keychain notice; the first Keychain read may start.
+  handle('keychain:noticeReady', async () => keychainNoticeReady());
+  // The round outlines (shared/turn-trace.ts) of the turns a timeline shows.
+  handle('sessions:traces', async (payload) => {
+    const { id, turnIds } = z.object({
+      id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+      turnIds: z.array(z.string().min(1).max(100)).max(64)
+    }).parse(payload);
+    return readTurnTraces(id, turnIds);
+  });
   handle('sessions:retryHelper', async (payload) => {
     const { id, sourceSessionId } = z.object({ id: z.string().uuid(), sourceSessionId: z.string().min(8).max(64) }).parse(payload);
     return retryGoalBrowserHelper(sourceSessionId, id);
+  });
+  handle('sessions:sendQueuedNow', async (payload) => {
+    const { id } = z.object({ id: z.string().uuid() }).strict().parse(payload);
+    const sent = await sendQueuedInputNow(id);
+    if (sent) wakeBrowserWork();
+    return sent;
   });
   handle('sessions:editInput', async (payload) => { const { id, text, afterTurn } = z.object({ id: z.string().uuid(), text: inputArgs.shape.text, afterTurn: z.boolean().optional() }).parse(payload); return editQueuedInput(id, text, afterTurn); });
   handle('sessions:cancelInput', async (payload) => cancelDesktopInput(z.object({ id: z.string().uuid() }).parse(payload).id));
@@ -1003,12 +1531,39 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
 
   handle('sessions:openChat', async (payload) => {
     const { id } = sessionIdArg.parse(payload);
-    const summary = await getSession(id);
-    const conversationId = summary?.conversationId;
-    if (!conversationId || !/^[0-9a-z-]{8,64}$/i.test(conversationId)) {
-      throw new Error('This session has no valid ChatGPT conversation');
+    await openSessionChat(id);
+    return true;
+  });
+
+  // ChatGPT's tool approval card, answered in the app (approval-wait.ts). Only a person's click
+  // in the renderer reaches `answerApproval`; the page presses the button for that exact card.
+  handle('sessions:approvalCard', async (payload) => {
+    const { id } = sessionIdArg.parse(payload);
+    const conversationId = (await getSession(id))?.conversationId;
+    return conversationId ? approvalCardView(conversationId) : null;
+  });
+  handle('sessions:answerApproval', async (payload) => {
+    const { id, cardId, choice } = sessionIdArg.extend({ cardId: z.string().min(8).max(64), choice: z.enum(['allow', 'deny']) })
+      .strict().parse(payload);
+    const conversationId = (await getSession(id))?.conversationId;
+    if (!conversationId) return { ok: false as const, error: 'no_card' as const };
+    const answer = requestApprovalAnswer(conversationId, cardId, choice);
+    if (answer.ok) {
+      logInfo(`approval card: the user chose ${choice} in the app for ${conversationId}`);
+      return { ok: true as const };
     }
-    await openInPreferredBrowser(chatUrl(conversationId));
+    return answer;
+  });
+
+  // Selecting a chat in the app selects its tab in the Background chats window (#1249). Only
+  // the newest selection counts: a slower lookup for an earlier click must not win (#1267).
+  let followSelection = 0;
+  handle('sessions:followTab', async (payload) => {
+    const { id } = sessionIdArg.parse(payload);
+    const selection = ++followSelection;
+    const conversationId = (await getSession(id))?.conversationId;
+    if (selection !== followSelection) return true;
+    if (conversationId && /^[0-9a-z-]{8,64}$/i.test(conversationId)) followChatInBackground(conversationId);
     return true;
   });
 
@@ -1024,12 +1579,25 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const { id, blocked } = z
       .object({ id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i), blocked: z.boolean() })
       .parse(payload);
-    const summary = await getSession(id);
-    const conversationId = summary?.conversationId;
-    if (!conversationId || !/^[0-9a-z-]{8,64}$/i.test(conversationId)) {
-      throw new Error('This session has no valid ChatGPT conversation');
+    if (deletingSessionIds.has(id)) {
+      throw new Error('This session is being deleted; its block cannot be changed');
     }
-    setChatBlocked(conversationId, blocked);
+    const conversationId = await withSessionMutationFence(id, async (summary) => {
+      if (deletingSessionIds.has(id)) {
+        throw new Error('This session is being deleted; its block cannot be changed');
+      }
+      const currentConversationId = summary.conversationId;
+      if (!currentConversationId || !/^[0-9a-z-]{8,64}$/i.test(currentConversationId)) {
+        throw new Error('This session has no valid ChatGPT conversation');
+      }
+      setChatsBlocked(
+        blocked
+          ? [currentConversationId]
+          : [currentConversationId, ...committedResumeAncestorsFromSummary(summary, currentConversationId)],
+        blocked
+      );
+      return currentConversationId;
+    });
     logInfo(
       blocked
         ? `conversation ${conversationId} blocked; its tool calls are refused until it is released`
@@ -1038,28 +1606,117 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // A blocked worker chat frees its swarm slot now, not on the next 30-second pass: the
     // user pressing Block on a worker is usually about to start something in its place.
     if (blocked) await sweepStaleSwarm().catch(() => undefined);
+    refreshPetOverlayActivities();
     return blockedChatIds();
   });
 
+  handle('sessions:trust', async (payload) => {
+    const { id, expectedConversationId, trusted } = z
+      .object({
+        id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+        expectedConversationId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+        trusted: z.boolean()
+      })
+      .parse(payload);
+    if (deletingSessionIds.has(id)) {
+      throw new Error('This session is being deleted; its trust cannot be changed');
+    }
+    const conversationId = await withSessionMutationFence(id, async (summary) => {
+      // Delete may have started while this operation was waiting behind an earlier session write.
+      // If Trust entered this queue first it linearizes before Delete; otherwise the tombstone wins.
+      if (deletingSessionIds.has(id)) {
+        throw new Error('This session is being deleted; its trust cannot be changed');
+      }
+      const currentConversationId = summary.conversationId;
+      if (!currentConversationId || !/^[0-9a-z-]{8,64}$/i.test(currentConversationId)) {
+        throw new Error('This session has no valid ChatGPT conversation');
+      }
+      if (currentConversationId !== expectedConversationId) {
+        throw new Error('This session moved to another ChatGPT conversation; refresh the chat list before changing trust');
+      }
+      const workerOwner = workerPrimeOwner(currentConversationId);
+      if (trusted && (workerOwner.owned || summary.origin?.kind === 'worker')) {
+        throw new Error('Worker chats cannot be trusted directly; trust the owning prime chat instead');
+      }
+      // The current resumed row is the only UI handle left after A -> B. Its Untrust action must
+      // remove every explicit Trust entry that can still grant B through committed provenance;
+      // deleting only B would immediately fall through to a still-trusted A. Worker Untrust is
+      // deliberately exact-only so stale pre-fix worker entries can be cleaned without touching
+      // the owning prime.
+      const trustTargets = !trusted && !workerOwner.owned
+        ? [currentConversationId, ...committedResumeAncestorsFromSummary(summary, currentConversationId)]
+        : [currentConversationId];
+      await setChatsTrusted(trustTargets, trusted);
+      return currentConversationId;
+    });
+    logInfo(trusted
+      ? `conversation ${conversationId} trusted for strict chat allowlisting`
+      : `conversation ${conversationId} removed from strict chat allowlisting`);
+    return trustedChatIds();
+  });
+
+  // Search chats by title and by what was said in them (#1107).
+  handle('sessions:search', async (payload) => {
+    const { query } = z.object({ query: z.string().max(200) }).parse(payload);
+    return searchSessions(query);
+  });
+  // Where a text match is in its chat, so opening the result shows that message.
+  handle('sessions:find', async (payload) => {
+    const { id, query } = z.object({ id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i), query: z.string().max(200) }).strict().parse(payload);
+    return findInSession(id, query);
+  });
+  handle('sessions:locate-match', async (payload) => {
+    const { id, query } = sessionIdArg.extend({ query: z.string().max(200) }).parse(payload);
+    return locateSearchMatch(id, query);
+  });
+  handle('sessions:rename', async (payload) => {
+    const { id, title } = sessionNameArg.parse(payload);
+    if (!await getSession(id)) throw new Error('Session not found');
+    const name = cleanSessionName(title);
+    if (name) await renameSession(id, name, 'manual');
+    else await clearSessionName(id);
+    notifyChanged(id);
+    return true;
+  });
   handle('sessions:delete', async (payload) => {
     const { id } = sessionIdArg.parse(payload);
-    // Detach first. The recorder maps live ChatGPT conversations to session ids, so
-    // deleting the folder underneath a live one left it appending to a session that no
-    // longer existed — the events went to a resurrected half-session with no summary.
-    // Forgetting the mapping makes the next observation open a fresh session instead.
-    const detached = forgetSession(id);
-    // Release first. The block button lives on this row, so a block left behind by the row's
-    // deletion would refuse that conversation's tools with nothing left in the app that could
-    // ever release it.
-    const summary = await getSession(id);
-    if (summary?.conversationId) setChatBlocked(summary.conversationId, false);
-    await deleteSession(id);
-    logInfo(
-      detached.length > 0
-        ? `session ${id} deleted; ${detached.length} live conversation(s) will start a new session`
-        : `session ${id} deleted`
-    );
-    return true;
+    if (deletingSessionIds.has(id)) throw new Error('This session is already being deleted');
+    deletingSessionIds.add(id);
+    try {
+      const summary = await getSession(id);
+      // Trust is permission. Revoke it durably before any other deletion side effect; otherwise
+      // a failed disk commit could leave this chat both trusted and newly unblocked, with its row
+      // already gone and no user control left to repair that authority.
+      if (summary?.conversationId) {
+        await setChatsTrusted([
+          summary.conversationId,
+          ...committedResumeAncestorsFromSummary(summary, summary.conversationId)
+        ], false);
+      }
+      // Detach first. The recorder maps live ChatGPT conversations to session ids, so
+      // deleting the folder underneath a live one left it appending to a session that no
+      // longer existed — the events went to a resurrected half-session with no summary.
+      // Forgetting the mapping makes the next observation open a fresh session instead.
+      const detached = forgetSession(id);
+      // Release first. The current resumed row is also the only UI handle for a Block on one of
+      // its committed predecessors, so deleting the row must clear that whole policy lineage.
+      // Otherwise a hidden source block survives with no remaining row that can release it.
+      if (summary?.conversationId) {
+        setChatsBlocked([
+          summary.conversationId,
+          ...committedResumeAncestorsFromSummary(summary, summary.conversationId)
+        ], false);
+      }
+      await deleteSession(id);
+      logInfo(
+        detached.length > 0
+          ? `session ${id} deleted; ${detached.length} live conversation(s) will start a new session`
+          : `session ${id} deleted`
+      );
+      return true;
+    } finally {
+      deletingSessionIds.delete(id);
+    }
   });
 
   handle('handoff:get', async (payload) => {
@@ -1144,6 +1801,133 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return { cleared: outcome.cleared, reason: outcome.reason, swarm: swarmState() };
   });
 
+  // Retiring a worker must never silently erase its branch, ignored files or uncommitted
+  // work. The UI offers a review after finished/failed/cleared (including after restart).
+  // Lookup is *on demand*: startup only restores worktrees for still-broker-owned workers.
+  const worktreeCleanupId = z.object({
+    runId: z.string().uuid(),
+    agentId: z.string().regex(/^worker-[1-9][0-9]{0,5}$/)
+  }).strict();
+  handle('swarm:worktreeCleanupList', async (): Promise<WorkerWorktreeCleanupOffer[]> => {
+    try {
+      if (!(await persistAgentAuthorityNow())) throw new Error('worker authority could not be persisted');
+      const candidates = await listOfferedWorkerWorktrees(getConfig().roots, managedWorktreeCleanupOffers());
+      return candidates.map(candidate => ({
+        runId: candidate.runId,
+        agentId: candidate.agentId,
+        reason: candidate.reason,
+        label: managedWorktreeCleanupOffers().find(offer =>
+          offer.runId === candidate.runId && offer.agentId === candidate.agentId)?.label,
+        workspace: candidate.workspace,
+        dirty: candidate.dirty,
+        ignoredFiles: candidate.ignoredFiles,
+        uniqueCommits: candidate.uniqueCommits,
+        changeCount: candidate.changes.length
+      }));
+    } catch (error) {
+      // Native paths from Git failures belong to local logs, never the browser/AI surface.
+      logInfo(`worktree cleanup inspection failed: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error('Could not review retained worker worktrees. Check the local app logs.');
+    }
+  });
+  handle('swarm:worktreeCleanupRemove', async (payload) => {
+    const { runId, agentId } = worktreeCleanupId.parse(payload);
+    if (!(await persistAgentAuthorityNow())) throw new Error('Cleanup could not confirm durable worker retirement. No files were removed.');
+    const offer = managedWorktreeCleanupOffers().find(entry => entry.runId === runId && entry.agentId === agentId);
+    if (!offer) throw new Error('This worker cleanup offer is no longer available. Refresh the list.');
+    let candidate: Awaited<ReturnType<typeof listOfferedWorkerWorktrees>>[number] | undefined;
+    try {
+      candidate = (await listOfferedWorkerWorktrees(getConfig().roots, [offer]))[0];
+    } catch (error) {
+      logInfo(`worktree cleanup preview failed: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error('Could not verify this worker checkout. No files were removed.');
+    }
+    if (!candidate) throw new Error('This checkout is missing or has no verified cleanup owner. No files were removed.');
+    // The native confirmation must describe a complete, byte-verified snapshot.
+    // A bounded/truncated inspection cannot authorize discarding files.
+    if (candidate.changesTruncated || !candidate.contentFingerprint) {
+      throw new Error('Could not safely inspect all contents of this worker checkout. No files were removed.');
+    }
+    // The preview is shown only in the trusted desktop confirmation, not the renderer
+    // or a model-facing tool. List bounded relative paths instead of native paths.
+    const changedFiles = candidate.changes.slice(0, 25).map(name =>
+      `  - ${name.replace(/[\x00-\x1f\x7f]/g, '?').slice(0, 180)}`);
+    const details = [
+      `Checkout: ${candidate.workspace}`,
+      candidate.changes.length
+        ? `${candidate.changes.length} uncommitted/ignored paths would be discarded:`
+        : 'No uncommitted or ignored paths were detected.',
+      ...changedFiles,
+      candidate.changes.length > changedFiles.length || candidate.changesTruncated
+        ? 'Additional paths are not shown; review the checkout before confirming.' : '',
+      candidate.ignoredFiles ? 'Ignored files are included in the removal.' : '',
+      candidate.uniqueCommits ? 'Commits made only on this branch will remain in Git.' : '',
+      'This action removes the entire checkout directory, including tracked working files, ignored files and uncommitted changes. The Git branch and its commits are kept. Uncommitted files cannot be recovered from Git.'
+    ].filter(Boolean).join('\n');
+    // Approval is acquired in the trusted main process, not supplied as a boolean by renderer
+    // or model. Default is cancellation, even for an apparently clean checkout.
+    const { response } = await dialog.showMessageBox({
+      type: 'warning',
+      title: 'Remove worker Git checkout?',
+      message: 'Review the worker checkout before removing it',
+      detail: details,
+      buttons: ['Keep checkout', 'Remove checkout; preserve Git branch'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true
+    });
+    if (response !== 1) return { removed: false, branchPreserved: true };
+    // Git's name/size status can stay identical across same-size byte edits.
+    // Compare the complete content fingerprint, including ignored/untracked files.
+    // The manager also checks this fingerprint inside its mutation fence.
+    let fresh: typeof candidate | undefined;
+    try {
+      fresh = (await listOfferedWorkerWorktrees(getConfig().roots, [offer]))[0];
+    } catch (error) {
+      logInfo(`worktree cleanup reinspection failed: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error('Could not recheck this checkout after confirmation. No files were removed.');
+    }
+    if (!fresh || fresh.workspace !== candidate.workspace || fresh.branch !== candidate.branch ||
+        fresh.headOid !== candidate.headOid || fresh.dirty !== candidate.dirty ||
+        fresh.ignoredFiles !== candidate.ignoredFiles || fresh.uniqueCommits !== candidate.uniqueCommits ||
+        fresh.changesTruncated || !fresh.contentFingerprint ||
+        fresh.contentFingerprint !== candidate.contentFingerprint ||
+        JSON.stringify(fresh.changes) !== JSON.stringify(candidate.changes)) {
+      throw new Error('The checkout changed while you were reviewing it. No files were removed.');
+    }
+    // Root approval and exact broker-offer identity are checked again after user interaction.
+    if (!(await persistAgentAuthorityNow())) throw new Error('Cleanup could not reconfirm durable worker retirement. No files were removed.');
+    const current = managedWorktreeCleanupOffers().find(entry => entry.runId === runId && entry.agentId === agentId);
+    if (!current || current.createdAt !== offer.createdAt || current.reason !== offer.reason) {
+      throw new Error('Cleanup ownership changed during confirmation. No files were removed.');
+    }
+    // A cleared worker's child processes do not stop merely because its broker row was
+    // retired. Refuse destructive removal while any tool may still be writing files.
+    if (inFlightToolCalls() > 0) {
+      throw new Error('Local tools are still executing. No worker files were removed.');
+    }
+    try {
+      const result = await disposeOfferedWorkerWorktree(getConfig().roots, current,
+        unifiedExecManager.listProcesses().map(process => process.cwd), candidate.contentFingerprint);
+      if (result.removed && acknowledgeManagedWorktreeCleanupOffer(runId, agentId)) {
+        // The files are already removed at this point. Failure to persist the acknowledgment
+        // is a recoverable stale UI offer, not permission to claim that deletion failed.
+        try {
+          if (!(await persistAgentAuthorityNow())) logInfo('worktree cleanup acknowledgment could not be persisted');
+        } catch (error) {
+          logInfo(`worktree cleanup acknowledgment persistence failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return { removed: result.removed, branchPreserved: !result.branchRemoved };
+    } catch (error) {
+      logInfo(`worktree cleanup removal refused: ${error instanceof Error ? error.message : String(error)}`);
+      if (error instanceof WorkerWorktreeError && error.code === 'WORKTREE_CONTENT_CHANGED') {
+        throw new Error('The checkout changed while you were reviewing it. No files were removed.');
+      }
+      throw new Error('The checkout was not removed safely. Inspect the local app logs for details.');
+    }
+  });
+
 
   // Push updates so the UI reflects tunnel progress without polling. buildState() crosses
   // async secret/bridge reads, so an older snapshot can otherwise resolve after a newer one and
@@ -1167,6 +1951,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   };
   configureInputDelivery({
     recoveryAllowed: recoveryInputAllowed,
+    callsHoldRecovery: recoveryHeldByCalls,
     activity: sessionInputActivity,
     wakeDecision: async (entry, signal) => {
       signal.throwIfAborted();
@@ -1180,6 +1965,17 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       const source = fromSessionId ? await getSession(fromSessionId) : null;
       if (source?.conversationId === conversationId || source?.chatIds.includes(conversationId)) return;
       await noteChatOrigin(conversationId, { kind: 'helper', fromSessionId, agentId: null, task: '' });
+    },
+    trustOpening: async (sessionId, conversationId) => {
+      // Composer openings use the same deletion/rebind fence as an explicit Trust click. The
+      // second tombstone check and synchronous queue admission ensure Delete either wins before
+      // this grant or durably revokes it afterwards; no orphan permission can survive the row.
+      if (deletingSessionIds.has(sessionId)) return false;
+      return withSessionMutationFence(sessionId, async (summary) => {
+        if (deletingSessionIds.has(sessionId) || summary.conversationId !== conversationId || summary.origin?.kind === 'worker') return false;
+        await setChatsTrusted([conversationId], true);
+        return true;
+      });
     },
     changed: () => push('session:changed'),
     recordDelivered: (entry, anchorCommitted) => getConfig().sessions.record ? recordDeliveredInput(entry, anchorCommitted) : Promise.resolve(true),
@@ -1222,7 +2018,16 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     });
   };
   onStatusChange(pushState);
+  onRecordingStorageFullChange(pushState);
   onBridgeChange(pushState);
+  onCosBrowserSignInChange(pushState);
+  onConnectorProofChange(pushState);
+  onPluginRefreshChange(pushState);
+  // A project's native ChatGPT Project changes from the browser; the sidebar and a waiting new chat say so.
+  onProjectLinkChange(() => push('session:changed'));
+  // A creation armed before the app last quit becomes uncertain on time, not on the browser's next pass.
+  void expireArmedProjectCreates().catch(() => undefined);
+  registerPluginIpc(handle, getWindow, pushState);
   // Draft stages belong to session controls; state:changed only refreshes settings.
   onGoalChange(() => push('session:changed'));
   handle('tasks:cancel', async payload => cancelTaskRequest(z.object({ requestId: z.string().uuid() }).parse(payload).requestId));
@@ -1243,12 +2048,17 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     if (!await startBridge()) throw new Error('The browser bridge could not start');
     if (allowOpen) {
       await wakeBrowserUrl(`https://chatgpt.com/?cos-model-catalog=${nonce}`, true, true);
-      push('setup:toolApprovalNotice');
+      // The approval prompt it describes comes with ChatGPT's first Core tool call, which needs a Core
+      // tunnel. On a fresh install, discovery opened ChatGPT before any of that existed and the
+      // reminder read "One last step" at step 0 of 6; Setup's last card keeps it until then.
+      if (getConfig().tunnel.tunnelId.trim()) push('setup:toolApprovalNotice');
     }
   } });
   onUpdateChange(pushState);
   onMacOSDesktopAccessChange(pushState);
   onLog((entry) => push('log:entry', entry));
-  onSessionChange(() => push('session:changed'));
+  // Recorder pushes name their exact transcript owners; payload-less pushes are catalog/control only.
+  onSessionChange(change => push('session:changed', change));
+  onBackgroundExecChange(() => push('sessions:backgroundExecChanged'));
   onSwarmChange(() => push('swarm:changed', swarmState()));
 }

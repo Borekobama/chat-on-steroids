@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
+const { fixtureConfigSource } = require('./fixtures/app-defaults.cjs');
 const output = path.join(root, 'outputs/appearance');
 app.setPath('userData', path.join(output, 'runtime'));
 app.whenReady().then(async () => {
@@ -11,7 +12,8 @@ app.whenReady().then(async () => {
   const fixture = `
     localStorage.removeItem('chat-on-steroids.sidebar-order');
     localStorage.removeItem('cos.ui.language');
-    const config = {
+    ${fixtureConfigSource()}
+    const config = fixtureConfig({
       roots: [{name:'demo',path:'C:/demo'}], readOnly:true,
       capabilities: {browse:true,search:true,read:true,metadata:true,create:false,edit:false,move:false,deleteFile:false,command:false,screen:false,control:false,clipboardRead:false,clipboardWrite:false},
       tunnel: {kind:'openai',tunnelId:'',desktopTunnelId:'',binaryPath:''},
@@ -19,7 +21,7 @@ app.whenReady().then(async () => {
       sessions: {record:true,retainDays:30,advisoryTokens:300000,limitTokens:400000}, compaction:{auto:true,autoTokens:300000},
       multiAgent:{enabled:false,maxWorkers:2,allowUnattributedCalls:false,recoverAgentTabs:false},
       goal:{enabled:false,model:'fixture',reasoning:'default',prompt:'Fixture'}
-    };
+    });
     const state = {config,hasApiKey:false,hasGoalKey:false,resolvedBinary:null,bundledTunnelVersion:null,
       status:{state:'disconnected',detail:'',publicUrl:null,localUrl:null,handshakeAt:null,lastRequestAt:null,lastToolCallAt:null,health:null,surfaces:[]},
       bridge:{running:false,port:0,paired:false,present:false,lastSeenAt:null,extensionVersion:null},
@@ -133,6 +135,10 @@ app.whenReady().then(async () => {
     const layout=[];
     for(const [width,zoom] of [[1100,1],[800,1.17],[1100,1.5],[640,1]]) {
       win.setSize(width,900); win.webContents.setZoomFactor(zoom);
+      // Resize and zoom land asynchronously; on slow CI runners two frames still showed the previous
+      // zoom (640 px at 1.5 read as 427 px). Wait until the page reports this window at this zoom.
+      const expected=Math.round(win.getContentSize()[0]/zoom);
+      for(let i=0;i<200 && Math.abs(await js('innerWidth')-expected)>1;i++) await new Promise(r=>setTimeout(r,10));
       await js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
       const geometry=await js(`(() => {const panel=document.getElementById('appearancePanel');return {viewport:innerWidth,scroll:panel.scrollWidth,width:panel.clientWidth,body:document.documentElement.scrollWidth};})()`);
       assert.ok(geometry.scroll<=geometry.width+1,JSON.stringify({width,zoom,geometry}));

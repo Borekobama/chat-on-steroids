@@ -1,6 +1,10 @@
 export interface ModelUsage {
   model: string;
-  scope: 'model' | 'feature' | 'shared';
+  /**
+   * `codex`: a window from ChatGPT's `wham/usage`, which is Codex's usage (the 5-hour and weekly
+   * limits Codex's /status and ChatGPT's sidebar show), never a limit on ChatGPT chat messages.
+   */
+  scope: 'model' | 'feature' | 'codex';
   remaining: number | null;
   remainingPercent: number | null;
   resetAt: number | null;
@@ -29,11 +33,16 @@ export interface UsageOverview {
 export interface UsageMessageDay { date: string; gpt56: number; gpt6: number }
 export type UsageMessageFamily = 'gpt-5.6' | 'gpt-6';
 
-/** Explicit recorded version identities only; unknown suffixes remain unclassified. */
+/**
+ * Explicit recorded version identities only; unknown suffixes remain unclassified. ChatGPT records its
+ * Instant and Thinking lanes as `gpt-6` and `gpt-6-thinking` (`gpt-5-6-instant`, `gpt-5-6-thinking`
+ * for 5.6), observed 2026-10-07; each lane counts toward its generation. GPT-6's Instant (`gpt-6`) is
+ * ChatGPT's automatic lane and may be answered by `gpt-6-thinking`; both count as GPT-6.
+ */
 export function usageMessageFamily(model: string | undefined): UsageMessageFamily | null {
   const id = (model ?? '').trim().toLowerCase().replace(/\s+/g, '-');
-  if (/^(?:gpt-?)?5[.-]6(?:-(?:thinking|pro|sol|terra|luna))?$/.test(id) || id === 'sol') return 'gpt-5.6';
-  if (/^(?:gpt-?)?6(?:\.0)?(?:-(?:pro|astra))?$/.test(id) || id === 'astra') return 'gpt-6';
+  if (/^(?:gpt-?)?5[.-]6(?:-(?:instant|thinking|pro|sol|terra|luna))?$/.test(id) || id === 'sol') return 'gpt-5.6';
+  if (/^(?:gpt-?)?6(?:\.0)?(?:-(?:instant|thinking|pro|astra))?$/.test(id) || id === 'astra') return 'gpt-6';
   return null;
 }
 
@@ -61,19 +70,22 @@ export interface UsageFormula {
   multiplier: number;
   rates: Record<string, number | null>;
 }
-// Standard short-context cached-input comparison rates verified 2026-09-07.
+// Standard short-context cached-input comparison rates verified 2026-09-27 (GPT-6 Sol and Luna added;
+// the earlier rates were unchanged).
 // GPT-6 Pro is ChatGPT's Astra label; Astra cached input is $1 per million tokens.
 // Sources are linked next to the editable formula and in usage-model-attribution.md.
 export const DEFAULT_USAGE_FORMULA: UsageFormula = {
   divisor: 2, multiplier: 1.2,
-  rates: { 'gpt-5.6': 0.4, 'gpt-5.6-sol': 0.4, 'gpt-5.6-terra': 0.2, 'gpt-5.6-luna': 0.02, 'gpt-6-astra': 1, 'gpt-6-pro': 1, 'gpt-5.5': 0.5 }
+  rates: { 'gpt-5.6': 0.4, 'gpt-5.6-sol': 0.4, 'gpt-5.6-terra': 0.2, 'gpt-5.6-luna': 0.02, 'gpt-6-astra': 1, 'gpt-6-pro': 1, 'gpt-6-sol': 0.2, 'gpt-6-luna': 0.01, 'gpt-5.5': 0.5 }
 };
 // Exact historical/provider identities only. This is a reporting projection, not
 // account availability or browser selection authority. Effort remains independent.
 const usageAliases: Readonly<Record<string, string>> = {
   '5.6': 'gpt-5.6-sol', 'gpt-5.6': 'gpt-5.6-sol', 'gpt-5-6': 'gpt-5.6-sol',
-  'gpt-5-6-thinking': 'gpt-5.6-sol', 'gpt-5-6-pro': 'gpt-5.6-sol',
-  '6': 'gpt-6-astra', 'gpt-6-pro': 'gpt-6-astra'
+  'gpt-5-6-instant': 'gpt-5.6-sol', 'gpt-5-6-thinking': 'gpt-5.6-sol', 'gpt-5-6-pro': 'gpt-5.6-sol',
+  '6': 'gpt-6-astra', 'gpt-6-pro': 'gpt-6-astra',
+  // ChatGPT labels these "5.5"; the API has one GPT-5.5 model with a cached-input rate.
+  '5.5': 'gpt-5.5', 'gpt-5-5': 'gpt-5.5', 'gpt-5-5-instant': 'gpt-5.5', 'gpt-5-5-thinking': 'gpt-5.5'
 };
 export function usageModel(model: string): string { return Object.hasOwn(usageAliases, model) ? usageAliases[model]! : model; }
 /** Group the display while retaining each raw source for its exact manual rate. */

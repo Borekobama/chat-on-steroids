@@ -1,9 +1,12 @@
 import { toolDeclaration } from './tool-declarations.js';
 import { registerPlanTool } from './plan-tool.js';
-import { goalWorkerChat } from '../bridge.js';
+import { goalWorkerChat, imageExportCapable } from '../bridge.js';
+import { exportImage, ImageExportError } from '../image-export.js';
+import { awaitRequestCorrelation } from '../session/correlation.js';
 import { announceSessionFinish, sessionFinishDeadline } from '../session/finish.js';
 import { getConfig } from '../config.js';
 import { finishControlTask } from '../control-service.js';
+import { liveConnectorName } from './surfaces.js';
 /**
  * The Core connector: reading, changing and running code on this PC.
  *
@@ -23,6 +26,9 @@ import nodePath from 'node:path';
 import { z } from 'zod';
 import { DEFAULT_READ_BYTES, MAX_READ_BYTES, formatBytes } from '../fsops.js';
 import { BinaryReadError, listDirectoryLevel, readTextFile, statInfo, walkFiles } from '../codex/read-backend.js';
+import { fsForRoot, localFs, type ProjectFs } from '../remote/project-fs.js';
+import { remoteCommand, sshArgs, sshProgram } from '../remote/ssh.js';
+import os from 'node:os';
 import {
   VIEW_IMAGE_DESCRIPTION,
   VIEW_IMAGE_PATH_DESCRIPTION,
@@ -31,8 +37,11 @@ import {
 } from '../codex/view-image.js';
 import { logInfo, logWarn } from '../logger.js';
 import { SandboxError, isAbsoluteVirtualPath, isNativeWindowsPath, resolvePath, strayVirtualPath } from '../sandbox.js';
-import { currentWorkspace } from '../workspace.js';
+import { currentWorkspace, primeWorkspace } from '../workspace.js';
+import { getSessionProject } from '../projects.js';
+import { acceptAgentMutation, measureSleepingWorkers, spawnAgentWorkers } from '../agent-admission.js';
 import type { Capabilities, Root } from '../../shared/types.js';
+import { commandHasSameArguments, evaluateCommandAllowlist } from '../../shared/command-allowlist.js';
 import type { FileChange } from '../../shared/session.js';
 import { REASONING_EFFORTS } from '../../shared/session.js';
 import { DEFAULT_EXCLUDES, MAX_CONTENT_FILE_BYTES, globToRegExp, search, searchOneFile } from '../search.js';
@@ -46,7 +55,6 @@ import {
   type Hunk,
   type PatchPathResolver
 } from '../codex/apply-patch/index.js';
-import { DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE } from '../codex/apply-patch/mode.js';
 import { maybeParseApplyPatchForExec } from '../codex/apply-patch/invocation.js';
 import { composeCommandBatch, parseCommandBatchSections } from '../codex/command-batch.js';
 import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.js';
@@ -58,7 +66,8 @@ import {
   forgetExecOwner,
   MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION,
   noteExecAttended,
-  noteExecOwner
+  noteExecOwner,
+  runningIdenticalExec
 } from '../codex/ownership.js';
 import {
   UnifiedExecError,
@@ -99,6 +108,7 @@ import {
   normalizePowerShellOperators,
   normalizeShellCommand,
   repairPowerShellQuoting,
+  execNotesText,
   withExecNotes
 } from '../exec-hints.js';
 import { childEnv } from '../exec.js';
@@ -108,17 +118,16 @@ import {
   agentForCaller,
   agentFamiliesForCaller,
   reconcileAgentRequestOwners,
-  noteAgentContextTokens,
-  persistCriticalSwarmNow,
   PRIME_ID,
   requestWorkerBootstraps,
   requestWorkerRevivals,
   statusForCaller,
   stageFinishAgent,
   stageMessages,
-  stageSpawn,
+  stagePrimeMessage,
+  managedWorkerIsolationRequired,
+  managedWorkerAllocationIdentity,
   swarmRunning,
-  swarmStateForCaller,
   type Caller
 } from '../agents.js';
 import { repairPrimeFromResumeShadow } from '../session/continuation.js';
@@ -134,12 +143,13 @@ import {
   awaitFreshCallOrigin,
   recordAgentMessage
 } from '../session/recorder.js';
-import { findSessionByConversation } from '../session/store.js';
+import { findSessionByConversation, readRecentEvents } from '../session/store.js';
 import { requestCorrelation } from '../session/correlation.js';
 import {
   adoptAgent,
   fail,
   failIdentity,
+  validatedWorkspace,
   formatFileInfo,
   friendlyError,
   guard,
@@ -196,7 +206,7 @@ const unifiedExecOutputSchema = z
       .optional()
       .describe('Session ID while running.'),
     completed_session_id: z.number().optional().describe('Use as write_stdin session_id to reread completed output.'),
-    benign_exit: z.boolean().optional().describe('Non-zero exit is an expected result, not a failure.'),
+    expected_exit: z.boolean().optional().describe('Non-zero exit is an expected result, not a failure.'),
     output_replayed: z.boolean().optional().describe('Retained output; command was not run again.'),
     original_token_count: z.number().optional().describe('Approximate token count before output truncation.'),
     output: z.string().describe('Command output text, possibly truncated.'),
@@ -236,12 +246,14 @@ function execChildEnvironment(): NodeJS.ProcessEnv {
 /** One stable owner for the running model turn, upgraded lazily when page proof arrives. */
 function execPrincipal(): string | null {
   const caller = currentCaller();
-  return executionPrincipal(
-    caller.requestId,
-    caller.sessionId ?? null,
-    currentCall()?.allowUnattributed ?? getConfig().multiAgent.allowUnattributedCalls
-  );
+  return executionPrincipal(caller.requestId, caller.sessionId ?? null);
 }
+
+/**
+ * How a command for a server folder is read here: as POSIX shell text, which is what the server
+ * account's login shell receives (`remoteCommand`). It shapes the allowlist check and batches.
+ */
+const SERVER_SHELL = { shellType: 'sh', shellPath: 'sh' } as const;
 
 export function registerCoreTools(reg: SurfaceRegistrar): void {
   const { ctx, caps, exposedCaps } = reg;
@@ -449,15 +461,83 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               'TOOL_DISABLED: view_image is disabled by the current Chat On Steroids permissions. Ask the user to enable reading in the app.'
             );
           }
-          const resolved = await resolveIn(ctx.roots, path);
+          const resolved = await resolveIn(ctx.roots, path, { access: 'read', remote: true });
           try {
-            const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
+            const image = await viewImage(resolved.real, null, undefined, resolved.virtual, undefined, fsForRoot(resolved.root));
             logInfo(`tool view_image ${resolved.virtual} (${formatBytes(image.bytes)})`);
             return {
               content: [{ type: 'image' as const, data: image.base64, mimeType: image.mimeType }]
             };
           } catch (error) {
             if (error instanceof ViewImageError) return fail(error.message);
+            throw error;
+          }
+        })
+    );
+  }
+
+  // -------------------------------------------------------------- save_image
+  //
+  // The original of an image ChatGPT generated in this chat, saved into an approved folder (#889).
+  // The chat's own page fetches it; see image-export.ts.
+  if (exposedCaps.create) {
+    reg.register(
+      'save_image',
+      toolDeclaration('save_image', () => ({
+        description: 'Save the original file of an image ChatGPT generated in this chat (not a screenshot or preview) to a new file in an approved folder. ' +
+          'Never replaces an existing file. The chat must be open in the browser with the image on its page.',
+        inputSchema: z
+          .object({
+            path: z.string().describe('New file path in an approved folder, for example /workspace/images/logo.png. Without an extension the image\'s own (.png, .jpg or .webp) is added.'),
+            // A number, not a name: ChatGPT fills a string here with the picture's `file_…` id and then
+            // fails the call internally before it reaches the app (measured live 2026-10-05).
+            nth: z.number().int().min(1).max(100).optional().describe('Which image, counting back from the newest generated in this chat: 1 (the default) is the latest, 2 the one before, and so on.')
+          })
+          .strict()
+      })),
+      async ({ path, nth }) =>
+        guard('save_image', async () => {
+          if (!caps.create) {
+            return fail('TOOL_DISABLED: save_image is disabled by the current Chat On Steroids permissions. Ask the user to enable creating files in the app.');
+          }
+          const caller = currentCaller();
+          const conversationId = caller.conversationId ??
+            (caller.requestId ? (await awaitRequestCorrelation(caller.requestId, 20_000))?.conversationId ?? null : null);
+          // Never guessed from recent activity: a wrong guess would save another chat's image.
+          if (!conversationId) {
+            // Name the Core that answered: with one ChatGPT account on several computers, ChatGPT
+            // may send a chat's call to another computer's Core, which never sees that chat (#1097).
+            return fail(`${liveConnectorName('core')} could not tell which chat this save_image call came from, ` +
+              'so it does not know which image to save. If the chat belongs to another computer, call save_image of that ' +
+              'computer\'s Chat On Steroids Core instead. Otherwise call save_image directly as its own tool call, not from ' +
+              'inside a JavaScript or exec step, and try again.');
+          }
+          if (!imageExportCapable()) {
+            return fail('save_image needs the Chat On Steroids browser extension to be connected and up to date, so the chat\'s page can hand over the image.');
+          }
+          const session = await findSessionByConversation(conversationId);
+          const recorded = session ? await readRecentEvents(session.id, 400, { kinds: ['native_image'] }) : [];
+          const images = recorded.filter((event): event is Extract<typeof event, { kind: 'native_image' }> =>
+            event.kind === 'native_image' && event.providerStatus !== 'in_progress');
+          const chosen = images.at(-(nth ?? 1));
+          if (!chosen) {
+            return fail(images.length
+              ? `save_image found only ${images.length} generated image${images.length === 1 ? '' : 's'} in this chat. Use nth ${images.length} or lower, or omit nth for the latest.`
+              : 'save_image found no image generated in this chat yet.');
+          }
+          const target = await resolveIn(ctx.roots, path, { allowMissing: true });
+          try {
+            await fs.lstat(target.real);
+            return fail(`${target.virtual} already exists. save_image never replaces a file; choose another name.`);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          }
+          try {
+            const saved = await exportImage({ conversationId, messageId: chosen.messageId, assetId: chosen.providerAssetId }, target);
+            logInfo(`tool save_image ${saved.virtual} (${formatBytes(saved.bytes)})`);
+            return ok(`Saved ${saved.virtual} (${saved.width}x${saved.height} ${saved.format.toUpperCase()}, ${formatBytes(saved.bytes)}), the original file ChatGPT generated.`);
+          } catch (error) {
+            if (error instanceof ImageExportError) return fail(`save_image did not save the image: ${error.message}`);
             throw error;
           }
         })
@@ -521,11 +601,20 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
         reg.guarded('search', 'find', async () => {
           const limit = Math.min(500, Math.max(1, Math.floor(max_results ?? 50)));
           const deadline = Date.now() + 10_000;
-          const scopes: Array<{ real: string; virtual: string }> = [];
+          const scopes: Array<{ real: string; virtual: string; server?: ProjectFs }> = [];
+          /** Server folders a search over every folder could not reach; the rest is still searched. */
+          const unreachable: string[] = [];
           if (p) {
-            const resolved = await resolveIn(ctx.roots, p);
-            const stat = await fs.stat(resolved.real);
-            if (stat.isFile()) {
+            const resolved = await resolveIn(ctx.roots, p, { access: 'read', remote: true });
+            const server = resolved.root.remote ? fsForRoot(resolved.root) : undefined;
+            let isFile: boolean, isDirectory: boolean;
+            if (server) ({ isFile, isDirectory } = await server.getMetadata(resolved.real));
+            else {
+              const stat = await fs.stat(resolved.real);
+              isFile = stat.isFile();
+              isDirectory = stat.isDirectory();
+            }
+            if (isFile) {
               const outcome = await searchOneFile(resolved.real, resolved.virtual, {
                 query,
                 mode: mode ?? 'name',
@@ -533,7 +622,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                 caseSensitive: case_sensitive === true,
                 regex: regex === true,
                 maxResults: limit,
-                deadline
+                deadline,
+                ...(server ? { server } : {})
               });
               const hits = outcome.hits.map((hit) =>
                 hit.line === undefined ? hit.path : `${hit.path}:${hit.line}: ${hit.text}`
@@ -547,10 +637,19 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               }
               return ok(hits.length === 0 ? 'No matches' : `${hits.length} matches\n${hits.join('\n')}`);
             }
-            if (!stat.isDirectory()) return fail(`${resolved.virtual} is not a regular file or folder`);
-            scopes.push({ real: resolved.real, virtual: resolved.virtual });
+            if (!isDirectory) return fail(`${resolved.virtual} is not a regular file or folder`);
+            scopes.push({ real: resolved.real, virtual: resolved.virtual, ...(server ? { server } : {}) });
           } else {
             for (const root of ctx.roots) {
+              if (root.remote) {
+                try {
+                  const resolved = await resolvePath(ctx.roots, `/${root.name}`, { remote: true });
+                  scopes.push({ real: resolved.real, virtual: resolved.virtual, server: fsForRoot(root) });
+                } catch (error) {
+                  unreachable.push(`/${root.name} (${friendlyError(error)})`);
+                }
+                continue;
+              }
               const resolved = await resolvePath(ctx.roots, `/${root.name}`);
               scopes.push({ real: resolved.real, virtual: resolved.virtual });
             }
@@ -567,7 +666,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               break;
             }
             if (hits.length >= limit) break;
-            const outcome = await search({
+            const request = {
               realDir: scope.real,
               virtualDir: scope.virtual,
               query,
@@ -577,8 +676,18 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               caseSensitive: case_sensitive === true,
               regex: regex === true,
               maxResults: limit - hits.length,
-              deadline
-            });
+              deadline,
+              ...(scope.server ? { server: scope.server } : {})
+            };
+            let outcome;
+            try {
+              outcome = await search(request);
+            } catch (error) {
+              // A server that drops away mid-search costs its own folder, not the whole answer.
+              if (!scope.server || p) throw error;
+              unreachable.push(`${scope.virtual} (${friendlyError(error)})`);
+              continue;
+            }
             scanned += outcome.filesScanned;
             elapsedMs += outcome.elapsedMs;
             if (outcome.stoppedBecause) stopReasons.add(outcome.stoppedBecause);
@@ -589,7 +698,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           noteCount(hits.length);
           const reason = stopReasons.size > 0 ? `\ntruncated: ${[...stopReasons].join(',')}` : '';
           const contentLimit = (mode ?? 'name') === 'content' ? `\ncontent_file_limit: ${formatBytes(MAX_CONTENT_FILE_BYTES)}` : '';
-          const meta = `\n\nfiles_scanned: ${scanned}\nelapsed_ms: ${elapsedMs}\nresults_returned: ${hits.length}${contentLimit}${reason}`;
+          const skipped = unreachable.length > 0 ? `\nnot_searched: ${unreachable.join('; ')}` : '';
+          const meta = `\n\nfiles_scanned: ${scanned}\nelapsed_ms: ${elapsedMs}\nresults_returned: ${hits.length}${contentLimit}${reason}${skipped}`;
           if (hits.length === 0) return ok(`No matches${meta}`);
           return ok(`${hits.length} matches\n${hits.join('\n')}${meta}`);
         })
@@ -630,7 +740,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           if (args.environmentId !== null) {
             return fail('apply_patch environment selection is unavailable for this turn');
           }
-          const workspace = currentWorkspace();
+          // apply_patch previously read the synchronous cwd cache, bypassing the managed
+          // lease check shared by resolveIn/resolveCwd. Validate before patch base selection.
+          const workspace = await validatedWorkspace();
           const hasRelativePath = args.hunks.some(hunk => {
             const paths = hunk.kind === 'update_file' && hunk.movePath !== null
               ? [hunk.path, hunk.movePath]
@@ -647,7 +759,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           if (baseVirtual === null) {
             return fail('No folder is approved, so there is nowhere to apply the patch.');
           }
-          const base = await resolveIn(ctx.roots, baseVirtual);
+          const base = await resolveIn(ctx.roots, baseVirtual, { remote: true });
+          await validatedWorkspace();
           return (await runParsedPatch(args, ctx.roots, base, caps)).result;
         })
     );
@@ -698,11 +811,32 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               );
             }
           }
-          const shell = input.shell === undefined ? defaultUserShell() : getShellByModelProvidedPath(input.shell, dir.real);
+          const server = dir.remote;
+          const shell = server
+            ? SERVER_SHELL
+            : input.shell === undefined ? defaultUserShell() : getShellByModelProvidedPath(input.shell, dir.real);
           if (!shell) {
             return fail(
               `SHELL_NOT_FOUND: the explicitly requested shell ${JSON.stringify(input.shell)} could not be resolved. ` +
                 'No command was run. Omit shell to use the configured default, or provide an existing recognised shell binary.'
+            );
+          }
+          // One preflight owns direct calls and code-mode children. It runs before command
+          // normalization, patch interception, process-id allocation or process launch, and a
+          // batch is admitted only after every user-authored command passes.
+          const policy = evaluateCommandAllowlist(getConfig().commandAllowlist, rawCommands, shell.shellType);
+          if (!policy.allowed) {
+            const location = isBatch ? ` in command ${policy.commandIndex + 1}` : '';
+            const reason = policy.kind === 'unmatched'
+              ? 'the command did not match any allow rule'
+              : policy.kind === 'denied'
+                ? 'the command matched a deny rule'
+              : policy.kind === 'invalid-policy'
+                ? 'the saved policy is invalid'
+                : 'the command uses unsupported or ambiguous shell syntax';
+            return fail(
+              `COMMAND_NOT_ALLOWED${location}: ${reason}. ${policy.detail} No command was run. ` +
+              'Change the command policy in Settings if this launch should be permitted.'
             );
           }
           // Does only what the shell itself would have done — today, expanding a bare filename
@@ -724,11 +858,22 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // line PowerShell can actually parse, and a line it cannot repair is left exactly
           // as written for the shell to refuse and the hint to explain.
           const commandNotes: string[] = [];
+          if (server && input.shell !== undefined) {
+            commandNotes.push('shell was ignored: in a server folder commands run in the server account\'s login shell.');
+          }
+          const normalizedCommands: string[] = [];
           const boundCommands = rawCommands.map((rawCommand, index) => {
+            // These repairs answer this computer's shells and its bundled ripgrep. A server's
+            // login shell gets the command exactly as written.
+            if (server) {
+              normalizedCommands.push(rawCommand);
+              return rawCommand;
+            }
             const repaired = repairPowerShellQuoting(rawCommand, shell.shellType);
             const normalized = normalizeShellCommand(repaired.cmd, shell.shellType, (relativeDirectory = '.') =>
               nodeFs.readdirSync(nodePath.resolve(dir.real, relativeDirectory))
             );
+            normalizedCommands.push(normalized.cmd);
             const prefix = (note: string): string => (isBatch ? `Command ${index + 1}: ${note}` : note);
             const bound = bindBundledRipgrep(
               normalized.cmd,
@@ -743,6 +888,17 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             );
             return chained.cmd;
           });
+          if (getConfig().commandAllowlist.enabled) {
+            const changed = normalizedCommands.findIndex((command, index) =>
+              !commandHasSameArguments(policy.args[index]!, command, shell.shellType)
+            );
+            if (changed !== -1) {
+              return fail(
+                `COMMAND_NOT_ALLOWED${isBatch ? ` in command ${changed + 1}` : ''}: command normalization changed the authorized argument list. ` +
+                'No command was run. Change the command policy in Settings if this launch should be permitted.'
+              );
+            }
+          }
           // Shell functions/aliases can resolve before applications on PATH. The app deliberately
           // ships ripgrep, parses rg's flags against that exact version, and puts it first on child
           // PATH, so a shadowing `rg` is not a harmless customization: it breaks the normalizer's
@@ -760,6 +916,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           const useLoginShell = input.login ?? process.platform !== 'win32';
           const command = deriveExecArgs(shell, boundCommand, useLoginShell);
           try {
+            await validatedWorkspace();
             // Current Codex intercepts an explicit `apply_patch` shell invocation before spawning
             // the shell process. The parser is the port of apply-patch/src/invocation.rs and uses
             // the same tree-sitter-bash grammar/query as upstream.
@@ -804,15 +961,32 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               );
             }
 
+            // Read before this launch registers, so the new copy never names itself.
+            const identical = runningIdenticalExec(owner, commandDetail, dir.virtual);
+            if (identical.length) {
+              const ids = identical.map((row) => row.processId).join(', ');
+              const ageS = Math.max(0, Math.round((Date.now() - identical[0]!.startedAt) / 1000));
+              commandNotes.push(
+                `The same command in this folder is still running from earlier in this chat as session${identical.length > 1 ? 's' : ''} ${ids} ` +
+                  `(started ${ageS} s ago); this call started another copy. If this was a retry of a lost answer, ` +
+                  `read the running one with write_stdin(session_id=${identical[0]!.processId}, chars="") instead of starting more.`
+              );
+            }
+
             const processId = unifiedExecManager.allocateProcessId();
             // Process ids are deliberately small/reusable, while chat ownership lives in a
             // separate registry. Clear any stale row at the allocation boundary so a recycled
             // id cannot briefly authorize its previous chat before this call publishes the new owner.
             forgetExecOwner(processId);
 
-            const ripgrep = locateRipgrep();
-            const executionCommand = deriveExecArgs(shell,
-              withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
+            const ripgrep = server ? null : locateRipgrep();
+            // A server command is one ssh connection of its own; the folder and login shell are
+            // set up on the server by `remoteCommand`, so the local side only needs somewhere to run.
+            const executionCommand = server
+              ? [sshProgram(), ...sshArgs(server, [(input.tty ?? DEFAULT_TTY) ? '-tt' : '-T'], [remoteCommand(dir.real, boundCommand)])]
+              : deriveExecArgs(shell,
+                withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
+            await validatedWorkspace();
             const output = await unifiedExecManager.execCommand({
               classifyExit: (exitCode, rawOutput) => {
                 if (!batch) return nonZeroExitIsBenign(boundCommand, exitCode, rawOutput);
@@ -829,7 +1003,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               yieldTimeMs: input.yield_time_ms ?? DEFAULT_EXEC_YIELD_TIME_MS,
               maxOutputTokens: undefined,
               truncationPolicy: EXEC_OUTPUT_CEILING_POLICY,
-              cwd: dir.real,
+              cwd: server ? os.tmpdir() : dir.real,
               displayCwd: dir.virtual,
               env: execChildEnvironment(),
               tty: input.tty ?? DEFAULT_TTY,
@@ -912,9 +1086,16 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                   ? execRecoveryHints(rawCommands[0] ?? '', responseText, shell.shellType)
                   : [])
             ];
+            // ChatGPT gives the model this tool's structuredContent, not its text, so notes that
+            // only follow the text never reached it (a live retry asked to quote the repeated-
+            // command note quoted nothing, 2026-10-10). They travel in `supplemental_context`,
+            // the schema's field for app context that is not process output.
             return {
               content: [{ type: 'text' as const, text: withExecNotes(responseText, notes) }],
-              structuredContent: execCommandStructuredOutput(output)
+              structuredContent: {
+                ...execCommandStructuredOutput(output),
+                ...(notes.length > 0 ? { supplemental_context: execNotesText(notes) } : {})
+              }
             };
           } catch (error) {
             const detail = error instanceof UnifiedExecError ? error.debug() : friendlyError(error);
@@ -942,8 +1123,24 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // The ownership registry decides both admission and the reason for refusal.
           // A request-scoped caller can continue a process it opened before proof. Another
           // request must wait for exact correlation; a numeric process id is not custody.
-          const asking = execPrincipal();
-          const denied = execOwnershipFailure(input.session_id, asking);
+          let asking = execPrincipal();
+          let denied = execOwnershipFailure(input.session_id, asking);
+          if (denied === 'unidentified') {
+            const caller = currentCaller();
+            if (caller.requestId) {
+              // A later turn in the same chat can reach Core before the page reports this
+              // request-id mate. Wait only for that exact correlation, then re-run the same
+              // ownership check; the numeric session id never becomes authority by itself.
+              await awaitFreshCallOrigin(
+                'write_stdin',
+                currentCall()?.startedAt ?? Date.now(),
+                IDENTITY_EVIDENCE_MS,
+                { exact: true, requestId: caller.requestId }
+              );
+              asking = execPrincipal();
+              denied = execOwnershipFailure(input.session_id, asking);
+            }
+          }
           if (denied) {
             const reason = {
               unavailable: 'EXEC_SESSION_UNAVAILABLE: This process id is not available to this call in the running app. Check the original exec_command response and earlier results for its exit/output before deciding what remains; do not rerun the command solely because its id is unavailable.',
@@ -954,6 +1151,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             const message = `write_stdin failed for session ${input.session_id}: ${reason} No input was sent and no output was read. This refusal concerns this process id, not Read-only mode or permission to edit files or launch other authorized work.`;
             return denied === 'unidentified' ? failIdentity(message) : fail(message);
           }
+          // A worker can keep an interactive shell running after its Git worktree has been
+          // replaced. Verify the exact current allocation before forwarding even empty polls:
+          // stdin may execute writes in the shell's now user-owned directory.
+          await validatedWorkspace();
           // Both sides of the wait. An empty poll blocks for seconds by design, and a caller
           // sitting in one is attending its session rather than neglecting it.
           noteExecAttended(input.session_id);
@@ -1013,7 +1214,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
 
   if (reg.ctx.exposedFinishTool ?? getConfig().ui.finishTool === true) {
     reg.register('session_finish', toolDeclaration('session_finish', () => ({
-      description: 'For Astra only, when explicitly requested by a user prompt. Call near actual completion, after implementing the requested work. Receives queued instructions; complete and verify them before calling again. Do not use for progress updates or queue collection.',
+      description: 'Only when explicitly requested by a user prompt, with any model. Call near actual completion, after implementing the requested work. Receives queued instructions; complete and verify them before calling again. Do not use for progress updates or queue collection. While HELD with no work remaining, call to wait. Each call waits at most 25 seconds.',
       inputSchema: z.object({ summary: z.string().min(1).max(1000) }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
     })), async ({ summary }) => {
@@ -1025,6 +1226,22 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       return guard('session_finish', async () => ({ content: [{ type: 'text', text: await announceSessionFinish(caller.sessionId!, summary, deadline) }] }));
     });
   }
+
+
+  // ----------------------------------------------------------------- usage
+
+  // #482: read-only, so the person can ask for their usage from the chat. Each figure names its
+  // source and age; Codex and Claude Code are read only while Settings › Usage allows it. Like
+  // `read`, offered only while a reading permission is on.
+  if (exposedCaps.read || exposedCaps.browse || exposedCaps.metadata) reg.register('usage', toolDeclaration('usage', () => ({
+    title: 'Usage and limits',
+    description: 'Only when the user asks about their usage, limits or quota. Read-only: ChatGPT\'s and Codex\'s reported limits, and tokens counted from Codex\'s and Claude Code\'s local logs, each with source and age. Report missing figures as not reported; never estimate.',
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  })), async () => guard('usage', async () => {
+    const report = usageReport(reportedUsageLimits(), await readProviderUsage(), Date.now());
+    return { content: [{ type: 'text', text: report.text }], structuredContent: report.structured };
+  }));
 
 
   // ----------------------------------------------------------------- agents
@@ -1050,40 +1267,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
  * act on and is kept to a sentence or two; ids, states and counts are machine state and belong
  * in a shape the caller can read without parsing English.
  */
-/**
- * Re-measures how full each sleeping worker's chat is, before the prime may wake one.
- *
- * The context ceiling is what makes a stop final, and it is measured from the app's own
- * durable session for that conversation rather than from anything a model reported. The
- * broker keeps the figure in memory and in its snapshot, but a chat that grew while this app
- * was not running — or one whose snapshot predates the measurement entirely — would otherwise
- * be woken into a conversation with no room left in it. Reading it here, on the one call that
- * can wake a worker, is what makes the ceiling survive a crash rather than a restart quietly
- * handing back a worker the prime was already told was finished.
- */
-async function measureSleepingWorkers(caller: Caller): Promise<void> {
-  const state = swarmStateForCaller(caller);
-  if (state.agents.length === 0) return;
-  for (const info of state.agents) {
-    if (info.role !== 'worker' || info.state !== 'sleeping' || !info.conversationId) continue;
-    const summary = await findSessionByConversation(info.conversationId, { requireUnique: true }).catch(() => null);
-    if (summary) noteAgentContextTokens(info.conversationId, summary.contextTokens);
-  }
-  // Measurement is usually telemetry, but crossing the worker ceiling revokes durable revival
-  // authority and can terminalize a parked worker. `status` also calls this helper, so there is
-  // no later message/spawn acceptance barrier we can rely on: make every critical revision seen
-  // through the end of measurement durable before publishing the resulting state to the model.
-  try {
-    if (!(await persistCriticalSwarmNow())) {
-      throw new Error('the broker has no immediate durable persistence sink');
-    }
-  } catch (error) {
-    throw new Error(
-      `Worker context/revival state could not cross its durable barrier. Retry the agents call. (${error instanceof Error ? error.message : String(error)})`
-    );
-  }
-}
-
 function registerAgentsTool(reg: SurfaceRegistrar): void {
   reg.register(
     'agents',
@@ -1091,8 +1274,8 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
       title: 'Multi-agent run',
       description:
         'Run ChatGPT workers. Omit model and reasoning_effort unless the user explicitly requests an override; saved app defaults apply. Do not ask the user to choose them. Reuse a suitable sleeping worker with message before spawn. ' +
-        'message: prime→worker or worker→prime; a free slot revives the same sleeping chat. Replies arrive with tool results; never poll. ' +
-        'status: all active, sleeping/revivable and terminal/non-revivable workers in this prime’s durable history, including parked runs. finish: report the result, normally then sleep.',
+        'message: prime↔worker. Reports ride tool results, never restart primes. Use status once to collect pending reports before finalizing; otherwise state that review is pending. Never poll repeatedly. ' +
+        'status: your active, sleeping/revivable and terminal workers, including parked families. finish: record the report, then normally sleep.',
       inputSchema: z.object({
         action: z.enum(['spawn', 'message', 'status', 'finish']).describe('What to do.'),
         run_id: z.string().uuid().optional().describe('Select your returned worker family when status lists several; never grants another caller’s workers.'),
@@ -1106,7 +1289,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
         workers: z
           .array(
             z.object({
-              label: z.string().max(60).optional().describe('Short name shown to the user, e.g. "Security".'),
+              label: z.string().max(60).optional().describe('Name its job in 1-3 words, e.g. "Tests"; shown to the user.'),
               task: z
                 .string()
                 .min(1)
@@ -1139,7 +1322,8 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           .array(
             z.object({
               to: z.string().min(1).max(40).describe('Recipient.'),
-              text: z.string().min(1).max(4000).describe('What to say.')
+              text: z.string().min(1).max(4000).describe('What to say.'),
+              label: z.string().trim().min(1).max(60).optional().describe('New job name when waking.')
             }).strict()
           )
           .min(1)
@@ -1154,6 +1338,12 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           .max(40)
           .optional()
           .describe('message: one recipient; messaging a sleeping worker wakes it.'),
+        target_run_id: z
+          .string()
+          .min(1)
+          .max(36)
+          .optional()
+          .describe('message: existing prime run id; prime-only, no worker/status access.'),
         text: z.string().min(1).max(4000).optional().describe('message: what to say.'),
         result: z
           .string()
@@ -1165,7 +1355,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           )
       })
       .superRefine((input, ctx) => {
-        const reject = (field: 'context' | 'workers' | 'messages' | 'to' | 'text' | 'result', message: string): void => {
+        const reject = (field: 'context' | 'workers' | 'messages' | 'to' | 'target_run_id' | 'text' | 'result', message: string): void => {
           if (input[field] !== undefined) ctx.addIssue({ code: 'custom', path: [field], message });
         };
         if (input.action !== 'spawn') {
@@ -1175,6 +1365,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
         if (input.action !== 'message') {
           reject('messages', 'messages is only valid with action=message');
           reject('to', 'to is only valid with action=message');
+          reject('target_run_id', 'target_run_id is only valid with action=message');
           reject('text', 'text is only valid with action=message');
         }
         if (input.action !== 'finish') reject('result', 'result is only valid with action=finish');
@@ -1197,33 +1388,22 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           // Reserve under exact chat proof or the permitted transport request, atomically.
           // The request remains the reachable prime before browser attachment; later proof
           // changes its frontend projection without recreating workers or replaying spawn.
-          const staged = stageSpawn({
+          const spawnCaller = await callerNow(startedAt, { exact: true, runId: input.run_id });
+          // A stale managed worker whose family and ordinary retired-worker TTL have expired
+          // must not bootstrap a new prime family to regain local mutation authority. Session
+          // origin and durable managed tombstones are denial-only, not adoption credentials.
+          if (await managedWorkerIsolationRequired(spawnCaller) && !managedWorkerAllocationIdentity(spawnCaller)) {
+            return fail('WORKTREE_OWNER_UNAVAILABLE: a retired worker cannot create a prime run after its isolated checkout owner was lost.');
+          }
+          const { created, becamePrime, runId, defaultNotes, isolationNotes } = await spawnAgentWorkers({
             workers: input.workers,
             context: input.context ?? null,
-            caller: await callerNow(startedAt, { exact: true, runId: input.run_id })
-          });
-          let accepted = false;
-          try {
-            let durable = false;
-            try {
-              durable = await persistCriticalSwarmNow();
-            } catch (error) {
-              throw new Error(
-                `The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request. (${error instanceof Error ? error.message : String(error)})`
-              );
-            }
-            if (!durable) {
-              throw new Error(
-                'The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request.'
-              );
-            }
-            staged.commit();
-            accepted = true;
-          } catch (error) {
-            if (!accepted) staged.rollback();
-            throw error;
-          }
-          const { created, becamePrime, runId } = staged;
+            caller: spawnCaller
+          }, async () => {
+            const sessionId = currentCall()?.caller.sessionId;
+            return (sessionId ? await getSessionProject(sessionId) : null) ??
+              primeWorkspace(currentCaller().conversationId) ?? currentWorkspace();
+          }, () => !reg.ctx.readOnly && reg.caps.command && reg.caps.create && reg.caps.edit);
           if (currentCall()) currentCall()!.caller.runId = runId;
           // Browser tabs are a publication side effect, never part of planning. They become
           // visible only after the exact broker revision above is durable.
@@ -1239,6 +1419,8 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                   (becamePrime ? `This ${currentCaller().conversationId ? 'conversation' : 'request'} is now the prime agent of run ${runId}. ` : '') +
                   `${created.length} worker(s) matched: ${created.map((info) => `${info.id} (${info.label}, ${info.state}${info.model ? `, model ${info.model}` : ''}${info.reasoningEffort ? `, reasoning ${info.reasoningEffort}` : ''})`).join(', ')}. ` +
                   (invited.length > 0 ? 'New worker chats are opening with their briefs already in them. ' : '') +
+                  (defaultNotes?.length ? `${defaultNotes.join(' ')} ` : '') +
+                  (isolationNotes.length ? `${isolationNotes.join(' ')} ` : '') +
                   (sleeping.length > 0
                     ? `${sleeping.map((worker) => worker.id).join(', ')} already finished that earlier piece and is sleeping in its existing chat; wake it with action=message instead of spawning a duplicate. `
                     : '') +
@@ -1259,6 +1441,38 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
         }
 
         if (input.action === 'message') {
+          if (input.target_run_id) {
+            if (input.messages?.length) {
+              return fail('agents action=message with target_run_id takes one text message, not messages[].');
+            }
+            if (input.to && input.to !== PRIME_ID) {
+              return fail('agents action=message with target_run_id can address only the destination prime.');
+            }
+            if (!input.text) {
+              return fail('agents action=message with target_run_id requires text.');
+            }
+            const caller = await callerNow(startedAt, { runId: input.run_id, member: true });
+            const staged = stagePrimeMessage(caller, input.target_run_id, input.text);
+            await acceptAgentMutation(staged,
+              'The prime message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request.',
+              'TARGET_RUN_UNAVAILABLE: the destination prime family changed before acceptance. Nothing was queued.');
+            if (currentCall()) currentCall()!.caller.runId = staged.sourceRunId;
+            await recordAgentMessage(staged.message, 'sent', caller.conversationId);
+            return {
+              content: [{
+                type: 'text' as const,
+                text:
+                  `Queued for prime family ${staged.targetRunId}. The recipient can reply with target_run_id=${staged.sourceRunId}.`
+              }],
+              structuredContent: {
+                action: 'message',
+                run_id: staged.sourceRunId,
+                target_run_id: staged.targetRunId,
+                queued: [{ to: PRIME_ID }]
+              }
+            };
+          }
+
           // Two spellings of one operation. A single message is the common case and stays a
           // pair of scalars; `messages` is the same thing in bulk. Both in one call is a
           // request whose intended order nobody can read, so it is refused rather than
@@ -1277,25 +1491,8 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           // One call, one identity resolution, one all-or-nothing delivery: a prime
           // redirecting its whole run cannot end up with two of its three messages sent.
           const staged = stageMessages(caller, items);
-          let accepted = false;
-          try {
-            let durable = false;
-            try {
-              durable = await persistCriticalSwarmNow();
-            } catch (error) {
-              throw new Error(
-                `The agent message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request. (${error instanceof Error ? error.message : String(error)})`
-              );
-            }
-            if (!durable) {
-              throw new Error('The agent message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request.');
-            }
-            staged.commit();
-            accepted = true;
-          } catch (error) {
-            if (!accepted) staged.rollback();
-            throw error;
-          }
+          await acceptAgentMutation(staged,
+            'The agent message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request.');
           const sent = staged.messages;
           const woken = staged.waking;
           // Reopening a sleeping worker's chat is a browser side effect, so it happens only
@@ -1332,28 +1529,9 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
             );
           }
           const staged = stageFinishAgent(await callerNow(startedAt, { runId: input.run_id, member: true }), input.result);
-          let accepted = staged.repeat;
-          try {
-            if (!staged.repeat) {
-              let durable = false;
-              try {
-                durable = await persistCriticalSwarmNow();
-              } catch (error) {
-                throw new Error(
-                  `The worker finish could not cross its durable acceptance barrier. Nothing was published; retry the same finish result. (${error instanceof Error ? error.message : String(error)})`
-                );
-              }
-              if (!durable) {
-                throw new Error(
-                  'The worker finish could not cross its durable acceptance barrier. Nothing was published; retry the same finish result.'
-                );
-              }
-              staged.commit();
-              accepted = true;
-            }
-          } catch (error) {
-            if (!accepted) staged.rollback();
-            throw error;
+          if (!staged.repeat) {
+            await acceptAgentMutation(staged,
+              'The worker finish could not cross its durable acceptance barrier. Nothing was published; retry the same finish result.');
           }
           const { info, report, repeat } = staged;
           if (report) await recordAgentMessage(report, 'sent', info.conversationId);
@@ -1365,13 +1543,13 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
               {
                 type: 'text' as const,
                 text: repeat
-                  ? `${info.id} was already ${info.state} and the prime agent already has that result, so nothing was ` +
-                    'sent again. Stop working and stop calling tools.'
+                  ? `${info.id} was already ${info.state}; the previous result was already recorded for the prime, so nothing was ` +
+                    'queued again. This acknowledgment does not confirm delivery to the prime. Stop working and stop calling tools.'
                   : info.state === 'finished'
-                    ? `${info.id} is finished. The prime agent has your result. This chat has also reached its context ` +
+                    ? `${info.id} is finished. Your result was recorded for the prime. This acknowledgment does not confirm delivery to the prime. This chat has also reached its context ` +
                       'limit, so there will be no more work in it: stop working and stop calling tools.'
-                    : `${info.id} reported and is now asleep but remains reusable. The prime agent has your result and ` +
-                      'your worker slot is free. Stop working and stop calling tools; for related follow-up work the ' +
+                    : `${info.id} reported and is now asleep but remains reusable. Your result was recorded for the prime. ` +
+                      'This acknowledgment does not confirm delivery to the prime. Your worker slot is free. Stop working and stop calling tools; for related follow-up work the ' +
                       'prime should wake this same chat with agents action=message before spawning a replacement.'
               }
             ],
@@ -1568,8 +1746,13 @@ interface PatchRollbackSnapshot {
 /** Keep the connector's atomicity promise bounded even when many large files are patched. */
 const MAX_PATCH_ROLLBACK_BYTES = 64 * 1024 * 1024;
 
-async function readOptionalPatchBytes(real: string): Promise<Buffer | null> {
+async function readOptionalPatchBytes(real: string, projectFs: ProjectFs): Promise<Buffer | null> {
   try {
+    if (projectFs !== localFs) {
+      const metadata = await projectFs.getMetadata(real);
+      if (metadata.isSymlink || !metadata.isFile) throw new Error('apply_patch target changed from a file before execution');
+      return await projectFs.readFile(real);
+    }
     const stat = await fs.lstat(real);
     if (!stat.isFile()) throw new Error('apply_patch target changed from a file before execution');
     return await fs.readFile(real);
@@ -1583,7 +1766,7 @@ async function capturePatchRollbackSnapshots(resolution: PatchResolution): Promi
   const snapshots = new Map<string, PatchRollbackSnapshot>();
   let total = 0;
   for (const [real, virtual] of resolution.virtualPaths) {
-    const bytes = await readOptionalPatchBytes(real);
+    const bytes = await readOptionalPatchBytes(real, resolution.fs);
     total += bytes?.length ?? 0;
     if (total > MAX_PATCH_ROLLBACK_BYTES) {
       throw new Error(
@@ -1630,7 +1813,8 @@ function expectedPatchStates(
  */
 async function rollbackFailedPatch(
   snapshots: Map<string, PatchRollbackSnapshot>,
-  delta: AppliedPatchDelta
+  delta: AppliedPatchDelta,
+  projectFs: ProjectFs
 ): Promise<{ complete: boolean; note: string }> {
   const expected = expectedPatchStates(snapshots, delta);
   const problems: string[] = [];
@@ -1638,7 +1822,7 @@ async function rollbackFailedPatch(
   for (const [real, snapshot] of snapshots) {
     let current: Buffer | null;
     try {
-      current = await readOptionalPatchBytes(real);
+      current = await readOptionalPatchBytes(real, projectFs);
     } catch {
       problems.push(`${snapshot.virtual}: could not inspect current state`);
       continue;
@@ -1650,7 +1834,10 @@ async function rollbackFailedPatch(
       continue;
     }
     try {
-      if (snapshot.bytes === null) await fs.rm(real, { force: true });
+      if (projectFs !== localFs) {
+        if (snapshot.bytes === null) await projectFs.remove(real, { recursive: false, force: true });
+        else await projectFs.writeFile(real, snapshot.bytes);
+      } else if (snapshot.bytes === null) await fs.rm(real, { force: true });
       else await fs.writeFile(real, snapshot.bytes);
     } catch {
       problems.push(`${snapshot.virtual}: restore failed`);
@@ -1660,7 +1847,7 @@ async function rollbackFailedPatch(
   // Prove the final state rather than assuming successful write/remove calls meant restoration.
   for (const [real, snapshot] of snapshots) {
     try {
-      if (!samePatchState(await readOptionalPatchBytes(real), snapshot.bytes)) {
+      if (!samePatchState(await readOptionalPatchBytes(real, projectFs), snapshot.bytes)) {
         if (!problems.some((problem) => problem.startsWith(`${snapshot.virtual}:`))) {
           problems.push(`${snapshot.virtual}: restore verification failed`);
         }
@@ -1706,9 +1893,12 @@ async function runParsedPatch(
       // Preserve the shell gate from `cd dir && apply_patch`: interception must not execute a
       // patch that the submitted shell command would never have reached. The cwd must already
       // exist and be a directory; patch-created parents apply only to paths *inside* it.
-      effectiveBase = await resolveIn(roots, args.workdir, { base: base.virtual });
-      const stat = await fs.stat(effectiveBase.real);
-      if (!stat.isDirectory()) {
+      const workdir = await resolveIn(roots, args.workdir, { base: base.virtual, remote: true });
+      effectiveBase = workdir;
+      const isDirectory = workdir.root.remote
+        ? (await fsForRoot(workdir.root).getMetadata(workdir.real)).isDirectory
+        : (await fs.stat(workdir.real)).isDirectory();
+      if (!isDirectory) {
         return { result: fail('apply_patch workdir must be an existing folder'), content: null, exitCode: null };
       }
     } catch (error) {
@@ -1727,24 +1917,24 @@ async function runParsedPatch(
   }
   if (caps !== undefined) {
     try {
-      const denial = await patchEffectCapabilityDenial(effectiveArgs.hunks, caps, resolution.resolve);
+      const denial = await patchEffectCapabilityDenial(effectiveArgs.hunks, caps, resolution.resolve, resolution.fs);
       if (denial !== null) return { result: fail(denial), content: null, exitCode: null };
     } catch (error) {
       return { result: fail(friendlyError(error)), content: null, exitCode: null };
     }
   }
-  // Move-only is a separate permission from Edit. Upstream's default update mode normalizes
-  // even context-only moves to LF, so a CRLF file would be byte-rewritten under Move alone.
-  // Preserve line endings whenever Edit is unavailable; any real content change was already
-  // rejected by patchCapabilityDenial before resolution.
-  const patchUpdateMode = caps !== undefined && !caps.edit ? 'preserve_line_endings' : DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE;
+  // Upstream's default update mode splits on LF only: lines outside a hunk keep their CR while
+  // the hunk's context and new lines lose it, so one edit leaves a CRLF file with mixed endings
+  // (and a context-only move under Move alone would rewrite bytes). Keep each file's own endings.
+  const patchUpdateMode = 'preserve_line_endings';
 
   try {
     await verifyApplyPatchArgs(
       effectiveArgs,
       effectiveBase.real,
       patchUpdateMode,
-      resolution.resolve
+      resolution.resolve,
+      resolution.fs
     );
   } catch (error) {
     return {
@@ -1767,11 +1957,12 @@ async function runParsedPatch(
     patch: effectiveArgs.patch,
     cwd: effectiveBase.real,
     updateFileMode: patchUpdateMode,
-    resolvePath: resolution.resolve
+    resolvePath: resolution.resolve,
+    fs: resolution.fs
   });
   let rollbackNote = '';
   if (execution.exitCode !== 0 && rollbackSnapshots !== null) {
-    const rollback = await rollbackFailedPatch(rollbackSnapshots, execution.delta);
+    const rollback = await rollbackFailedPatch(rollbackSnapshots, execution.delta, resolution.fs);
     rollbackNote = rollback.note;
   }
   const stdout = safePatchOutput(execution.stdout, resolution);
@@ -1789,7 +1980,9 @@ async function runParsedPatch(
     DEFAULT_TRUNCATION_POLICY
   );
 
-  noteChanges(patchFileChanges(execution.delta, resolution.virtualPaths));
+  const recordedChanges = patchFileChanges(execution.delta, resolution.virtualPaths);
+  noteChanges(recordedChanges.map(entry => entry.change), execution.exitCode === 0 && execution.delta.exact
+    ? recordedChanges.map(({ before, after }) => ({ before, after })) : undefined);
   logInfo(`tool apply_patch (${execution.delta.changes.length} file(s), exit ${execution.exitCode})`);
   return {
     result: execution.exitCode === 0 ? ok(content) : fail(content),
@@ -1841,11 +2034,14 @@ function patchCapabilityDenial(hunks: readonly Hunk[], caps: Capabilities): stri
 async function patchEffectCapabilityDenial(
   hunks: readonly Hunk[],
   caps: Capabilities,
-  resolve: PatchPathResolver
+  resolve: PatchPathResolver,
+  projectFs: ProjectFs
 ): Promise<string | null> {
   const exists = async (target: string): Promise<boolean> => {
     try {
-      await fs.lstat(target);
+      // A server folder never resolves a dangling link, so following links there loses nothing.
+      if (projectFs === localFs) await fs.lstat(target);
+      else await projectFs.getMetadata(target);
       return true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
@@ -1853,7 +2049,7 @@ async function patchEffectCapabilityDenial(
     }
   };
   const samePath = (left: string, right: string): boolean =>
-    process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+    projectFs === localFs && process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 
   for (const hunk of hunks) {
     if (hunk.kind === 'add_file') {
@@ -1878,6 +2074,8 @@ interface PatchResolution {
   virtualPaths: Map<string, string>;
   /** Exact model-visible/real spellings that must never be echoed back as native paths. */
   displayRewrites: Map<string, string>;
+  /** Where every path of the patch lives: this computer, or the one server folder (#1469). */
+  fs: ProjectFs;
 }
 
 function safePatchOutput(text: string, resolution: PatchResolution): string {
@@ -1910,17 +2108,19 @@ async function resolvePatchPaths(
   // resolution has to model that same presence state instead of consulting only pre-patch disk.
   const pendingPresence = new Map<string, boolean>();
   const pathKey = (real: string): string => (process.platform === 'win32' ? real.toLowerCase() : real);
+  const touchedRoots = new Map<string, Root>();
 
   const add = async (spelledPath: string, requireExisting: boolean): Promise<string> => {
     // First resolve the sandbox identity without requiring the leaf to exist. This gives later
     // hunks a stable real key even when the path exists only in the patch's simulated state.
-    let resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: true });
+    let resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: true, remote: true });
     const state = pendingPresence.get(pathKey(resolved.real));
     // An untouched initial Update/Delete keeps the old strict Not-found behaviour. Once an
     // earlier hunk has established presence/absence, the verifier owns the sequential verdict.
     if (requireExisting && state === undefined) {
-      resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: false });
+      resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: false, remote: true });
     }
+    touchedRoots.set(resolved.root.name, resolved.root);
     realBySpelling.set(spelledPath, resolved.real);
     virtualPaths.set(resolved.real, resolved.virtual);
     displayRewrites.set(resolved.real, resolved.virtual);
@@ -1950,6 +2150,16 @@ async function resolvePatchPaths(
     pendingPresence.set(pathKey(destination), true);
   }
 
+  // One patch is applied through one file system. A server folder's files are reached over its
+  // own SFTP session, so a patch there stays inside that folder; mixing it with any other folder
+  // would need two file systems and two rollbacks that could not succeed or fail together.
+  const remote = [...touchedRoots.values()].find(root => root.remote);
+  if (remote && touchedRoots.size > 1) {
+    throw new SandboxError(
+      `This patch changes files in /${remote.name}, a folder on a server, and in another folder. A patch can change files in one server folder at a time; split it into one patch per folder.`
+    );
+  }
+
   const resolve: PatchPathResolver = (spelledPath) => {
     const resolved = realBySpelling.get(spelledPath);
     if (resolved === undefined) {
@@ -1957,10 +2167,10 @@ async function resolvePatchPaths(
     }
     return resolved;
   };
-  return { resolve, virtualPaths, displayRewrites };
+  return { resolve, virtualPaths, displayRewrites, fs: remote ? fsForRoot(remote) : localFs };
 }
 
-function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<string, string>): FileChange[] {
+function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<string, string>): Array<{ change: FileChange; before: string; after: string }> {
   return delta.changes.map(({ path, change }) => {
     let realPath = path;
     let before: string;
@@ -1978,10 +2188,14 @@ function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<st
     }
     const counts = lineDelta(before, after);
     return {
-      path: virtualPaths.get(realPath) ?? '[unresolved patch path]',
-      added: counts.added,
-      removed: counts.removed,
-      approximate: counts.approximate || !delta.exact
+      change: {
+        path: virtualPaths.get(realPath) ?? '[unresolved patch path]',
+        added: counts.added,
+        removed: counts.removed,
+        approximate: counts.approximate || !delta.exact
+      },
+      before,
+      after
     };
   });
 }
@@ -2019,8 +2233,9 @@ async function expandGlob(
   const rest = segments.slice(baseSegments.length).join('/');
   if (!rest) return { matches: [normalised], truncated: null };
 
-  const resolved = await resolveIn(roots, base);
-  const info = await statInfo(resolved.real, resolved.virtual, { scanContent: false });
+  const resolved = await resolveIn(roots, base, { access: 'read', remote: true });
+  const projectFs = fsForRoot(resolved.root);
+  const info = await statInfo(resolved.real, resolved.virtual, { scanContent: false, fs: projectFs });
   if (info.type !== 'directory') throw new SandboxError(`${resolved.virtual} is not a folder, so it cannot be globbed`);
 
   // `**` walks with Codex's bounded breadth-first walk; a single-level pattern needs one
@@ -2030,12 +2245,13 @@ async function expandGlob(
   if (rest.includes('**')) {
     const walked = await walkFiles(resolved.real, resolved.virtual, {
       maxEntries: GLOB_SCAN_LIMIT,
-      exclude: DEFAULT_EXCLUDES
+      exclude: DEFAULT_EXCLUDES,
+      fs: projectFs
     });
     candidates = walked.files;
     scanTruncated = walked.truncated;
   } else {
-    const listed = await listDirectoryLevel(resolved.real, resolved.virtual, GLOB_SCAN_LIMIT, false);
+    const listed = await listDirectoryLevel(resolved.real, resolved.virtual, GLOB_SCAN_LIMIT, false, projectFs);
     candidates = listed.entries.filter((entry) => entry.type === 'file').map((entry) => entry.virtualPath);
     scanTruncated = listed.truncated;
   }
@@ -2103,6 +2319,8 @@ const MISSING_PATH_LISTING = 40;
  */
 async function nearestFolderListing(roots: Root[], requested: string, err: unknown): Promise<string> {
   if (!(err instanceof SandboxError) || !err.message.startsWith('Not found:')) return '';
+  const meant = await pathUnderNamedRoot(roots, requested);
+  if (meant) return `\nDid you mean ${meant}? It exists under the approved root of that name.`;
   let candidate = requested;
   for (let depth = 0; depth < 8; depth++) {
     const parent = candidate.replace(/[\\/]+[^\\/]+[\\/]*$/, '');
@@ -2110,13 +2328,13 @@ async function nearestFolderListing(roots: Root[], requested: string, err: unkno
     candidate = parent;
     let resolved;
     try {
-      resolved = await resolveIn(roots, candidate);
+      resolved = await resolveIn(roots, candidate, { access: 'read', remote: true });
     } catch (error) {
       if (error instanceof SandboxError && error.message.startsWith('Not found:')) continue;
       return '';
     }
     try {
-      const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MISSING_PATH_LISTING, false);
+      const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MISSING_PATH_LISTING, false, fsForRoot(resolved.root));
       const names = entries.map((entry) => `${entry.type === 'directory' ? 'd' : 'f'} ${entry.name}`);
       const more = truncated ? `, …` : '';
       return `\nThe nearest existing folder is ${resolved.virtual}${
@@ -2127,6 +2345,29 @@ async function nearestFolderListing(roots: Root[], requested: string, err: unkno
     }
   }
   return '';
+}
+
+/**
+ * A missing path that names another approved root further down, where the rest exists.
+ *
+ * Live 2026-10-12: with roots `/downloads` and `/voxelcraft`, a model read
+ * `/downloads/.Dev-projects/voxelcraft/shared/adventure.ts`, the project's disk path under the
+ * wrong root. The listing that followed showed the user's Downloads folder, unrelated to the
+ * project, instead of the file it was after.
+ */
+async function pathUnderNamedRoot(roots: Root[], requested: string): Promise<string | null> {
+  const segments = requested.split(/[\\/]+/).filter(Boolean);
+  for (let index = 1; index < segments.length - 1; index++) {
+    const root = roots.find(entry => entry.name.toLowerCase() === segments[index]!.toLowerCase());
+    if (!root) continue;
+    const candidate = `/${[root.name, ...segments.slice(index + 1)].join('/')}`;
+    try {
+      return (await resolveIn(roots, candidate, { access: 'read', remote: true })).virtual;
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 /**
@@ -2141,14 +2382,26 @@ async function readOne(
   requested: string,
   options: ReadOneOptions
 ): Promise<{ text: string; bytes: number; image?: { data: string; mimeType: string } }> {
-  const resolved = await resolveIn(options.roots, requested);
-  const info = await statInfo(resolved.real, resolved.virtual, { scanContent: !options.canRead });
+  // The virtual root itself: a model that has not looked yet naturally starts at "/", and "Path
+  // is empty" left it guessing the names. The shared folders are what "/" contains.
+  if (typeof requested === 'string' && (process.platform === 'win32' ? /^[/\\]+$/ : /^\/+$/).test(requested.trim())) {
+    if (!options.canBrowse) {
+      return { text: `--- / ---\nTOOL_DISABLED: listing folders needs the Browse folders permission.`, bytes: 0 };
+    }
+    const text = options.roots.length === 0
+      ? '--- / — no folders are shared yet ---'
+      : `--- / — ${options.roots.length} entr${options.roots.length === 1 ? 'y' : 'ies'}, one level ---\n${options.roots.map(root => `d ${root.name}`).join('\n')}`;
+    return { text, bytes: Buffer.byteLength(text, 'utf8') };
+  }
+  const resolved = await resolveIn(options.roots, requested, { access: 'read', remote: true });
+  const projectFs = fsForRoot(resolved.root);
+  const info = await statInfo(resolved.real, resolved.virtual, { scanContent: !options.canRead, fs: projectFs });
 
   if (info.type === 'directory') {
     if (!options.canBrowse) {
       return { text: `--- ${resolved.virtual} ---\nTOOL_DISABLED: listing folders needs the Browse folders permission.`, bytes: 0 };
     }
-    const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MAX_DIR_ENTRIES);
+    const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MAX_DIR_ENTRIES, true, projectFs);
     const prefixLength = resolved.virtual.length + 1;
     const body = entries
       .map((entry) => {
@@ -2189,7 +2442,7 @@ async function readOne(
     // must not fail solely because it is larger than the text budget. Still charge base64,
     // not just compressed file bytes, and refuse an exhausted image batch before decoding.
     if (options.imageBytes <= 0) throw new Error('Read image output cap reached; read remaining images in another call or use view_image.');
-    const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
+    const image = await viewImage(resolved.real, null, undefined, resolved.virtual, undefined, projectFs);
     logInfo(`tool read image ${resolved.virtual} (${formatBytes(image.bytes)})`);
     const text = `--- ${resolved.virtual} — ${formatBytes(image.bytes)} ${image.mimeType} ---`;
     if (image.base64.length > options.imageBytes) {
@@ -2218,7 +2471,8 @@ async function readOne(
     result = await readTextFile(resolved.real, {
       startLine: options.startLine,
       endLine: options.endLine,
-      maxBytes: options.maxBytes
+      maxBytes: options.maxBytes,
+      fs: projectFs
     });
   } catch (error) {
     if (!(error instanceof BinaryReadError)) throw error;
@@ -2312,3 +2566,6 @@ function boundedNumberedRead(
 
 export type { ToolResult };
 import { firstTaskRoot } from '../skill-access.js';
+import { reportedUsageLimits } from '../session/usage.js';
+import { readProviderUsage } from '../provider-usage.js';
+import { usageReport } from '../usage-tool.js';

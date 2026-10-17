@@ -33,6 +33,10 @@ import type { Root } from '../shared/types.js';
 import { currentCall } from './mcp/call-context.js';
 import { requestCorrelation } from './session/correlation.js';
 import { isSkillPath, isSkillVirtualPath } from './skill-access.js';
+import { isContained } from './sandbox.js';
+import { fsForRoot, type ProjectFs } from './remote/project-fs.js';
+import { lookupWorkerWorkspace } from './worktrees/index.js';
+import { managedWorkerAllocationIdentity, managedWorkerWorktreeRequired } from './agents.js';
 
 /** How long a learned workspace survives without being used or renewed. */
 const WORKSPACE_TTL_MS = 12 * 60 * 60 * 1000;
@@ -104,6 +108,19 @@ export function currentWorkspace(): Workspace | null {
   const keys = workspaceKeys();
   if (!keys.length) return null;
   prune();
+  // Worker allocation is the broker's immutable identity, independent of its active run id.
+  // On restart the marker can be rebuilt while this ephemeral cwd cache is empty.
+  const required = call ? managedWorkerWorktreeRequired(call.caller) : false;
+  if (required) {
+    const allocation = managedWorkerAllocationIdentity(call!.caller);
+    const lease = allocation && call!.agent === allocation.agentId ? lookupWorkerWorkspace(allocation) : null;
+    if (!lease) {
+      throw new Error('WORKTREE_OWNER_UNAVAILABLE: the required isolated worker checkout has no verified owner. Restore the marker and approved root before using local files or commands.');
+    }
+    const workspace: Workspace = { ...lease.workspace, at: Date.now() };
+    for (const key of keys) workspaces.set(key, { ...workspace });
+    return workspace;
+  }
   let held: Workspace | null = null;
   for (const key of keys) {
     held = workspaces.get(key) ?? null;
@@ -229,6 +246,18 @@ export function moveChatWorkspace(fromConversationId: string, toConversationId: 
   return true;
 }
 
+/**
+ * Forgets a learned workspace whose folder no longer exists.
+ *
+ * A worker that slept while its temporary folder was deleted would otherwise run its first
+ * command after revival in that deleted folder and fail with "Not found". Request-scoped copies
+ * of the same folder go too, or the next exact call would recover it from them again.
+ */
+export function forgetMissingWorkspace(real: string): void {
+  for (const key of workspaceKeys()) if (workspaces.get(key)?.real === real) workspaces.delete(key);
+  for (const [key, held] of workspaces) if (key.startsWith('request:') && held.real === real) workspaces.delete(key);
+}
+
 /** Drops one conversation-scoped workspace without touching any agent-scoped mirror. */
 export function clearChatWorkspace(conversationId: string | null): boolean {
   if (!conversationId) return false;
@@ -308,11 +337,13 @@ async function hasMarker(real: string): Promise<boolean> {
  */
 export async function projectFolderOf(
   resolved: { real: string; virtual: string },
-  rootReal: string
+  rootReal: string,
+  io: FolderIo = localIo
 ): Promise<{ real: string; virtual: string }> {
-  const startReal = (await isDirectory(resolved.real)) ? resolved.real : path.dirname(resolved.real);
+  const startIsDirectory = await io.isDirectory(resolved.real);
+  const startReal = startIsDirectory ? resolved.real : io.path.dirname(resolved.real);
   const depth = path.posix.normalize(resolved.virtual).split('/').filter(Boolean).length;
-  const startVirtual = (await isDirectory(resolved.real))
+  const startVirtual = startIsDirectory
     ? path.posix.normalize(resolved.virtual)
     : path.posix.dirname(path.posix.normalize(resolved.virtual));
 
@@ -321,15 +352,40 @@ export async function projectFolderOf(
   // Bounded by the virtual depth, so a malformed pair can never spin.
   for (let step = 0; step <= depth; step++) {
     // Never above the approved root: containment is the boundary, here as everywhere.
-    const relative = path.relative(rootReal, currentReal);
-    if (relative.startsWith('..') || path.isAbsolute(relative)) break;
-    if (await hasMarker(currentReal)) return { real: currentReal, virtual: currentVirtual };
-    const parentReal = path.dirname(currentReal);
+    if (!io.contained(rootReal, currentReal)) break;
+    if (await io.hasMarker(currentReal)) return { real: currentReal, virtual: currentVirtual };
+    const parentReal = io.path.dirname(currentReal);
     if (parentReal === currentReal) break;
     currentReal = parentReal;
     currentVirtual = path.posix.dirname(currentVirtual);
   }
   return { real: startReal, virtual: startVirtual };
+}
+
+/** How `projectFolderOf` looks at a folder: on this computer, or on a server over SFTP (#1469). */
+interface FolderIo {
+  path: path.PlatformPath;
+  isDirectory(real: string): Promise<boolean>;
+  hasMarker(real: string): Promise<boolean>;
+  contained(rootReal: string, real: string): boolean;
+}
+const localIo: FolderIo = { path, isDirectory, hasMarker, contained: isContained };
+function serverIo(files: ProjectFs): FolderIo {
+  const isDirectoryThere = (real: string) => files.getMetadata(real).then(meta => meta.isDirectory, () => false);
+  return {
+    path: path.posix,
+    isDirectory: isDirectoryThere,
+    async hasMarker(real) {
+      for (const marker of PROJECT_MARKERS) {
+        if (await files.getMetadata(path.posix.join(real, marker)).then(() => true, () => false)) return true;
+      }
+      return false;
+    },
+    contained: (rootReal, real) => {
+      const root = rootReal.replace(/\/+$/, '');
+      return real === root || real.startsWith(`${root}/`) || root === '';
+    }
+  };
 }
 
 /**
@@ -343,6 +399,11 @@ export async function projectFolderOf(
 export async function learnWorkspace(resolved: { real: string; virtual: string; root: Root }): Promise<void> {
   if (isSkillPath(resolved.real) || isSkillVirtualPath(resolved.virtual) || resolved.root.name.toLowerCase() === 'skills') return;
   if (!workspaceKey()) return;
+  // A folder on a server (#1469) is walked there, with the server's own path rules.
+  if (resolved.root.remote) {
+    setCurrentWorkspace(await projectFolderOf(resolved, resolved.root.remote.path, serverIo(fsForRoot(resolved.root))));
+    return;
+  }
   let rootReal: string;
   try {
     rootReal = await fs.realpath(resolved.root.path);

@@ -1551,6 +1551,15 @@ export function execRecoveryHints(
     // The batch runner parses each item with ScriptBlock.Create; PowerShell wraps its
     // parser diagnostic in this exception instead of emitting FullyQualifiedErrorId.
     /Exception calling "Create" with "1" argument\(s\): "At line:\d+ char:\d+/i.test(outputText) ||
+    // …and PowerShell localises that wrapper. A German install reports the same unterminated
+    // string as `Ausnahme beim Aufrufen von "Create" mit 1 Argument(en): "In Zeile:1
+    // Zeichen:14`, which the English sentence above cannot see — so every non-English Windows
+    // lost this hint entirely and the model was left with a foreign-language exception and no
+    // statement that nothing had parsed. Two things in that output are never translated: the
+    // method name the batch runner calls, and the caret underline the parser draws under the
+    // offending token. Neither appears in ordinary program output, and requiring both keeps a
+    // command that merely prints the word Create from claiming a parse failure.
+    (/"Create"/.test(outputText) && /(?:^|\n)\s*\+\s*~{2,}/.test(outputText)) ||
     /FullyQualifiedErrorId\s*:\s*(?:TerminatorExpectedAtEndOfString|MissingArgument|MissingExpressionAfterToken|MissingFileSpecification|RedirectionNotSupported|UnexpectedToken|EmptyPipeElement)/i.test(
       outputText
     );
@@ -1592,8 +1601,13 @@ export function execRecoveryHints(
   return hints;
 }
 
+/** The advisory notes of an exec result, one `Note:` line each; empty when there are none. */
+export function execNotesText(notes: readonly string[]): string {
+  return notes.map((note) => `Note: ${note}`).join('\n');
+}
+
 /** Appends advisory notes to an exec result without disturbing the parity-formatted body. */
 export function withExecNotes(responseText: string, notes: readonly string[]): string {
   if (notes.length === 0) return responseText;
-  return `${responseText}\n\n${notes.map((note) => `Note: ${note}`).join('\n')}`;
+  return `${responseText}\n\n${execNotesText(notes)}`;
 }

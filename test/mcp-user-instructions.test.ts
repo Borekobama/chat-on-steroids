@@ -89,7 +89,11 @@ describe('the user’s own connector instructions', () => {
   it.each(['win32', 'darwin', 'linux'] as const)('teaches the same terminal result lifetime on %s', platform => {
     const text = serverInstructions({ ...ctx, caps: { ...ctx.caps, command: true } }, 'core', platform);
     expect(text).toContain('completed_session_id');
-    expect(text).toContain('benign_exit');
+    // write_stdin has one id argument. completed_session_id is an exec_command result field that
+    // goes into it; read as a second argument, the strict schema refuses the call.
+    expect(text).toContain("pass a finished command's completed_session_id as session_id");
+    expect(text).toContain('expected_exit');
+    expect(text).not.toContain('benign');
     expect(text).toContain('without rerunning work');
     if (platform !== 'win32') {
       expect(text).toContain('normal POSIX shell');
@@ -127,6 +131,16 @@ describe('the user’s own connector instructions', () => {
     const withoutCommands = serverInstructions({ ...ctx, caps: { ...ctx.caps, command: false } }, 'core', 'linux');
     expect(withoutCommands).toContain('find searches');
     expect(withoutCommands).not.toContain('exec_command runs');
+  });
+
+  it('explains the transient ChatGPT safety refusal and offers session_finish to any model', () => {
+    // #555: a benign call was blocked once by ChatGPT and succeeded unchanged on retry.
+    const text = serverInstructions({ ...ctx, exposedFinishTool: true }, 'core', 'win32');
+    expect(text).toContain('"This tool call was blocked by OpenAI because we couldn\'t determine the safety status of the request." comes from ChatGPT before CoS receives the call');
+    expect(text).toContain('retry the identical call once');
+    // #556: the tool is exposed by the finish setting, not by model; Sol users were told "Astra only".
+    expect(text).toContain('Use session_finish only when the user prompt explicitly requests it, with any model.');
+    expect(text).not.toMatch(/Astra only/);
   });
 
   it('adds nothing at all when empty, not even the heading', () => {

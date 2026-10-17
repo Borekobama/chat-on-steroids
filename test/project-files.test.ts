@@ -13,10 +13,12 @@ import {
   previewProjectFile,
   projectFileTarget,
   renameProjectEntry,
+  revalidateProjectFileTarget,
   saveProjectTextFile
 } from '../src/main/project-files.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
 import { ProjectFileWatchSet } from '../src/main/project-file-watcher.js';
+import * as projectFiles from '../src/main/project-files.js';
 
 let directory: string;
 let approved: string;
@@ -36,6 +38,19 @@ afterEach(async () => {
   vi.restoreAllMocks();
   resetDurableForTests();
   await fs.rm(directory, { recursive: true, force: true });
+});
+
+it('hides repository internals and Finder metadata but keeps ordinary dotfiles', async () => {
+  const projectPath = path.join(approved, 'project');
+  await fs.mkdir(path.join(projectPath, '.git'), { recursive: true });
+  await fs.writeFile(path.join(projectPath, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+  await fs.writeFile(path.join(projectPath, '.DS_Store'), 'x');
+  await fs.writeFile(path.join(projectPath, '.gitignore'), 'dist\n');
+  const project = await addProject(projectPath);
+  const names = (await listProjectDirectory(project.id)).entries.map(entry => entry.name);
+  expect(names).toContain('.gitignore');
+  expect(names).not.toContain('.git');
+  expect(names).not.toContain('.DS_Store');
 });
 
 it('lists exactly one project level at a time and previews bounded text', async () => {
@@ -222,6 +237,44 @@ it('rejects traversal and links that leave the LocalProject even when the target
   await expect(projectFileTarget(project.id, 'linked-sibling/secret.txt')).rejects.toThrow(/symbolic links|junctions/);
 });
 
+it('revalidates a create parent when it is replaced by a junction after target resolution', async () => {
+  const projectPath = path.join(approved, 'project');
+  const siblingPath = path.join(approved, 'sibling');
+  const notes = path.join(projectPath, 'notes');
+  const parked = path.join(projectPath, 'notes-original');
+  const target = path.join(notes, 'race.txt');
+  await fs.mkdir(notes);
+  const project = await addProject(projectPath);
+  const lstat = fs.lstat.bind(fs);
+  let targetChecks = 0;
+  vi.spyOn(fs, 'lstat').mockImplementation((async (file: any, options?: any) => {
+    if (String(file) === target && ++targetChecks === 2) {
+      await fs.rename(notes, parked);
+      await fs.symlink(siblingPath, notes, process.platform === 'win32' ? 'junction' : 'dir');
+      throw Object.assign(new Error('Target is still missing'), { code: 'ENOENT' });
+    }
+    return lstat(file, options);
+  }) as typeof fs.lstat);
+
+  await expect(createProjectEntry(project.id, 'notes', 'race.txt', 'file')).rejects.toThrow(/symbolic links|junctions|changed location/);
+  expect(await fs.readdir(siblingPath)).not.toContain('race.txt');
+});
+
+it('rejects a previously resolved mutation target after its parent becomes a junction', async () => {
+  const projectPath = path.join(approved, 'project');
+  const siblingPath = path.join(approved, 'sibling');
+  const notes = path.join(projectPath, 'notes');
+  const parked = path.join(projectPath, 'notes-original');
+  await fs.mkdir(notes);
+  await fs.writeFile(path.join(notes, 'trash-me.txt'), 'safe');
+  const project = await addProject(projectPath);
+  const target = await projectFileTarget(project.id, 'notes/trash-me.txt', { allowRoot: false });
+  await fs.rename(notes, parked);
+  await fs.symlink(siblingPath, notes, process.platform === 'win32' ? 'junction' : 'dir');
+
+  await expect(revalidateProjectFileTarget(target)).rejects.toThrow(/symbolic links|junctions|changed location/);
+});
+
 it('keeps the original bytes when the final replacement cannot be renamed', async () => {
   const projectPath = path.join(approved, 'project');
   const file = path.join(projectPath, 'notes.txt');
@@ -336,4 +389,60 @@ it('watches only requested project directories, debounces changes, and closes co
   } finally {
     vi.useRealTimers();
   }
+});
+
+it('reports a lost watch for resync and ignores notifications from its retired handle', async () => {
+  vi.useFakeTimers();
+  const records: Array<{ emitter: EventEmitter & { close: ReturnType<typeof vi.fn> }; fire: () => void }> = [];
+  const changed: Array<{ projectId: string; directory: string; watchLost?: boolean }> = [];
+  const watches = new ProjectFileWatchSet(event => changed.push(event), (_nativePath, listener) => {
+    const emitter = new EventEmitter() as EventEmitter & { close: ReturnType<typeof vi.fn> };
+    emitter.close = vi.fn();
+    records.push({ emitter, fire: listener });
+    return emitter as never;
+  });
+  try {
+    const project = await addProject(path.join(approved, 'project'));
+    await watches.sync(project.id, ['']);
+    records[0]!.fire(); // Pending ordinary notification must retire with the failed watch.
+    records[0]!.emitter.emit('error', new Error('watch closed by the filesystem'));
+    expect(changed).toEqual([{ projectId: project.id, directory: '', watchLost: true }]);
+    expect(records[0]!.emitter.close).toHaveBeenCalledTimes(1);
+    changed.length = 0;
+    await watches.sync(project.id, ['']);
+    records[0]!.fire();
+    records[0]!.emitter.emit('error', new Error('late old error'));
+    vi.advanceTimersByTime(180);
+    expect(changed).toEqual([]);
+    records[1]!.fire();
+    vi.advanceTimersByTime(180);
+    expect(changed).toEqual([{ projectId: project.id, directory: '' }]);
+  } finally {
+    watches.close();
+    vi.useRealTimers();
+  }
+});
+
+it('does not retire a new watch when an obsolete A-B-A validation fails late', async () => {
+  vi.useFakeTimers();
+  const listeners: Array<() => void> = [];
+  const changed: Array<{ projectId: string; directory: string }> = [];
+  const watches = new ProjectFileWatchSet(event => changed.push(event), (_nativePath, listener) => {
+    const emitter = new EventEmitter() as EventEmitter & { close: ReturnType<typeof vi.fn> };
+    emitter.close = vi.fn(); listeners.push(listener); return emitter as never;
+  });
+  try {
+    const project = await addProject(path.join(approved, 'project'));
+    await watches.sync(project.id, ['']);
+    let failOld!: (error: Error) => void;
+    vi.spyOn(projectFiles, 'projectFileTarget').mockImplementationOnce(() => new Promise((_resolve, reject) => { failOld = reject; }));
+    const oldSync = watches.sync(project.id, ['']);
+    await watches.sync(null, []);
+    await watches.sync(project.id, ['']);
+    failOld(new Error('old directory no longer available'));
+    await oldSync;
+    listeners[1]!();
+    vi.advanceTimersByTime(180);
+    expect(changed).toEqual([{ projectId: project.id, directory: '' }]);
+  } finally { watches.close(); vi.useRealTimers(); }
 });

@@ -40,6 +40,7 @@ interface Descriptor {
   hidden: number;
   localCount: number | null;
   answered: boolean;
+  own?: boolean;
 }
 
 // ------------------------------------------------------------------ fixtures
@@ -243,6 +244,7 @@ interface TurnCall {
 
 interface TurnEvidence {
   index: number;
+  sightings?: Array<{ requestId: string; appId: string; linkId: string | null; appName: string | null }>;
   turnId: string | null;
   conversationId?: string | null;
   conversationConflict?: boolean;
@@ -257,6 +259,7 @@ interface TurnEvidence {
     stable: boolean;
     order: number;
     createTime?: number | null;
+    references?: Array<{ index: number; sources: Array<{ title: string; url: string; source?: string; date?: number; snippet?: string }> }>;
     rawText: string;
     renderedHtml: string;
   }>;
@@ -278,19 +281,29 @@ interface TurnEvidence {
 interface TurnFixture {
   id: string;
   messages: Message[];
+  renderer?: 'search';
+  viewItems?: any[];
+  viewStatus?: string;
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
-  rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
+  rendered?: Array<string | { html: string; nativeId?: string; selectedMessageId?: string; selectedConversationId?: string;
+    fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string; pillFibers?: Fiber[] }>;
   activities?: Array<{ label: string; fiber: Fiber; staleThoughtStamp?: string; v5?: boolean }>;
   images?: Array<{ assetId: string; clones?: number }>;
   staleStamp?: string;
   conversationProps?: Record<string, unknown>;
   rect?: { top: number; bottom: number; left: number; right: number } | 'throw';
+  /** Mounted on an earlier page ChatGPT keeps undisplayed in the same tab. */
+  keptPage?: boolean;
 }
 
 async function scan(
   fibers: Fiber[],
   turnSections: TurnFixture[] = [],
-  repeatStableScan = false
+  repeatStableScan = false,
+  /** This install's connector names, as the content script passes them with every ask. */
+  apps?: unknown,
+  /** This install's proven connector apps ({ surface, appId, linkId, name }), passed the same way. */
+  appIds?: unknown
 ): Promise<{
   rows: Descriptor[];
   version: number;
@@ -312,6 +325,48 @@ async function scan(
   const document = window.document;
 
   for (const turn of turnSections) {
+    if (turn.renderer === 'search') {
+      const container = document.createElement('div');
+      container.setAttribute('data-turn-key', turn.id);
+      const user = document.createElement('div');
+      user.setAttribute('data-chatgpt-search-unit-key', `${turn.id}:0:user`);
+      const userItem = turn.viewItems?.find(item => item?.type === 'user-message');
+      if (typeof userItem?.messageId === 'string') user.setAttribute('data-chatgpt-search-message-ids', userItem.messageId);
+      if (turn.staleStamp !== undefined) user.setAttribute('data-clf-fiber-turn', turn.staleStamp);
+      if (turn.rect) user.getBoundingClientRect = () => {
+        if (turn.rect === 'throw') throw new Error('unavailable geometry');
+        return turn.rect as DOMRect;
+      };
+      const viewTurn = {
+        items: turn.viewItems ?? [],
+        messageIds: (turn.viewItems ?? []).map(item => item?.messageId).filter((id): id is string => typeof id === 'string'),
+        status: turn.viewStatus ?? 'complete'
+      };
+      (user as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = {
+        memoizedProps: { conversationId: THREAD },
+        return: { memoizedProps: { conversationId: THREAD, turn: viewTurn }, return: null }
+      } satisfies Fiber;
+
+      const assistant = document.createElement('div');
+      assistant.setAttribute('data-chatgpt-search-unit-key', `${turn.id}:2:assistant`);
+      const assistantItem = turn.viewItems?.find(item => item?.type === 'assistant-message');
+      if (typeof assistantItem?.messageId === 'string') assistant.setAttribute('data-chatgpt-search-message-ids', assistantItem.messageId);
+      for (const entry of turn.rendered ?? []) {
+        const block = document.createElement('div');
+        block.setAttribute('data-markdown-text-style', 'assistant-message');
+        if (typeof entry === 'string') block.textContent = entry;
+        else {
+          block.innerHTML = entry.html;
+          if (entry.fiberProps) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = chain(entry.fiberProps);
+          if (entry.fiber) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
+          if (entry.staleMessageStamp) block.setAttribute('data-clf-fiber-message', entry.staleMessageStamp);
+        }
+        assistant.append(block);
+      }
+      container.append(user, assistant);
+      document.body.append(container);
+      continue;
+    }
     const section = document.createElement('section');
     section.setAttribute('data-testid', 'conversation-turn-2');
     if (turn.id) section.setAttribute('data-turn-id', turn.id);
@@ -334,8 +389,17 @@ async function scan(
         if (entry.fiberProps) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = chain(entry.fiberProps);
         if (entry.fiber) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
         if (entry.staleMessageStamp) block.setAttribute('data-clf-fiber-message', entry.staleMessageStamp);
+        [...block.querySelectorAll('a[data-testid="chatgpt-citation"]')].forEach((pill, at) => {
+          if (entry.pillFibers?.[at]) (pill as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.pillFibers[at];
+        });
       }
-      section.append(block);
+      if (typeof entry !== 'string' && entry.selectedMessageId) {
+        const selection = document.createElement('div');
+        selection.setAttribute('data-chatgpt-selection-message-id', entry.selectedMessageId);
+        if (entry.selectedConversationId) selection.setAttribute('data-chatgpt-selection-conversation-id', entry.selectedConversationId);
+        selection.append(block);
+        section.append(selection);
+      } else section.append(block);
     }
     for (const entry of turn.activities ?? []) {
       const row = document.createElement(entry.v5 ? 'div' : 'span');
@@ -357,7 +421,11 @@ async function scan(
       };
       for (let clone = 0; clone < Math.max(1, entry.clones ?? 1); clone++) add();
     }
-    document.body.append(section);
+    if (turn.keptPage) {
+      const page = document.createElement('div');
+      page.setAttribute('data-app-shell-page-surface', 'true'); page.style.display = 'none';
+      page.append(section); document.body.append(page);
+    } else document.body.append(section);
   }
 
   const elements = fibers.map((fiber) => {
@@ -385,7 +453,7 @@ async function scan(
   // Dispatched rather than posted: jsdom's own postMessage does not set `source`, and the
   // helper refuses any message that did not come from this window.
   window.dispatchEvent(
-    new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce }, source: window })
+    new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce, ...(apps === undefined ? {} : { apps }), ...(appIds === undefined ? {} : { appIds }) }, source: window })
   );
 
   const data = await reply;
@@ -399,13 +467,13 @@ async function scan(
     observer.disconnect();
   }
   const stamps = elements.map((row) => row.getAttribute('data-clf-fiber'));
-  const messageStamps = [...document.querySelectorAll('.markdown')].map(node => node.getAttribute('data-clf-fiber-message'));
+  const messageStamps = [...document.querySelectorAll('.markdown, [data-markdown-text-style="assistant-message"]')].map(node => node.getAttribute('data-clf-fiber-message'));
   const thoughtStamps = [...document.querySelectorAll('[data-clf-fiber-thought], .group\\/tool-message, div:has(> [data-testid="cot-v5-tool-icon-pile"])')]
     .filter(node => node.closest('[data-testid^="conversation-turn-"]'))
     .map(node => node.getAttribute('data-clf-fiber-thought'));
   const imageStamps = [...document.querySelectorAll('.group\\/imagegen-image img')]
     .map(node => node.getAttribute('data-clf-fiber-image'));
-  const turnStamps = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].map((section) =>
+  const turnStamps = [...document.querySelectorAll('[data-testid^="conversation-turn-"], [data-chatgpt-search-unit-key]')].map((section) =>
     section.getAttribute('data-clf-fiber-turn')
   );
   dom.window.close();
@@ -431,6 +499,38 @@ const rowInTurn = (messages: Message[], turnMessages: Message[], collapsed = 0) 
 // --------------------------------------------------------------------- tests
 
 describe('reading a row out of the page', () => {
+  it('reads the 2026-09 search-unit turn.items model without inventing request identity', async () => {
+    const result = await scan([], [{
+      id: 'search-turn-one',
+      messages: [],
+      renderer: 'search',
+      viewItems: [
+        { type: 'user-message', messageId: 'search-user', message: 'New renderer question', sentAtMs: 1_790_000_000_000 },
+        { type: 'chatgpt-reasoning-group', items: [{
+          type: 'mcp-tool-call', callId: 'search-call',
+          invocation: { server: APP, tool: `${LINK}/read`, arguments: { secret: 'must-not-cross-worlds' } }
+        }] },
+        { type: 'assistant-message', messageId: 'search-assistant', content: 'New renderer answer', completed: true,
+          phase: 'final_answer', sentAtMs: 1_790_000_001_000, turnExchangeId: 'exchange-search' }
+      ],
+      viewStatus: 'complete',
+      rendered: ['New renderer answer']
+    }]);
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0]).toMatchObject({
+      turnId: 'search-turn-one',
+      conversationId: THREAD,
+      endMessageId: 'search-assistant',
+      requests: [],
+      calls: [{ messageId: 'search-call', tool: 'read', order: 0, answered: true, requestId: null, createTime: null }]
+    });
+    expect(result.turns[0]!.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ rawMessageId: 'search-user', role: 'user', rawText: 'New renderer question' }),
+      expect.objectContaining({ rawMessageId: 'search-assistant', role: 'assistant', rawText: 'New renderer answer' })
+    ]));
+    expect(JSON.stringify(result.turns)).not.toMatch(/must-not-cross-worlds|arguments/);
+  });
+
   it.each(['exact', 'missing', 'duplicate', 'cycle', 'different-request', 'tool-boundary', 'foreign-tool'])(
     'follows an exact result parent through the native intermediate message (%s)', async mode => {
       const asked = request('linked-request', 'read');
@@ -480,6 +580,53 @@ describe('reading a row out of the page', () => {
       answered: true, requestId: 'wfr_01a009', createTime: 1786873669.5 }]);
   });
 
+  describe('a connector renamed in ChatGPT (app id, 2026-10-11)', () => {
+    const NAMES = ['Chat On Steroids Core', 'Chat On Steroids Desktop', 'Chat On Steroids Plugins'];
+    const pair = (app: string, requestId: string, uri?: string) => {
+      const asked = request(`${requestId}-ask`, 'read', { app });
+      asked.metadata!.request_id = requestId;
+      const result = answer(`${requestId}-res`, asked.id, 'read', app);
+      result.metadata!.request_id = requestId;
+      result.author.name = 'api_tool.call_tool';
+      if (uri) (result.metadata!.invoked_resource as Record<string, unknown>).resource_uri = uri;
+      return [asked, result];
+    };
+
+    it('treats a renamed connector as ours by its learned app id and link', async () => {
+      const messages = pair('My tools', 'q1');
+      const { rows, turns } = await scan([rowInTurn(messages, messages)], [{ id: 'renamed-turn', messages }], false, NAMES,
+        [{ surface: 'core', appId: ASDK, linkId: LINK, name: 'My tools' }]);
+      expect(turns[0]!.calls.map(call => call.tool)).toEqual(['read']);
+      expect(rows[0]).toMatchObject({ own: true });
+    });
+
+    it('does not claim a same-named app once the real app id is learned', async () => {
+      const messages = pair(APP, 'q2', '/asdk_app_foreign/link_foreign/read');
+      const content = messages[0]!.content as Record<string, string>;
+      content['text'] = content['text']!.replace(LINK, 'link_foreign');
+      const { rows, turns } = await scan([rowInTurn(messages, messages)], [{ id: 'foreign-turn', messages }], false, NAMES,
+        [{ surface: 'core', appId: ASDK, linkId: LINK, name: APP }]);
+      expect(turns[0]?.calls ?? []).toEqual([]);
+      expect(rows[0]).toMatchObject({ own: false });
+    });
+
+    it('falls back to the names while nothing is learned', async () => {
+      const messages = pair(APP, 'q3');
+      const { rows, turns } = await scan([rowInTurn(messages, messages)], [{ id: 'names-turn', messages }], false, NAMES, []);
+      expect(turns[0]!.calls.map(call => call.tool)).toEqual(['read']);
+      expect(rows[0]).toMatchObject({ own: true });
+    });
+
+    it('reports a sighting for every connector result row, ours or not', async () => {
+      const messages = [...pair('My tools', 'q4'), ...pair('Gmail', 'q5', '/asdk_app_gmail/link_g/search')];
+      const { turns } = await scan([], [{ id: 'sighting-turn', messages }], false, NAMES, []);
+      expect(turns[0]!.sightings).toEqual([
+        { requestId: 'q4', appId: ASDK, linkId: LINK, appName: 'My tools' },
+        { requestId: 'q5', appId: 'asdk_app_gmail', linkId: 'link_g', appName: 'Gmail' }
+      ]);
+    });
+  });
+
   it.each(['Chat On Steroids Core', 'Chat On Steroids Desktop', 'Chat On Steroids Plugins', 'Chat On Steroids Backup', 'Gmail'])(
     'keeps result-only metadata scoped to the exact supported connector %s', async app => {
       const result = answer('result-scope', 'unused', 'read', app);
@@ -506,6 +653,27 @@ describe('reading a row out of the page', () => {
     expect(rows[0]).toMatchObject({ index: 0, tool: 'search_files', app: APP, answered: true });
   });
 
+  /**
+   * One ChatGPT account on two computers: each computer's connectors carry its own suffix, and
+   * ChatGPT records every call under the exact name typed (measured 2026-10-04). This page's
+   * install recognizes exactly its own names; the other computer's calls run there.
+   */
+  it.each([
+    ['this install\'s suffixed names', ['Chat On Steroids Core (Windows)', 'Chat On Steroids Desktop (Windows)', 'Chat On Steroids Plugins (Windows)'], 'Chat On Steroids Core (Windows)', true],
+    ['the plain name while this install uses a suffix', ['Chat On Steroids Core (Windows)', 'Chat On Steroids Desktop (Windows)', 'Chat On Steroids Plugins (Windows)'], APP, false],
+    ['another computer\'s suffixed name', ['Chat On Steroids Core', 'Chat On Steroids Desktop', 'Chat On Steroids Plugins'], 'Chat On Steroids Core (Mac)', false],
+    ['names that are not this app\'s, which are ignored', ['Chat On Steroids Backup', 'x', 'y'], APP, true]
+  ])('recognizes calls by %s', async (_case, apps, app, ours) => {
+    const ask = request('req-1', 'read_file', { app });
+    const { rows } = await scan([row([ask, answer('res-1', 'req-1', 'read_file', app)])], [], false, apps);
+    expect(rows.length === 1 && rows[0]!.app === app && rows[0]!.tool === 'read_file').toBe(ours);
+    // A call still running has no answer yet; the request path alone names the connector, and
+    // only this install's calls count as the turn's evidence.
+    const running = request('req-2', 'read_file', { app });
+    const { turns } = await scan([], [{ id: 'running-turn', messages: [running] }], false, apps);
+    expect(turns[0]!.calls.map(call => call.tool)).toEqual(ours ? ['read_file'] : []);
+  });
+
   it('names six sequential calls in the same chat, each as itself', async () => {
     const tools = ['search_files', 'search_files', 'read_file', 'list_directory', 'run_command', 'agent_status'];
     const { rows, stamps, scanToken } = await scan(
@@ -522,8 +690,8 @@ describe('reading a row out of the page', () => {
 
   it('keeps the version it was built for on the reply', async () => {
     const { version, rows } = await scan([row([request('req-1', 'read_file')])]);
-    expect(version).toBe(21);
-    expect(rows[0]!.v).toBe(21);
+    expect(version).toBe(22);
+    expect(rows[0]!.v).toBe(22);
   });
   it('counts only TobisComputer requests in the complete turn, not api_tool metadata calls', async () => {
     const mine1 = request('req-1', 'read_file');
@@ -719,12 +887,61 @@ describe('the calls a turn says it made', () => {
     ]);
   });
 
+  it('ignores the turns of an earlier page ChatGPT keeps undisplayed in the same tab', async () => {
+    // Measured 2026-10-01: after a Project resume the tab kept the source chat as a hidden page.
+    // Its turns named the source conversation, the bridge refused every sighting as foreign to
+    // the URL, and the resumed chat's whole answer went unrecorded until a reload.
+    const { turns } = await scan([], [
+      { id: 'source-turn', messages: [authored('source-message', 'Old chat.')], rendered: ['Old chat.'],
+        conversationProps: { conversation: { id: '99999999-8888-4777-8666-555555555555' } }, keptPage: true },
+      { id: 'resumed-turn', messages: [authored('resumed-message', 'New chat.')], rendered: ['New chat.'],
+        conversationProps: { conversation: { id: THREAD } } }
+    ]);
+    expect(turns.map(turn => turn.turnId)).toEqual(['resumed-turn']);
+    expect(turns[0]).toMatchObject({ conversationId: THREAD, conversationConflict: false });
+  });
+
   it('reads the mounted conversation object identity used by helper answers', async () => {
     const { turns } = await scan([], [{
       id: 'helper-final', messages: [authored('helper-message', 'Complete.')],
       rendered: ['Complete.'], conversationProps: { conversation: { id: THREAD } }
     }]);
     expect(turns[0]).toMatchObject({ conversationId: THREAD, conversationConflict: false });
+  });
+
+  it.each([
+    ['at the end', 'Run the review. [$chat-on-steroids-core](app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019)', 'Run the review.'],
+    ['at the start', '[$chat-on-steroids-core](app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019) run echo ok', 'run echo ok'],
+    ['in the middle', 'Ask [$chat-on-steroids-core](app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019) to list files', 'Ask to list files']
+  ])('reads a user message without its ChatGPT app mention %s (#861)', async (_where, stored, authored_) => {
+    const { turns } = await scan([], [{
+      id: 'mention-user', messages: [{ ...authored('mention-user-message', stored), author: { role: 'user' } }],
+      conversationProps: { conversation: { id: THREAD } }
+    }]);
+    expect(turns[0]!.messages[0]).toMatchObject({ role: 'user', rawText: authored_ });
+  });
+
+  it.each([
+    ['marked', { serialization_metadata: { render_format: 'markdown' } }, true],
+    ['unmarked', {}, false],
+    ['marked with another format', { serialization_metadata: { render_format: 'plain' } }, false]
+  ] as const)('reports ChatGPT\'s own Markdown storage mark on a user message (%s)', async (_case, metadata, markdown) => {
+    const message = { ...authored('stored-user-message', 'Run \\`echo two\\`'), author: { role: 'user' } };
+    const { turns } = await scan([], [{
+      id: 'stored-user', messages: [{ ...message, metadata: { ...(message as { metadata?: object }).metadata, ...metadata } }],
+      conversationProps: { conversation: { id: THREAD } }
+    }]);
+    // The raw stored text stays for exact comparisons; the mark tells readers how ChatGPT shows it.
+    expect(turns[0]!.messages[0]).toMatchObject({ role: 'user', rawText: 'Run \\`echo two\\`' });
+    expect((turns[0]!.messages[0] as { markdown?: boolean }).markdown === true).toBe(markdown);
+  });
+
+  it('keeps an ordinary Markdown link a user wrote', async () => {
+    const { turns } = await scan([], [{
+      id: 'link-user', messages: [{ ...authored('link-user-message', 'See [the docs](https://example.com/app) first.'), author: { role: 'user' } }],
+      conversationProps: { conversation: { id: THREAD } }
+    }]);
+    expect(turns[0]!.messages[0]).toMatchObject({ rawText: 'See [the docs](https://example.com/app) first.' });
   });
 
   it('reads the durable server identity instead of the mounted WEB identity', async () => {
@@ -818,6 +1035,35 @@ describe('the calls a turn says it made', () => {
     ]);
   });
 
+  it('retains the end of a long final from an exact GPT-6 DIL selection wrapper', async () => {
+    const id = '6d83d23a-24b5-474d-b0a6-410f875ac985';
+    const prose = `TASK: keep every requirement.\n${'Synthetic handoff detail. '.repeat(6_500)}\nEND_OF_BRIEF`;
+    const html = `<div data-decor="${'z'.repeat(50_000)}">${prose}</div>`;
+    expect(html.length).toBeGreaterThan(120_000);
+    const result = await scan([], [{ id: 'large-final', messages: [authored(id, prose, { endTurn: true, status: 'finished_successfully' })],
+      rendered: [{ html, selectedMessageId: id, selectedConversationId: THREAD }] }]);
+    const message = result.turns[0]!.messages[0]!;
+    expect(message.rawText).toBe(prose);
+    expect(result.turns[0]!.endMessageId).toBe(id);
+    expect(message.renderedHtml.length).toBeGreaterThan(120_000);
+    expect(message.renderedHtml).toContain('END_OF_BRIEF');
+    expect(message.renderedHtml).not.toContain('data-decor');
+  });
+
+  it('does not give an unowned or foreign long block the larger final allowance', async () => {
+    const id = 'large-native-final';
+    const prose = 'TASK: synthetic verified content';
+    const html = `<div>${'Unrelated visible text '.repeat(7_000)}</div>`;
+    for (const rendered of [
+      [{ html }],
+      [{ html, selectedMessageId: id, selectedConversationId: 'another-conversation' }],
+      [{ html, selectedMessageId: id, selectedConversationId: THREAD }, { html, selectedMessageId: id, selectedConversationId: THREAD }]
+    ]) {
+      const result = await scan([], [{ id: 'large-final', messages: [authored(id, prose, { endTurn: true, status: 'finished_successfully' })], rendered }]);
+      expect(result.turns[0]!.messages[0]!.renderedHtml).toBe('');
+    }
+  });
+
   it('keeps public preambles complete when ChatGPT visually hides them during streaming and reload', async () => {
     const branch = { workingTurnId: 'preamble-working', turnExchangeId: 'preamble-exchange', channel: 'commentary' };
     const first = authored('preamble-first', 'The verification is', { ...branch, createTime: 1_787_165_000 });
@@ -872,6 +1118,44 @@ describe('the calls a turn says it made', () => {
     const expected = mode === 'native' || mode === 'scoped' ? `${result.scanToken}:0:anchor-message` : null;
     expect(result.messageStamps).toEqual(mode === 'duplicate' ? [null, null] : [expected]);
     expect(result.turns[0]!.messages[0]!.rawText).toBe('Public prose');
+  });
+
+  it('carries the server-resolved model of a reply, and only a plain slug', async () => {
+    const resolved = authored('resolved', 'Answer');
+    resolved.metadata = { ...resolved.metadata, resolved_model_slug: 'gpt-5-6-thinking', model_slug: 'gpt-5-6' };
+    const fallback = authored('fallback', 'Answer two');
+    fallback.metadata = { ...fallback.metadata, model_slug: 'gpt-6-pro' };
+    const hostile = authored('hostile', 'Answer three');
+    hostile.metadata = { ...hostile.metadata, resolved_model_slug: 'gpt-6 <img src=x>' };
+    const result = await scan([], [{ id: 'model-turn', messages: [resolved, fallback, hostile], conversationProps: { conversationId: THREAD } }]);
+    const byId = Object.fromEntries(result.turns[0]!.messages.map((row: any) => [row.rawText, row.resolvedModel]));
+    expect(byId).toEqual({ Answer: 'gpt-5-6-thinking', 'Answer two': 'gpt-6-pro', 'Answer three': undefined });
+  });
+
+  it('carries the sources behind each citation pill, by the reply and reference index its props name', async () => {
+    // Live shape: the pill's props hold the list its card pages through; a component above it holds
+    // the pill's reference and the reply's references, whose position is the directive's index.
+    const cited = authored('cited', 'Cited answer');
+    const reference = { type: 'grouped_webpages' };
+    const turnContext = { messageId: 'cited', contentReferences: [{ type: 'sources_footnote' }, reference] };
+    const sources = [
+      { kind: 'primary', label: 'Example News', title: 'A report', url: 'https://news.example.com/report', pubDate: 1790553600.5, snippet: '  A short   summary. ' },
+      { kind: 'supporting', label: 'Example Scans', title: 'Project details', url: 'https://scans.example.org/project', pubDate: undefined, snippet: null },
+      { kind: 'supporting', label: 'Hostile', title: 'Script', url: 'javascript:alert(1)' }
+    ];
+    const pill = chain({ reference, turnContext }, 1, null);
+    const withSources: Fiber = { memoizedProps: { sources, attributes: { label: 'Example News' } }, return: pill };
+    const rendered = [{ html: '<p>A claim. <span><a data-testid="chatgpt-citation" href="https://news.example.com/report">Example News</a></span></p>', nativeId: 'cited',
+      pillFibers: [chain(null, 3, withSources)] }];
+    const result = await scan([], [{ id: 'cite-turn', messages: [cited], rendered, conversationProps: { conversationId: THREAD } }]);
+    expect(result.turns[0]!.messages.find(message => message.rawMessageId === 'cited')?.references).toEqual([{ index: 1, sources: [
+      { title: 'A report', url: 'https://news.example.com/report', source: 'Example News', date: 1790553600500, snippet: 'A short summary.' },
+      { title: 'Project details', url: 'https://scans.example.org/project', source: 'Example Scans' }
+    ] }]);
+    // A pill whose props name another reply, or no reference of it, is not this reply's source.
+    const foreign = await scan([], [{ id: 'cite-turn', messages: [cited], conversationProps: { conversationId: THREAD },
+      rendered: [{ ...rendered[0]!, pillFibers: [chain(null, 3, { memoizedProps: { sources }, return: chain({ reference: {}, turnContext }, 1, null) })] }] }]);
+    expect(foreign.turns[0]!.messages.find(message => message.rawMessageId === 'cited')?.references).toBeUndefined();
   });
 
   it.each(['exact', 'missing-scope', 'foreign', 'conflicting-scope', 'unknown', 'wrong-type', 'wrong-prefix', 'conflicting-id', 'private', 'tool', 'duplicate'])('joins typed preambles at native Fiber depths (%s)', async mode => {
@@ -1515,6 +1799,7 @@ describe('what may leave the page', () => {
         'index',
         'localCount',
         'messageId',
+        'own',
         'path',
         'resource',
         'tool',

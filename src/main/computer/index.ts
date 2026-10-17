@@ -23,6 +23,7 @@ import { ensureUsablePath, normalizeEnvironment } from '../env.js';
 import { findWindowsPowerShell, terminateProcessTree } from '../exec.js';
 import { logInfo, logWarn } from '../logger.js';
 import type { MacOSDesktopAccessStatus, MacOSPermissionState } from '../../shared/types.js';
+import { noteMacOSGrants } from './macos-grants.js';
 import { HELPER_SCRIPT } from './helper.js';
 
 /** Width the screenshot is scaled down to, matching computer-use convention. */
@@ -381,6 +382,8 @@ async function startHelper(): Promise<HelperRuntime> {
           args = [];
         } else {
           host = findWindowsPowerShell() ?? 'powershell.exe';
+          // The helper leaves this app's own windows out of every lookup, as on macOS.
+          env.COS_APP_PID = String(process.pid);
           args = ['-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', scriptFile!];
         }
         const child = spawn(host, args, {
@@ -1965,18 +1968,6 @@ async function electronClipboard(): Promise<Pick<Electron.Clipboard, 'readText' 
   }
 }
 
-/** Confirms the helper can run at all, so the UI can say so before ChatGPT tries. */
-export async function checkAvailable(): Promise<string | null> {
-  try {
-    await listWindows();
-    return null;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logWarn(`computer use unavailable: ${message}`);
-    return message;
-  }
-}
-
 /**
  * Starts and initializes the helper off the first tool call's critical path.
  *
@@ -2012,6 +2003,8 @@ export async function refreshMacOSDesktopAccess(
       checkedAt: Date.now(),
       error: null
     };
+    try { status.grantedBefore = await noteMacOSGrants(status); }
+    catch { /* Without the memory the status still says what is missing, only not why. */ }
     if (generation === macOSDesktopAccessRefreshGeneration) publishMacOSDesktopAccess(status);
     return generation === macOSDesktopAccessRefreshGeneration ? status : macOSDesktopAccess;
   } catch (err) {

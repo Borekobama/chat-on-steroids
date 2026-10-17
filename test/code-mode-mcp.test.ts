@@ -18,18 +18,34 @@ import * as desktopBackend from '../src/main/computer/index.js';
 import sharp from 'sharp';
 import { randomBytes } from 'node:crypto';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
+import { onLog } from '../src/main/logger.js';
 import { noteExecOwner, forgetExecOwner } from '../src/main/codex/ownership.js';
 import * as ownership from '../src/main/codex/ownership.js';
 import type { ExecCommandToolOutput } from '../src/main/codex/unified-exec.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let directory: string, endpoint: McpEndpoint, ctx: ToolContext;
+/**
+ * Finished MCP requests, counted from the server's own `request POST …` line. That line is written
+ * in the response's `finish` handler right after it stamps the publication's `completedAt`.
+ */
+let finishedRequests = 0;
+onLog(entry => { if (/^request POST mcp\//.test(entry.message)) finishedRequests++; });
+
 async function rpc(method: string, params: object, requestId?: string, surface: 'core' | 'desktop' = 'core'): Promise<any> {
+  const before = finishedRequests;
   const response = await fetch(endpoint.urls[surface], { method: 'POST', headers: {
     'content-type': 'application/json', accept: 'application/json, text/event-stream',
     ...(requestId ? { 'x-request-id': `${requestId}/attempt` } : {})
   }, body: JSON.stringify({ jsonrpc: '2.0', id: randomUUID(), method, params }) });
   const raw = await response.text();
+  // On loopback the body can arrive before the server's `finish` handler has run, and a next call in
+  // the same millisecond reads as concurrent: it does not acknowledge background output that the
+  // previous answer delivered (`startedAt <= completedAt`). ChatGPT's next call comes seconds later;
+  // act like it by letting the server record this answer and the clock move past it.
+  await vi.waitFor(() => expect(finishedRequests).toBeGreaterThan(before));
+  const finishedAt = Date.now();
+  while (Date.now() <= finishedAt) await new Promise(resolve => setTimeout(resolve, 1));
   return JSON.parse(raw.startsWith('{') ? raw : [...raw.matchAll(/^data: (.+)$/gm)].at(-1)![1]!);
 }
 async function identity() {
@@ -153,6 +169,27 @@ it('preserves a nonzero terminal exit and leaves nested correction delivery with
   expect(child).not.toHaveProperty('supplemental_context');
   expect(text(nested).match(/OUTER_ONLY_CORRECTION/g)).toHaveLength(1);
   await call(who.requestId, 'text("receipt")');
+});
+
+it('enforces command allowlist rejection identically for direct and code-mode calls', async () => {
+  const original = getConfig();
+  await saveConfig({ ...original, commandAllowlist: { enabled: true, mode: 'allow', rules: ['git status'] } });
+  const who = await identity();
+  const launch = vi.spyOn(unifiedExecManager, 'execCommand');
+  try {
+    const direct = await rpc('tools/call', {
+      name: 'exec_command', arguments: { cmd: 'git diff', workdir: '/workspace' }
+    }, who.requestId);
+    expect(direct.result.isError).toBe(true);
+    expect(text(direct)).toContain('COMMAND_NOT_ALLOWED');
+
+    const nested = await call(who.requestId, 'text(await tools.exec_command({cmd:"git diff",workdir:"/workspace"}));');
+    expect(text(nested)).toContain('COMMAND_NOT_ALLOWED');
+    expect(launch).not.toHaveBeenCalled();
+  } finally {
+    launch.mockRestore();
+    await saveConfig(original);
+  }
 });
 
 it('projects corrections for other Core structured results without changing the empty worker family', async () => {
@@ -471,4 +508,12 @@ it('uses existing process custody for nested exec and write_stdin across a conve
   observeRequestCorrelation({ requestId, conversationId: replacement, sessionId: a.session.id, messageId: randomUUID(), tool: 'exec', observedAt: Date.now() });
   const continued = await call(requestId, `text(await tools.write_stdin({session_id:${processId},chars:"owner\\r",yield_time_ms:1000}));`);
   expect(text(continued)).toContain('OWNED_RESULT');
+});
+
+it('explains a "not a function" from another connector\'s tool in a Core script (#1287)', async () => {
+  const who = await identity();
+  const response = await call(who.requestId, 'try { await tools.read_clipboard({}); } catch (error) { text(String(error)); }');
+  const all = text(response);
+  expect(all).toContain('not a function');
+  expect(all).toContain('UNKNOWN_TOOL_NAMES: this script used tools.read_clipboard (a Chat On Steroids Desktop tool), which Chat On Steroids Core does not offer');
 });

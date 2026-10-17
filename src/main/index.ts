@@ -1,3 +1,4 @@
+import { closeRemoteSessions } from './remote/ssh.js';
 import { stopInputStartup } from './session/start-input.js';
 import { browserExtensionRequired } from '../shared/types.js';
 import { requestSessionFinishGoal, setFinishNotifier } from './session/finish.js';
@@ -6,34 +7,65 @@ import { requestSessionFinishGoal, setFinishNotifier } from './session/finish.js
  */
 
 import path from 'node:path';
-import { app, Notification, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, screen, session } from 'electron';
+import { app, Notification, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, powerMonitor, powerSaveBlocker, screen, session } from 'electron';
+import { createKeepAwake, installKeepAwake } from './keep-awake.js';
 import { getConfig, initConfigPath, loadConfig } from './config.js';
-import { connect, disconnect, getStatus, onStatusChange, shutdownConnection } from './connection.js';
-import { registerIpc } from './ipc.js';
+import { initConnectorProofPath, loadConnectorProof, notePluginInstalled } from './connector-proof.js';
+import { initWorkerArchivePath, loadWorkerArchive, queueWorkerArchives } from './worker-archive.js';
+import { initBrowserProofPath, loadBrowserProof } from './browser-proof.js';
+import { enrolledPluginSurfaces } from './plugin-refresh.js';
+import {
+  connect,
+  disconnect,
+  getStatus,
+  onStatusChange,
+  resumeConnectionLossNotices,
+  setConnectionLossNotifier,
+  shutdownConnection,
+  suspendConnectionLossNotices
+} from './connection.js';
+import { setSystemProxyResolver } from './tunnel/index.js';
+import { configureAppProxy, refreshAppProxy } from './app-proxy.js';
+import { openSessionChat, registerIpc } from './ipc.js';
 import { getChatModels, restoreChatModels, startChatModelDiscovery } from './chat-models.js';
-import { flushLogBeforeExit, initLogFile, logError, logInfo, logWarn, snapshotLogOnCrash } from './logger.js';
+import { flushLogBeforeExit, initLogFile, logError, logInfo, logWarn, onLog, snapshotLogOnCrash } from './logger.js';
+import { noteRuntimeEvent, tallyLogEntry } from './diagnostics-facts.js';
 import { unifiedExecManager } from './codex/manager.js';
-import { initSecretsPath } from './secrets.js';
+import { workspaceTerminalsExited } from './workspace-terminal.js';
+import { initSecretsPath, keychainReadPending } from './secrets.js';
+import { mainText, mainTextTranslations, onMainTextsChange, restoreMainTextTranslations } from './main-texts.js';
+import { isMainText } from '../shared/main-texts.js';
+import { executableFingerprint, initKeychainNotice } from './keychain-notice.js';
 import { pluginManager } from './plugins/manager.js';
-import { setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
-import { flushSessions, initSessionStore } from './session/store.js';
+import { sessionActivityExpiresAt, setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
+import { setStuckNotifier } from './stuck-notice.js';
+import { flushSessions, getSession, initSessionStore, listSessions, readRecentEvents, setRecordingStorageLimit } from './session/store.js';
+import { createTurnNotifier } from './turn-notifications.js';
+import { DEFAULT_RECORDING_STORAGE_GIB } from '../shared/session.js';
 import { initSkillsPath } from './skills.js';
+import { initUvRuntime } from './plugins/uv-runtime.js';
+import { initPetLibrary } from './pet-library.js';
+import { shutdownPetOverlay, startPetOverlay } from './pet-overlay.js';
 import { usageOverview } from './session/usage.js';
 import {
   flushRecorder,
+  onSessionChange,
   queueDeterministicAttributionRepair,
   setAgentBinder,
   setAgentConversationLookup
 } from './session/recorder.js';
 import {
   agentConversation,
+  archiveWorkerAssignments,
   bindConversation,
   onRetiredWorkersPersist,
   onRetiredWorkersPersistNow,
+  onWorkerChatsRetired,
   onSwarmPersist,
   onSwarmPersistNow,
   pauseSwarmForDisable,
-  repairPrimeConversationAfterRecovery,
+  managedWorkerRecoveryIdentities,
+  primeFleetIn, repairPrimeConversationAfterRecovery,
   reconcileAgentRequestOwners,
   restoreRetiredWorkers,
   restoreSwarm,
@@ -43,13 +75,19 @@ import {
   type SwarmSnapshot
 } from './agents.js';
 import { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
+import { loadConnectorIdentity } from './connector-identity.js';
+import { initControlApiPath, shutdownControlApi, startControlApi } from './control-api.js';
 import { restoreRequestCorrelations } from './session/correlation.js';
 import { restoreBlockedChats } from './session/blocked-chats.js';
+import { restoreTrustedChats } from './session/trusted-chats.js';
 import { stopComputerHelper } from './computer/index.js';
 import {
   GOAL_OBJECTIVES_STATE,
   GOAL_REPLIES_STATE,
   GOAL_SWITCHES_STATE,
+  GOAL_HELPER_SIZE_STATE,
+  restoreGoalHelperSize,
+  goalSwitchEnabledFor,
   restoreGoalObjectives,
   restoreGoalReplies,
   restoreGoalSwitches,
@@ -64,15 +102,21 @@ import {
   type ContinuationSnapshot
 } from './session/continuation.js';
 import { runShutdownSequence } from './shutdown.js';
-import { applyStagedUpdate, startUpdateChecks } from './update.js';
-import { UI_BASE_ZOOM, windowLayoutForWorkArea, titleBarOverlayForTheme, windowBackgroundForTheme } from './window-layout.js';
+import { startAgentRuntimeGc, stopAgentRuntimeGc } from './runtime-gc.js';
+import { restoreManagedWorktrees } from './worktrees/index.js';
+import { applyStagedUpdate, ELEVATION_ANSWER_MS, installingVersion, onInstallerTakeover, onUpdateHandoffStep, startUpdateChecks } from './update.js';
+import { setUpdateProgressStep, showUpdateProgress, untilInstallerTakesOver } from './update-progress.js';
+import { resumeUpdateRefresh } from './update-all.js';
+import { UI_BASE_ZOOM, windowLayoutForDisplays, windowPlacementWasMaximized, titleBarOverlayForTheme, windowBackgroundForTheme } from './window-layout.js';
 import { openInPreferredBrowser } from './browser.js';
+import { loadedCosBrowser, onCosBrowserLoaded, syncCosBrowser } from './cos-browser/selection.js';
 import {
   applyLoginStartup,
   isBackgroundLaunch,
   createWindowActivationGate,
   ownsAppRuntime,
   registerNativeWindowActivation,
+  trackNormalWindowBounds,
   shouldBeginAppBootstrap,
   shouldQuitOnWindowAllClosed
 } from './window-lifecycle.js';
@@ -80,12 +124,17 @@ import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
 import { startControlService, stopControlService } from './control-service.js';
+import { showConnectionLossNotice } from './connection-loss-notice.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
 const RETIRED_WORKERS_STATE = 'retired-workers';
+const WINDOW_BOUNDS_STATE = 'window-bounds';
+/** The tray and notice texts in the last interface language; a launch to the tray opens no window to send them. */
+const MAIN_TEXTS_STATE = 'main-texts';
 
 let window: BrowserWindow | null = null;
+let savedWindowBounds: unknown = null;
 let tray: Tray | null = null;
 let quitting = false;
 let shutdownStarted = false;
@@ -102,8 +151,16 @@ if (!hasSingleInstanceLock) {
   app.quit();
 }
 
+const BENIGN_RENDERER_ERRORS = new Set(['ResizeObserver loop completed with undelivered notifications.']);
+
 function createWindow(): void {
-  const layout = windowLayoutForWorkArea(screen.getPrimaryDisplay().workArea);
+  const primaryWorkArea = screen.getPrimaryDisplay().workArea;
+  const { layout, restored } = windowLayoutForDisplays(
+    primaryWorkArea,
+    screen.getAllDisplays().map(display => display.workArea),
+    savedWindowBounds
+  );
+  const restoreMaximized = windowPlacementWasMaximized(savedWindowBounds);
   const icon = browserWindowIconPath(process.platform, app.isPackaged, process.resourcesPath);
   window = new BrowserWindow({
     ...layout,
@@ -116,6 +173,10 @@ function createWindow(): void {
       titleBarStyle: 'hidden' as const,
       titleBarOverlay: titleBarOverlayForTheme(getConfig().ui.theme, getConfig().ui.appearance)
     } : {}),
+    // macOS: the app's own top bar is the title bar, with the traffic lights inside it, instead
+    // of a native title row above a second row that only held the sidebar and View buttons.
+    // The overlay publishes the traffic-light area as env(titlebar-area-x) to the page.
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden' as const, titleBarOverlay: true } : {}),
     // Painted before the renderer loads, so a dark window never flashes white.
     backgroundColor: windowBackgroundForTheme(getConfig().ui.theme, getConfig().ui.appearance),
     title: 'Chat On Steroids',
@@ -132,6 +193,7 @@ function createWindow(): void {
   });
 
   if (process.platform === 'win32') window.removeMenu();
+  const owner = window;
 
   // First use discovers the account once. A restored catalog is immediately usable;
   // showing the window again may observe an existing page, never open another browser attempt.
@@ -143,11 +205,17 @@ function createWindow(): void {
     // A renderer can finish loading after Cmd+Q has already entered bounded teardown. Never let
     // that late native event make the app visible again while `will-quit` is draining.
     if (!quitting) {
-      // Newly created windows intentionally start maximized. Keep that startup-only presentation
-      // here so later tray/Dock/native activation can show an existing user-sized window without
-      // overwriting its geometry.
-      if (!window?.isFullScreen()) window?.maximize();
+      // Fresh installs retain the existing maximized first presentation. A saved normal window
+      // stays normal; a window last used maximized restores that presentation over its saved
+      // normal rectangle so un-maximizing returns to the same user-sized geometry.
+      if ((!restored || restoreMaximized) && !window?.isFullScreen()) window?.maximize();
       showWindow();
+      // Start observing only after initial native presentation has settled. BrowserWindow
+      // construction/maximization can itself emit geometry events; those are not user choices.
+      trackNormalWindowBounds(owner, (placement) => {
+        savedWindowBounds = placement;
+        writeDurableSoon(WINDOW_BOUNDS_STATE, placement);
+      });
     }
   });
 
@@ -171,7 +239,10 @@ function createWindow(): void {
   // Renderer errors are otherwise invisible from here. Only errors, and only the
   // message text — never anything the page was working with.
   window.webContents.on('console-message', (details) => {
-    if (details.level === 'error') logError(`renderer: ${details.message}`);
+    // Chromium's ResizeObserver notice is not a failure: the composer's height animation starts
+    // inside its observer by design, and the deferred notification arrives on the next frame.
+    // Logged as an error it appeared on every send and read like a renderer fault.
+    if (details.level === 'error' && !BENIGN_RENDERER_ERRORS.has(details.message)) logError(`renderer: ${details.message}`);
   });
 
   // Nothing in this app should ever open a second window or navigate away.
@@ -193,6 +264,7 @@ function createWindow(): void {
   // corpse. Dropping it is what makes those paths take their existing null branch.
   window.on('closed', () => {
     window = null;
+    if (!quitting && process.platform !== 'darwin' && !getConfig().ui.minimizeToTray) void shutdownPetOverlay();
   });
 
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -202,6 +274,8 @@ function createWindow(): void {
   }
 }
 
+/** When a Session-finish or stuck notice last went out per chat, so a turn-done notice does not repeat it. */
+const chatNoticeAt = new Map<string, number>();
 function showWindow(): void {
   // Defense in depth for every current or future native activation source. The explicit gate
   // below additionally protects the long pre-window startup interval, while this invariant makes
@@ -218,6 +292,7 @@ function showWindow(): void {
 
 setFinishNotifier((title, body, sessionId, turnId) => {
   if (window?.isFocused() || !Notification.isSupported()) return false;
+  chatNoticeAt.set(sessionId, Date.now());
   const write = (): void => {
     showWindow();
     if (!window) return;
@@ -225,8 +300,9 @@ setFinishNotifier((title, body, sessionId, turnId) => {
     const open = (): void => { if (!target.isDestroyed()) target.send('session:write', sessionId); };
     if (target.isLoadingMainFrame()) target.once('did-finish-load', open); else open();
   };
-  const notice = new Notification({ title, body, actions: [
-    { type: 'button', text: 'Send Automatic Goal' }, { type: 'button', text: 'Write Directly' }
+  const shown = (text: string): string => isMainText(text) ? mainText(text) : text;
+  const notice = new Notification({ title: shown(title), body: shown(body), actions: [
+    { type: 'button', text: mainText('Send Automatic Goal') }, { type: 'button', text: mainText('Write Directly') }
   ] });
   notice.on('click', write);
   notice.on('action', (details) => {
@@ -236,6 +312,35 @@ setFinishNotifier((title, body, sessionId, turnId) => {
   notice.show();
   return true;
 });
+setStuckNotifier((title, body, sessionId, opens = 'app') => {
+  // A person looking at the app already has the timeline note this accompanies; interrupting
+  // them with the same sentence is noise, exactly as the finish notice treats a focused window.
+  if (window?.isFocused() || !Notification.isSupported()) return false;
+  chatNoticeAt.set(sessionId, Date.now());
+  const notice = new Notification({ title, body });
+  notice.on('click', () => {
+    if (opens === 'browser') {
+      void openSessionChat(sessionId).catch(error => logWarn(`approval notice: ${error.message}`));
+      return;
+    }
+    showWindow();
+    if (!window) return;
+    const target = window.webContents;
+    const open = (): void => { if (!target.isDestroyed()) target.send('session:write', sessionId); };
+    if (target.isLoadingMainFrame()) target.once('did-finish-load', open); else open();
+  });
+  notice.show();
+  return true;
+});
+setConnectionLossNotifier(surface => showConnectionLossNotice(surface, {
+  isQuitting: () => quitting,
+  isFocused: () => window?.isFocused() ?? false,
+  isSupported: () => Notification.isSupported(),
+  text: mainText,
+  create: options => new Notification(options),
+  showWindow
+}));
+
 setBrowserWorkArea(() => screen.getPrimaryDisplay().workArea);
 
 // Electron promises `second-instance` only after its own `ready`, not after our async startup.
@@ -265,21 +370,32 @@ function refreshTray(): void {
   const offline = state === 'offline';
   // Offline keeps the running icon: the bridge is up, the internet is not.
   const running = connected || offline;
-  const label = connected ? 'Connected' : offline ? 'No internet' : 'Not connected';
+  const label = mainText(connected ? 'Connected' : offline ? (getStatus().offlineCause === 'service' ? 'OpenAI outage' : 'No internet') : 'Not connected');
   tray.setImage(trayIcon(running));
-  tray.setToolTip(`Chat On Steroids — ${label.toLowerCase()}`);
+  // Not lowercased: that would break translated nouns ("Keine Internetverbindung").
+  tray.setToolTip(`Chat On Steroids — ${label}`);
+  const cosBrowser = loadedCosBrowser();
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label, enabled: false },
       { type: 'separator' },
-      { label: 'Open', click: windowActivation.request },
+      { label: mainText('Open'), click: windowActivation.request },
+      // The CoS browser lives in the tray: its windows never sit in a taskbar or dock. Only once
+      // it is selected and loaded; the default extension path shows exactly the menu it had.
+      ...(cosBrowser && getConfig().ui.chatBrowser === 'cos' ? [{
+        label: mainText(cosBrowser.visible() ? 'Hide browser' : 'Show browser'),
+        click: () => {
+          if (cosBrowser.visible()) cosBrowser.hide();
+          else void cosBrowser.show().catch(error => logWarn(`cos browser: could not show: ${error instanceof Error ? error.message : String(error)}`));
+        }
+      }] : []),
       {
-        label: running ? 'Disconnect' : 'Connect',
+        label: mainText(running ? 'Disconnect' : 'Connect'),
         click: () => void (running ? disconnect() : connect())
       },
       { type: 'separator' },
       {
-        label: 'Quit',
+        label: mainText('Quit'),
         click: () => {
           quitting = true;
           app.quit();
@@ -297,23 +413,103 @@ void app.whenReady().then(async () => {
   // This guard is intentionally before even app.getPath/init* calls. A secondary instance, or a
   // primary that was told to quit before ready, must never touch the primary's shared userData.
   if (!shouldBeginAppBootstrap(hasSingleInstanceLock, quitting)) return;
+  powerMonitor.on('suspend', suspendConnectionLossNotices);
+  powerMonitor.on('resume', resumeConnectionLossNotices);
+  // Counted for the diagnostics report: kinds of warnings, ended page and helper processes, sleep.
+  onLog(tallyLogEntry);
+  powerMonitor.on('suspend', () => noteRuntimeEvent('sleep'));
+  app.on('render-process-gone', (_event, _contents, details) => noteRuntimeEvent(`page process gone: ${details.reason}`));
+  app.on('child-process-gone', (_event, details) => noteRuntimeEvent(`${details.type} process gone: ${details.reason}`));
   const userData = app.getPath('userData');
   initLogFile(path.join(userData, 'app.log'));
   process.on('uncaughtExceptionMonitor', (error, origin) => {
     snapshotLogOnCrash(`${origin}: ${error.stack ?? error.message}`);
   });
   initConfigPath(userData);
+  initConnectorProofPath(userData);
+  initWorkerArchivePath(userData);
+  initBrowserProofPath(userData);
   initSecretsPath(userData);
+  initKeychainNotice(userData, {
+    platform: process.platform,
+    contents: () => (window && !window.isDestroyed() ? window.webContents : null),
+    fingerprint: () => executableFingerprint(app.getVersion())
+  });
   initSessionStore(userData);
+  // The tunnel program reads proxies only from its environment; the system's setting comes from here (#1255).
+  setSystemProxyResolver(url => session.defaultSession.resolveProxy(url));
   try { await initSkillsPath(userData); }
   catch (error) { logWarn(`Skills library unavailable: ${error instanceof Error ? error.message : String(error)}`); }
   initDurableStore(userData);
   try { await startControlService(userData); }
   catch (error) { logError(`control service failed to start: ${error instanceof Error ? error.message : String(error)}`); }
+  savedWindowBounds = await readDurable<unknown>(WINDOW_BOUNDS_STATE);
+  restoreMainTextTranslations(await readDurable<unknown>(MAIN_TEXTS_STATE));
+  await loadConnectorIdentity();
+  if (windowActivation.isDisabled()) return;
+  initControlApiPath(userData);
+  initUvRuntime(userData);
+  // Bundled pet packages: the packaged app's resources, or the repository's pets/ folder in dev.
+  try { await initPetLibrary(userData, app.isPackaged ? path.join(process.resourcesPath, 'pets') : path.join(app.getAppPath(), 'pets')); }
+  catch (error) { logWarn(`Pet library unavailable: ${error instanceof Error ? error.message : String(error)}`); }
   await restoreChatModels();
   if (windowActivation.isDisabled()) return;
   await loadConfig();
+  setRecordingStorageLimit(getConfig().sessions.storageLimitGiB ?? DEFAULT_RECORDING_STORAGE_GIB);
+  await loadConnectorProof();
+  await loadWorkerArchive();
+  // Worker chats the broker retired for good are archived in ChatGPT when the setting is on (#1460).
+  onWorkerChatsRetired((conversationIds) => queueWorkerArchives(conversationIds));
+  await loadBrowserProof();
+  // Plugins ChatGPT already showed the refresh feature are created: Setup need not wait for a call.
+  for (const surface of await enrolledPluginSurfaces()) notePluginInstalled(surface);
   await pluginManager.initialize(userData);
+  // Codex's "Prevent sleep while running": a sleeping computer stops a long run (#1086).
+  const keepAwake = createKeepAwake({
+    sessions: async () => (await listSessions()).map(summary => ({ ...summary, activityExpiresAt: sessionActivityExpiresAt(summary) })),
+    enabled: () => getConfig().ui.keepAwake !== false,
+    screen: () => getConfig().ui.keepScreenAwake === true,
+    blocker: {
+      start: kind => powerSaveBlocker.start(kind === 'screen' ? 'prevent-display-sleep' : 'prevent-app-suspension'),
+      stop: id => { if (powerSaveBlocker.isStarted(id)) powerSaveBlocker.stop(id); }
+    }
+  });
+  installKeepAwake(keepAwake);
+  onSessionChange(() => void keepAwake.refresh());
+  setInterval(() => void keepAwake.refresh(), 60_000).unref();
+  void keepAwake.refresh();
+  // Codex's turn-completion notifications: a finished answer in a background window.
+  const turnNotifier = createTurnNotifier({
+    getSession,
+    lastAnswer: async id => {
+      const [answer] = await readRecentEvents(id, 1, { kinds: ['assistant_message'] });
+      return answer?.kind === 'assistant_message' ? answer.message.text : null;
+    },
+    enabled: () => getConfig().ui.turnNotifications !== false && Notification.isSupported(),
+    focused: () => window?.isFocused() === true,
+    automated: conversationId => goalSwitchEnabledFor(conversationId),
+    recentlyNotified: id => Date.now() - (chatNoticeAt.get(id) ?? 0) < 120_000,
+    show: (title, body, sessionId) => {
+      const notice = new Notification({ title, body });
+      notice.on('click', () => {
+        showWindow();
+        if (!window) return;
+        const target = window.webContents;
+        const open = (): void => { if (!target.isDestroyed()) target.send('session:write', sessionId); };
+        if (target.isLoadingMainFrame()) target.once('did-finish-load', open); else open();
+      });
+      notice.show();
+    }
+  });
+  turnNotifier.seed(await listSessions().catch(() => []));
+  onSessionChange(change => void turnNotifier.handle(change.sessionIds ?? []));
+  // The app's own requests follow the system proxy too, not only the tunnel (#1255).
+  configureAppProxy(url => session.defaultSession.resolveProxy(url), () => [
+    ...(getConfig().goal.provider.kind === 'custom' ? [getConfig().goal.provider.baseUrl] : []),
+    ...pluginManager.remoteEndpoints()
+  ]);
+  await refreshAppProxy();
+  setInterval(() => void refreshAppProxy(), 2 * 60_000).unref();
   if (windowActivation.isDisabled()) return;
   try { applyLoginStartup(app, getConfig().ui.startAtLogin === true); }
   catch (error) { logWarn(`Windows login startup: ${error instanceof Error ? error.message : String(error)}`); }
@@ -330,6 +526,7 @@ void app.whenReady().then(async () => {
   const savedGoalReplies = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
   if (windowActivation.isDisabled()) return;
   restoreGoalReplies(savedGoalReplies);
+  restoreGoalHelperSize(await readDurable(GOAL_HELPER_SIZE_STATE));
   // Request ownership must exist before either side of the bridge can race in. A request id
   // that was proved yesterday remains the same workflow today even if its ChatGPT tab closed.
   await restoreRequestCorrelations();
@@ -337,6 +534,10 @@ void app.whenReady().then(async () => {
   // And the user's blocks, for the same reason: a chat blocked yesterday is still the rogue
   // turn today, and a block that loads after the first call is a tool the turn already got.
   await restoreBlockedChats();
+  if (windowActivation.isDisabled()) return;
+  // Strict allowlisting is fail-closed: restore the exact trust set before model-facing
+  // endpoints can accept work, just as blocked-chat policy is restored above.
+  await restoreTrustedChats();
   if (windowActivation.isDisabled()) return;
   setAgentConversationLookup(agentConversation);
   // The prime's chat is the user's own, so no extension report can name it. It is bound
@@ -378,7 +579,26 @@ void app.whenReady().then(async () => {
   restoreRetiredWorkers(retiredWorkers);
   const savedSwarm = await readDurable<SwarmSnapshot>(SWARM_STATE);
   if (windowActivation.isDisabled()) return;
+  // From the saved snapshot itself, so families the restore prunes as expired keep their names in
+  // history; in the background, since startup does not wait on presentation.
+  void archiveWorkerAssignments(savedSwarm);
   restoreSwarm(savedSwarm);
+  // Restore only marker-verified leases after broker identity is loaded and before any
+  // browser/MCP worker can execute. An existing isolated worker retains its assigned
+  // checkout even if autoWorktrees has subsequently been turned Off in Settings.
+  if (getConfig().roots.length > 0) {
+    try {
+      // Recovery is authorized only by the durable broker workers loaded above, not by
+      // self-asserting filesystem markers left from unaccepted or pruned allocations.
+      const recovered = await restoreManagedWorktrees(getConfig().roots, managedWorkerRecoveryIdentities());
+      logInfo(`worktrees: restored ${recovered.restored.length} worker workspace(s); refused ${recovered.rejected.length} invalid marker(s)`);
+    } catch (error) {
+      // No marker is accepted on failure; workspace resolution must still require an
+      // exact active lease rather than silently sending this worker into the prime cwd.
+      logWarn(`worktrees: restore failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (windowActivation.isDisabled()) return;
+  }
   if (!getConfig().multiAgent.enabled) {
     // A feature toggle is a pause, not Clear swarm. Canonicalize any active incarnation left by
     // a crash into stopped prime-owned history before the bridge exists, then make that safer
@@ -391,7 +611,8 @@ void app.whenReady().then(async () => {
   // Continuation recovery is after swarm restore because an interrupted durable rebind may
   // have to finish publishing the prime transfer that was frozen in that snapshot.
   setContinuationRecoveryHooks({
-    repairPrimeTransfer: repairPrimeConversationAfterRecovery
+    repairPrimeTransfer: repairPrimeConversationAfterRecovery,
+    hasPrimeFleet: primeFleetIn
   });
   const savedContinuations = await readDurable<ContinuationSnapshot>(CONTINUATIONS_STATE);
   if (windowActivation.isDisabled()) return;
@@ -399,6 +620,9 @@ void app.whenReady().then(async () => {
   if (windowActivation.isDisabled()) return;
   await reconcileAgentRequestOwners();
   if (windowActivation.isDisabled()) return;
+  // Runtime GC consumes restored broker/session/exec ownership only. It owns no worker lifecycle
+  // state and does not run until its first coarse interval after this point.
+  startAgentRuntimeGc();
 
   // Strict CSP for our own page. There is no remote content and no inline script.
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
@@ -429,6 +653,9 @@ void app.whenReady().then(async () => {
   );
   windowActivation.enable();
   if (!isBackgroundLaunch(process.argv)) windowActivation.request();
+  // The desktop pet overlay is independent of the main window once started; it stays hidden
+  // until a pet is enabled.
+  await startPetOverlay(() => window, () => windowActivation.request());
   // macOS `activate` can fire on first launch, so do not wire it at module load where it could
   // create a BrowserWindow before Electron is ready. Once the initial window path is established,
   // Dock activation/re-launch can safely recreate or focus it.
@@ -438,6 +665,10 @@ void app.whenReady().then(async () => {
   tray.on('click', windowActivation.request);
   refreshTray();
   onStatusChange(refreshTray);
+  // The built-in browser's own hooks live in its module, which loads only once it is selected.
+  onCosBrowserLoaded(cosBrowser => { cosBrowser.onChange(refreshTray); refreshTray(); });
+  onMainTextsChange(refreshTray);
+  onMainTextsChange(() => writeDurableSoon(MAIN_TEXTS_STATE, mainTextTranslations()));
 
   logInfo('app started');
 
@@ -448,10 +679,18 @@ void app.whenReady().then(async () => {
 
   // Recording, workers and direct browser tools share one extension transport.
   // ipc.ts uses the same eligibility rule when settings change.
+  // The CoS browser starts once the bridge listens: its extension looks for the app as soon as it
+  // loads, and a miss would leave it waiting for its next retry.
   if (browserExtensionRequired(getConfig())) {
-    void startBridge();
+    void startBridge().finally(() => void syncCosBrowser());
+  } else void syncCosBrowser();
+  // Opt-in, and only once every fact it projects has been restored. ipc.ts starts and stops it
+  // when the setting changes; a failed bind is logged and leaves the rest of the app untouched.
+  if (getConfig().controlApi.enabled) {
+    startControlApi().catch((error: Error) => logWarn(`control API did not start: ${error.message}`));
   }
   if (getConfig().ui.autoConnect) void connect();
+  void resumeUpdateRefresh().catch((error: Error) => logWarn(`update refresh did not resume: ${error.message}`));
 
   // Never awaited: an unreachable GitHub, a slow download or a broken release must not delay a
   // window that is already on screen. Everything it learns arrives through the ordinary state
@@ -472,6 +711,7 @@ app.on('before-quit', () => {
   // that sequence drains must not recreate or reveal a window after the tray has disappeared.
   windowActivation.disable();
   usageWarmup.abort();
+  void stopAgentRuntimeGc();
 });
 
 app.on('window-all-closed', () => {
@@ -481,6 +721,14 @@ app.on('window-all-closed', () => {
   // preference; Cmd+Q / app.quit bypasses this event and still enters the shutdown sequence.
   if (shouldQuitOnWindowAllClosed(process.platform, getConfig().ui.minimizeToTray)) app.quit();
 });
+
+/**
+ * Ends the process at once, without Chromium's teardown. Only for a shutdown sequence that has
+ * already flushed every store and log line.
+ */
+function exitNow(code: number): void {
+  (process as unknown as { reallyExit(code: number): void }).reallyExit(code);
+}
 
 app.on('will-quit', (event) => {
   // A secondary instance called app.quit() only to get out of the primary's way. It must be
@@ -494,19 +742,35 @@ app.on('will-quit', (event) => {
   stopInputStartup();
   tray?.destroy();
   tray = null;
+  // A person who pressed Restart and install sees what happens until the installer takes over;
+  // the main window is already gone here (2.1.38).
+  const installing = installingVersion();
+  if (installing) {
+    onUpdateHandoffStep(setUpdateProgressStep);
+    onInstallerTakeover(() => untilInstallerTakesOver());
+    showUpdateProgress(installing);
+  }
 
   void runShutdownSequence(
     [
-      // Phase 1: stop both listeners from admitting work and let accepted requests drain.
+      // Phase 1: stop the listeners from admitting work and let accepted requests drain.
       // The budget has to clear the drains it contains, or it would silently defeat them:
       // the bridge force-closes wedged localhost sockets at 15s and the MCP endpoint forces
-      // its own drain at 30s. This is the outer bound on both, not a competing one.
-      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge(), stopControlService()] },
+      // its own drain at 30s. This is the outer bound on both, not a competing one. The control
+      // API is read-only and drains within 2s; stopping it also removes its token file.
+      {
+        name: 'admission/drain',
+        budgetMs: 40_000,
+        run: () => [shutdownConnection(), shutdownBridge(), stopControlService(), shutdownControlApi(), stopAgentRuntimeGc()]
+      },
       // Phase 2: only after request handlers are done may their owned child processes go.
       {
         name: 'process cleanup',
         budgetMs: 15_000,
-        run: () => [unifiedExecManager.terminateAllProcesses(), stopComputerHelper(), pluginManager.close()]
+        run: () => [unifiedExecManager.terminateAllProcesses(), workspaceTerminalsExited(), stopComputerHelper(), shutdownPetOverlay(), pluginManager.close(),
+          // SFTP sessions of projects on a server (#1469): their ssh would outlive the app on Windows.
+          Promise.resolve().then(() => closeRemoteSessions()),
+          Promise.resolve().then(() => loadedCosBrowser()?.stop())]
       },
       // Phase 3: recorder work can enqueue both session projections and named durable state.
       { name: 'recorder flush', budgetMs: 10_000, run: () => [flushRecorder()] },
@@ -516,7 +780,9 @@ app.on('will-quit', (event) => {
       // staged update is handed to the platform's installer here, so the next start of the app
       // is the new version. Nothing is staged unless it downloaded whole and matched the
       // release's published SHA-256, and applying it cannot fail loudly - see update.ts.
-      { name: 'update handoff', budgetMs: 5_000, run: () => [applyStagedUpdate()] }
+      // An install folder that needs an administrator waits here for Windows' permission prompt
+      // (#1492); exiting earlier would end that prompt with the app. Other handoffs take moments.
+      { name: 'update handoff', budgetMs: ELEVATION_ANSWER_MS + 5_000, run: () => [applyStagedUpdate()] }
     ],
     {
       info: logInfo,
@@ -529,6 +795,11 @@ app.on('will-quit', (event) => {
         // The sequence has just logged its completion; a phase inside it would flush too early.
         void flushLogBeforeExit().finally(() => {
           shutdownComplete = true;
+          // A Keychain read still waiting on the macOS password prompt holds Chromium's teardown,
+          // so app.exit() would leave the process running with nothing to click, ignoring even
+          // SIGTERM (2026-10-10, a new build quit before its prompt was answered). Every phase has
+          // flushed by now; end the process directly instead.
+          if (process.platform === 'darwin' && keychainReadPending()) exitNow(0);
           app.exit(0);
         });
       }
@@ -538,7 +809,10 @@ app.on('will-quit', (event) => {
 
 // Belt and braces: no web contents anywhere in this app may open a window or
 // navigate. External links go through the vetted allowlist in ipc.ts instead.
+// The CoS browser's pages are the one exception: a browser has to navigate, and signing in to
+// ChatGPT is nothing but navigations and redirects. Its host sets their window rules itself.
 app.on('web-contents-created', (_event, contents) => {
+  if (loadedCosBrowser()?.browses(contents)) return;
   contents.setWindowOpenHandler(() => ({ action: 'deny' }));
   contents.on('will-navigate', (event) => event.preventDefault());
   contents.on('will-redirect', (event) => event.preventDefault());

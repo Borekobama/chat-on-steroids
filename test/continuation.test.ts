@@ -52,7 +52,9 @@ const {
   AUTOMATIC_HANDOVER_TTL_MS,
   CONTINUATION_PRO_WRITING_TTL_MS,
   CONTINUATION_TTL_MS,
+  CONTINUATION_WRITING_TTL_MS,
   abortContinuation,
+  abortContinuationNow,
   abortContinuationSourceBeforeSendNow,
   attachSummary,
   beginContinuationDestinationSendNow,
@@ -68,6 +70,7 @@ const {
   dispatchContinuationSourceSendNow,
   openContinuationNow,
   releaseContinuationDestinationSendNow,
+  reopenWithHandoffNow,
   repairPrimeFromResumeShadow,
   resetContinuationsForTests,
   restoreContinuations,
@@ -76,7 +79,7 @@ const {
   supersededSourceConversations
 } = await import('../src/main/session/continuation.js');
 const { RESUME_CLAIM_WINDOW_MS, resumeOpeningChat } = await import('../src/main/session/resume-gate.js');
-const { briefShortfall, resumeBootstrapText } = await import('../src/main/session/handoff.js');
+const { briefShortfall, handoffContinuationId, prepareHandoff, resumeBootstrapText } = await import('../src/main/session/handoff.js');
 const { createSession, getSession, initSessionStore, resetSessionStoreForTests, sessionsRoot } = await import(
   '../src/main/session/store.js'
 );
@@ -148,6 +151,60 @@ async function readyContinuation(): Promise<{ sessionId: string; token: string }
   return { sessionId: summary.id, token: opened.token };
 }
 
+describe('reopening from a saved summary (#1215)', () => {
+  /** A run that captured its brief and was then abandoned, as when chat B never opened. */
+  async function abandonedAfterCapture(): Promise<{ sessionId: string; token: string; handoffId: string }> {
+    const { sessionId, token } = await readyContinuation();
+    const handoffId = (await getSession(sessionId))!.lastHandoffId!;
+    expect(await abortContinuationNow(token, 'the new chat could not be opened')).toBe(true);
+    return { sessionId, token, handoffId };
+  }
+
+  it('opens chat B from the captured summary through the ordinary claim and commit', async () => {
+    const { sessionId, token, handoffId } = await abandonedAfterCapture();
+    const reopened = await reopenWithHandoffNow(sessionId, handoffId);
+    expect(reopened).toMatchObject({ sessionId, state: 'awaiting-chat' });
+    expect(reopened!.token).not.toBe(token);
+    // A fresh handoff bound to this run, with the same brief: no second summary was asked for.
+    const second = (await getSession(sessionId))!.lastHandoffId!;
+    expect(second).not.toBe(handoffId);
+    expect(await handoffCount(sessionId)).toBe(2);
+    // Each timeline handoff names its own run, so the reopened row can show its summary.
+    const handoffs = (await store.readEvents(sessionId, { kinds: ['handoff'] })).map((event) =>
+      event.kind === 'handoff' ? [event.handoffId, event.continuation] : []);
+    expect(handoffs).toEqual([[handoffId, token], [second, reopened!.token]]);
+    const claim = await claimContinuationNow(reopened!.token, 'page-b');
+    expect(claim?.summary.trim().startsWith(SAMPLE_BRIEF.trim().slice(0, 60))).toBe(true);
+    expect(await commitContinuation(reopened!.token, CHAT_B)).toBe(true);
+    expect(await attachedChat(sessionId)).toBe(CHAT_B);
+  });
+
+  it('survives a restart: its handoff belongs to the reopened run', async () => {
+    const { sessionId, handoffId } = await abandonedAfterCapture();
+    const reopened = await reopenWithHandoffNow(sessionId, handoffId);
+    const snapshot = snapshotContinuations();
+    resetContinuationsForTests();
+    await restoreContinuations(snapshot);
+    expect(continuationByToken(reopened!.token)).toMatchObject({ state: 'awaiting-chat' });
+    expect(await claimContinuationNow(reopened!.token, 'page-b')).not.toBeNull();
+    expect(await commitContinuation(reopened!.token, CHAT_B)).toBe(true);
+  });
+
+  it('refuses while a run is open, for an older summary, and once the session moved on', async () => {
+    const { sessionId, token } = await readyContinuation();
+    const handoffId = (await getSession(sessionId))!.lastHandoffId!;
+    expect(await reopenWithHandoffNow(sessionId, handoffId)).toBeNull();
+    expect(await abortContinuationNow(token, 'the new chat could not be opened')).toBe(true);
+    expect(await reopenWithHandoffNow(sessionId, 'not-the-latest-handoff')).toBeNull();
+    const reopened = await reopenWithHandoffNow(sessionId, handoffId);
+    expect(await claimContinuationNow(reopened!.token, 'page-b')).not.toBeNull();
+    expect(await commitContinuation(reopened!.token, CHAT_B)).toBe(true);
+    // The session lives in chat B now, with a newer handoff: the old row's button does nothing.
+    expect(await reopenWithHandoffNow(sessionId, handoffId)).toBeNull();
+    expect(await attachedChat(sessionId)).toBe(CHAT_B);
+  });
+});
+
 describe('capturing the brief', () => {
   it('freezes exact source model intent across selection changes and durable restore', async () => {
     const summary = await createSession({ title: 'model transfer', conversationId: CHAT_A });
@@ -194,6 +251,66 @@ describe('capturing the brief', () => {
     expect(store.autoCompactionReady({ ...restored, contextTokens: 1_000_000 })).toBe(false);
     await store.appendEvent(summary.id, { time: 2, source: 'extension', kind: 'turn_start', turnId: 'next' });
     expect(store.autoCompactionReady({ ...(await getSession(summary.id))!, contextTokens: 1_000_000 })).toBe(true);
+  });
+
+  it.each([false, true])('keeps an explicit automatic cancellation after a handoff turn across restart (handoff=%s)', async handoffStarted => {
+    const summary = await createSession({ title: 'cancel automatic handoff', conversationId: CHAT_A });
+    await store.appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 'work' });
+    const ticket = await openContinuationNow(summary.id, CHAT_A, true);
+    if (handoffStarted) {
+      await beginContinuationSourceSendNow(ticket.token);
+      await dispatchContinuationSourceSendNow(ticket.token);
+      await bindContinuationSourceMessageNow(ticket.token, 'handoff-message');
+      await store.appendEvent(summary.id, { time: 2, source: 'extension', kind: 'turn_start', turnId: 'handoff' });
+    }
+    expect(await abortContinuationNow(ticket.token, 'cancelled')).toBe(true);
+    expect(await dispatchContinuationSourceSendNow(ticket.token)).toBe(false);
+    await store.flushSessions();
+    await resetSessionStoreForTests();
+    const restored = (await getSession(summary.id))!;
+    expect(restored.autoCompactionRefusal).toMatchObject({ conversationId: CHAT_A, turnId: handoffStarted ? 'handoff' : 'work' });
+    expect(store.autoCompactionReady({ ...restored, contextTokens: 1_000_000 })).toBe(false);
+    await store.appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_end', turnId: handoffStarted ? 'handoff' : 'work', outcome: 'completed' });
+    expect(store.autoCompactionReady({ ...(await getSession(summary.id))!, contextTokens: 1_000_000 })).toBe(false);
+    await store.appendEvent(summary.id, { time: 4, source: 'extension', kind: 'turn_start', turnId: 'new-request' });
+    expect(store.autoCompactionReady({ ...(await getSession(summary.id))!, contextTokens: 1_000_000 })).toBe(true);
+  });
+
+  it('does not add an automatic refusal when cancelling a manual handoff', async () => {
+    const { sessionId, token } = await readyContinuation();
+    expect(await abortContinuationNow(token, 'cancelled')).toBe(true);
+    expect((await getSession(sessionId))?.autoCompactionRefusal).toBeUndefined();
+  });
+
+  it('retains the automatic ticket if its cancellation refusal cannot be persisted', async () => {
+    const summary = await createSession({ title: 'cancel write failure', conversationId: CHAT_A });
+    const ticket = await openContinuationNow(summary.id, CHAT_A, true);
+    vi.spyOn(store, 'refuseAutomaticCompactionNow').mockRejectedValueOnce(new Error('disk full'));
+    await expect(abortContinuationNow(ticket.token, 'cancelled')).rejects.toThrow('disk full');
+    expect(continuationForSession(summary.id)?.token).toBe(ticket.token);
+    expect(await abortContinuationNow(ticket.token, 'cancelled')).toBe(true);
+  });
+
+  it('does not let a late handoff write revive a cancelled continuation', async () => {
+    const summary = await createSession({ title: 'late handoff', conversationId: CHAT_A });
+    const ticket = await openContinuationNow(summary.id, CHAT_A);
+    const handoffs = await import('../src/main/session/handoff.js');
+    const prepare = handoffs.prepareHandoff;
+    let entered = false;
+    let release = (): void => undefined;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(handoffs, 'prepareHandoff').mockImplementationOnce(async input => {
+      entered = true;
+      await held;
+      return prepare(input);
+    });
+    const capture = attachSummary(ticket.token, SAMPLE_BRIEF);
+    await vi.waitFor(() => expect(entered).toBe(true));
+    expect(await abortContinuationNow(ticket.token, 'cancelled')).toBe(true);
+    release();
+    expect(await capture).toBeNull();
+    expect(continuationByToken(ticket.token)).toMatchObject({ state: 'aborted', handoffId: null });
+    expect(await claimContinuationNow(ticket.token, 'late-page')).toBeNull();
   });
 
   it('aborts only while the source checkpoint still proves no prompt was sent', async () => {
@@ -285,8 +402,13 @@ describe('capturing the brief', () => {
 
   it('repairs a handoff event after a crash between continuation WAL commit and session publication', async () => {
     const summary = await createSession({ title: 'work', conversationId: CHAT_A });
-    const { prepareHandoff } = await import('../src/main/session/handoff.js');
-    const prepared = await prepareHandoff({ sessionId: summary.id, text: SAMPLE_BRIEF });
+    const recoveryToken = 'recovery-handoff-token';
+    const prepared = await prepareHandoff({
+      sessionId: summary.id,
+      text: SAMPLE_BRIEF,
+      continuationToken: recoveryToken,
+      sourceConversationId: CHAT_A
+    });
     expect((await getSession(summary.id))?.lastHandoffId).toBeNull();
 
     // This is the exact durable state after the continuation WAL landed but before the
@@ -297,7 +419,7 @@ describe('capturing the brief', () => {
       savedAt: Date.now(),
       entries: [
         {
-          token: 'recovery-handoff-token',
+          token: recoveryToken,
           sessionId: summary.id,
           from: CHAT_A,
           to: null,
@@ -319,7 +441,7 @@ describe('capturing the brief', () => {
       savedAt: Date.now(),
       entries: [
         {
-          token: 'recovery-handoff-token',
+          token: recoveryToken,
           sessionId: summary.id,
           from: CHAT_A,
           to: null,
@@ -337,6 +459,80 @@ describe('capturing the brief', () => {
       (event) => event.kind === 'handoff' && event.handoffId === prepared.id
     );
     expect(handoffEvents).toHaveLength(1);
+  });
+
+  it('stores a non-authority transaction fingerprint instead of the continuation token in provenance', async () => {
+    const summary = await createSession({ title: 'provenance', conversationId: CHAT_A });
+    const opened = await openContinuationNow(summary.id, CHAT_A);
+    const handoff = await attachSummary(opened.token, SAMPLE_BRIEF);
+
+    expect(handoff).toMatchObject({
+      version: 1,
+      sessionId: summary.id,
+      provenance: {
+        sourceConversationId: CHAT_A,
+        sourceGeneration: 1,
+        sourceTurnId: null,
+        continuationId: handoffContinuationId(opened.token)
+      }
+    });
+    const disk = JSON.parse(
+      await fs.readFile(path.join(sessionsRoot(), summary.id, 'handoffs', `${handoff!.id}.json`), 'utf8')
+    ) as { provenance: { continuationId: string } };
+    expect(disk.provenance.continuationId).not.toBe(opened.token);
+  });
+
+  it('aborts a pre-commit restart when the saved handoff belongs to another continuation', async () => {
+    const now = Date.now();
+    const summary = await createSession({ title: 'provenance mismatch', conversationId: CHAT_A });
+    const first = await openContinuationNow(summary.id, CHAT_A);
+    const handoff = await attachSummary(first.token, SAMPLE_BRIEF);
+    expect(handoff).not.toBeNull();
+    const saved = snapshotContinuations();
+
+    resetContinuationsForTests();
+    const wrongToken = 'different-transaction-token';
+    await restoreContinuations({
+      ...saved,
+      entries: saved.entries.map(entry => ({
+        ...entry,
+        token: wrongToken,
+        openedAt: now,
+        touchedAt: now
+      }))
+    });
+
+    expect(continuationByToken(wrongToken)).toMatchObject({
+      state: 'aborted',
+      error: 'The saved handoff belongs to a different continuation.'
+    });
+    expect(await attachedChat(summary.id)).toBe(CHAT_A);
+  });
+
+  it('keeps a durable committed rebind when handoff provenance is corrupt, without repairing it from that file', async () => {
+    const summary = await createSession({ title: 'committed provenance mismatch', conversationId: CHAT_A });
+    const opened = await openContinuationNow(summary.id, CHAT_A);
+    const handoff = await attachSummary(opened.token, SAMPLE_BRIEF);
+    expect(handoff).not.toBeNull();
+    expect(await store.rebindSession(summary.id, CHAT_A, CHAT_B)).toBe(true);
+    const saved = snapshotContinuations();
+
+    resetContinuationsForTests();
+    const wrongToken = 'committed-wrong-token';
+    await restoreContinuations({
+      ...saved,
+      entries: saved.entries.map(entry => ({
+        ...entry,
+        token: wrongToken,
+        state: 'committed' as const,
+        to: CHAT_B,
+        claimedBy: CHAT_B
+      }))
+    });
+
+    expect(continuationByToken(wrongToken)?.state).toBe('committed');
+    expect(await attachedChat(summary.id)).toBe(CHAT_B);
+    expect((await getSession(summary.id))?.lastCommittedResumeHandoffId).toBeNull();
   });
 
   it('keeps the first brief when a re-observation differs, and still reports success', async () => {
@@ -436,7 +632,15 @@ describe('committing', () => {
     expect(goalSwitchFor(CHAT_A).own).toBe(false);
     expect(goalPendingReplyFor(CHAT_A)).toBeNull();
     expect(goalPendingReplyFor(CHAT_B)).toBeNull();
+    // An app start replays this committed handoff. With the broker's hooks installed, as the app
+    // installs them, a chat that never led sub-agents has nothing to warn about (2026-10-06:
+    // every start warned "recovered without a broker prime repair hook" per kept handoff).
+    const { getLog } = await import('../src/main/logger.js');
+    const { primeFleetIn } = await import('../src/main/agents.js');
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery, hasPrimeFleet: primeFleetIn });
+    const logged = getLog().length;
     await restoreContinuations(snapshotContinuations());
+    expect(getLog().slice(logged).filter(entry => /prime repair hook|fleet is still led/.test(entry.message))).toEqual([]);
     expect(goalSwitchFor(CHAT_B)).toMatchObject({ enabled: true, mode: 'loop', afterTurn: true });
   });
 
@@ -474,6 +678,27 @@ describe('committing', () => {
     expect(await commitContinuation(token, CHAT_B)).toBe(true);
     expect(await commitContinuation(token, CHAT_B)).toBe(true);
     expect((await getSession(sessionId))?.chatIds).toEqual([CHAT_A, CHAT_B]);
+  });
+
+  it('records the sent resume message of the committed chat when its first call committed first', async () => {
+    // 2026-09-30, live: B's first attributed tool call committed the resume 50 ms before the
+    // page reported the message it typed, and the report was refused as a conflict. Without
+    // it the feed knows no resume boundary, and A's reload notice sat above B's first message.
+    const { token } = await readyContinuation();
+    await claimContinuationNow(token, 'tab-1');
+    expect((await beginContinuationDestinationSendNow(token))?.allowed).toBe(true);
+    expect(await dispatchContinuationDestinationSendNow(token)).toBe(true);
+    expect(await commitContinuation(token, CHAT_B)).toBe(true);
+
+    expect(await bindContinuationDestinationMessageNow(token, CHAT_A, 'resume-message-b')).toBe(false);
+    expect(await bindContinuationDestinationMessageNow(token, 'some-other-chat', 'resume-message-b')).toBe(false);
+    expect(await bindContinuationDestinationMessageNow(token, CHAT_B, 'resume-message-b')).toBe(true);
+    expect(continuationByToken(token)).toMatchObject({
+      state: 'committed',
+      destinationSend: { state: 'sent', conversationId: CHAT_B, messageId: 'resume-message-b' }
+    });
+    // Once recorded it is the proof, and a different message is still a conflict.
+    expect(await bindContinuationDestinationMessageNow(token, CHAT_B, 'another-message')).toBe(false);
   });
 
   it('hands an armed replacement dispatch back on proof that nothing left the page, never once sent', async () => {
@@ -545,6 +770,53 @@ describe('committing', () => {
 });
 
 describe('the commit lock', () => {
+  it('keeps a commit behind an earlier automatic cancellation until its refusal is durable', async () => {
+    const summary = await createSession({ title: 'cancel before commit', conversationId: CHAT_A });
+    const ticket = await openContinuationNow(summary.id, CHAT_A, true);
+    await attachSummary(ticket.token, SAMPLE_BRIEF);
+    await claimContinuationNow(ticket.token, 'tab-1');
+    const refuse = store.refuseAutomaticCompactionNow;
+    let entered = false;
+    let release = (): void => undefined;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(store, 'refuseAutomaticCompactionNow').mockImplementationOnce(async (...args) => {
+      entered = true;
+      await held;
+      return refuse(...args);
+    });
+    const cancel = abortContinuationNow(ticket.token, 'cancelled');
+    await vi.waitFor(() => expect(entered).toBe(true));
+    const commit = commitContinuation(ticket.token, CHAT_B);
+    release();
+    expect(await cancel).toBe(true);
+    expect(await commit).toBe(false);
+    expect(await attachedChat(summary.id)).toBe(CHAT_A);
+    expect(continuationByToken(ticket.token)?.state).toBe('aborted');
+  });
+
+  it('does not cancel a commit while its staged intent is still being written', async () => {
+    const { sessionId, token } = await readyContinuation();
+    await claimContinuationNow(token, 'tab-1');
+    const durable = await import('../src/main/durable.js');
+    const real = durable.writeDurableNow;
+    let entered = false;
+    let release = (): void => undefined;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(durable, 'writeDurableNow').mockImplementationOnce(async (...args) => {
+      entered = true;
+      await held;
+      return real(...args);
+    });
+    const commit = commitContinuation(token, CHAT_B);
+    await vi.waitFor(() => expect(entered).toBe(true));
+    const cancel = abortContinuationNow(token, 'cancelled');
+    release();
+    expect(await commit).toBe(true);
+    expect(await cancel).toBe(false);
+    expect(continuationByToken(token)?.state).toBe('committed');
+    expect(await attachedChat(sessionId)).toBe(CHAT_B);
+  });
+
   /** Runs `body` while the durable write is suspended, then lets the commit finish. */
   async function duringDurableWrite(
     token: string,
@@ -911,7 +1183,7 @@ describe('the swarm handover', () => {
     const summary = await createSession({ title: 'expired restore', conversationId: CHAT_A });
     spawn({ workers: [{ task: 'read the tests' }], caller: { conversationId: CHAT_A } });
 
-    vi.setSystemTime(openedAt + CONTINUATION_TTL_MS + 1);
+    vi.setSystemTime(openedAt + CONTINUATION_WRITING_TTL_MS + 1);
     await restoreContinuations({
       version: 1,
       savedAt: openedAt,
@@ -932,10 +1204,10 @@ describe('the swarm handover', () => {
       ]
     });
 
-    // Recovery must not mint a fresh transfer lease for a transaction whose own ten-minute
+    // Recovery must not mint a fresh transfer lease for a transaction whose writing
     // deadline already elapsed. The reusable worker run is independent of that expired
     // continuation, so losing the prime browser view pauses the run rather than destroying it.
-    expect(continuationByToken('expired-wait-token')?.state).toBe('aborted');
+    expect(continuationByToken('expired-wait-token')).toBeNull();
     expect(primeConversationGone(CHAT_A)).toBe(false);
     expect(swarmRunning()).toBe(true);
   });
@@ -1155,7 +1427,8 @@ describe('the window in which a replacement chat is expected', () => {
     const create = vi.spyOn(store, 'createSession');
     const gate = vi.spyOn(await import('../src/main/session/resume-gate.js'), 'resumeOpeningChat');
     const observation = sessionForConversation(destination);
-    await vi.waitFor(() => expect(gate.mock.calls.length).toBeGreaterThanOrEqual(2));
+    // Both gate checks come after disk reads, not timers; a busy Windows runner takes over a second.
+    await vi.waitFor(() => expect(gate.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 15_000 });
     await vi.advanceTimersByTimeAsync(6_000);
 
     // The command still owns its sixty-second claim. Five seconds without its ACK
@@ -1168,6 +1441,49 @@ describe('the window in which a replacement chat is expected', () => {
     expect((await store.findSessionByConversation(destination))?.id).toBe(sessionId);
   });
 
+  it('re-arms the destination ownership gate when Send is dispatched after a long post-claim wait', async () => {
+    const { sessionId, token } = await readyContinuation();
+    const destination = '93939393-2222-4333-8444-555555555555';
+    await claimContinuationNow(token, 'slow-picker-resume-command');
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    await vi.advanceTimersByTimeAsync(RESUME_CLAIM_WINDOW_MS + 100);
+    expect(resumeOpeningChat()).toBe(false);
+
+    expect((await beginContinuationDestinationSendNow(token))?.allowed).toBe(true);
+    expect(await dispatchContinuationDestinationSendNow(token)).toBe(true);
+    expect(resumeOpeningChat()).toBe(true);
+
+    const create = vi.spyOn(store, 'createSession');
+    const observation = sessionForConversation(destination);
+    expect(await commitContinuation(token, destination)).toBe(true);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await observation).toBe(sessionId);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('keeps the destination ownership gate armed while an already-dispatched resume still awaits its chat id', async () => {
+    const { sessionId, token } = await readyContinuation();
+    const destination = '94949494-2222-4333-8444-666666666666';
+    await claimContinuationNow(token, 'very-slow-resume-command');
+    expect((await beginContinuationDestinationSendNow(token))?.allowed).toBe(true);
+    expect(await dispatchContinuationDestinationSendNow(token)).toBe(true);
+
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    await vi.advanceTimersByTimeAsync(RESUME_CLAIM_WINDOW_MS + 100);
+
+    // Once dispatch is durable, ChatGPT may already hold the bootstrap in a conversation whose
+    // id the page still cannot expose. The recorder fence therefore belongs to the dispatched
+    // continuation, not to the age of the original browser-opening claim.
+    expect(resumeOpeningChat()).toBe(true);
+
+    const create = vi.spyOn(store, 'createSession');
+    const observation = sessionForConversation(destination);
+    expect(await commitContinuation(token, destination)).toBe(true);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await observation).toBe(sessionId);
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it.each(['abort', 'expiry'] as const)('releases unrelated new recording when the resume claim ends by %s', async reason => {
     const { token } = await readyContinuation();
     await claimContinuationNow(token, 'unfinished-resume-command');
@@ -1175,7 +1491,8 @@ describe('the window in which a replacement chat is expected', () => {
     const unrelated = reason === 'abort' ? '93939393-1111-4222-8333-444444444444' : '94949494-1111-4222-8333-444444444444';
     const gate = vi.spyOn(await import('../src/main/session/resume-gate.js'), 'resumeOpeningChat');
     const observation = sessionForConversation(unrelated);
-    await vi.waitFor(() => expect(gate.mock.calls.length).toBeGreaterThanOrEqual(2));
+    // Both gate checks come after disk reads, not timers; a busy Windows runner takes over a second.
+    await vi.waitFor(() => expect(gate.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 15_000 });
     if (reason === 'abort') abortContinuation(token, 'cancelled before destination');
     await vi.advanceTimersByTimeAsync(reason === 'expiry' ? RESUME_CLAIM_WINDOW_MS + 100 : 100);
     const sessionId = await observation;
@@ -1254,6 +1571,21 @@ describe('the window in which a replacement chat is expected', () => {
     resetContinuationsForTests();
     expect(resumeOpeningChat()).toBe(false);
     await restoreContinuations(snapshot);
+    expect(resumeOpeningChat()).toBe(true);
+  });
+
+  it('restores a dispatched destination as transaction-owned instead of aging it out after restart', async () => {
+    const { token } = await readyContinuation();
+    await claimContinuationNow(token, 'restart-after-dispatch');
+    expect((await beginContinuationDestinationSendNow(token))?.allowed).toBe(true);
+    expect(await dispatchContinuationDestinationSendNow(token)).toBe(true);
+    const snapshot = snapshotContinuations();
+
+    resetContinuationsForTests();
+    await restoreContinuations(snapshot);
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    await vi.advanceTimersByTimeAsync(RESUME_CLAIM_WINDOW_MS + 100);
+
     expect(resumeOpeningChat()).toBe(true);
   });
 
@@ -1572,7 +1904,8 @@ describe('the window in which a replacement chat is expected', () => {
 });
 
 /**
- * Issue #21: a handoff that was still being written got declared dead at ten minutes.
+ * Issue #21: a handoff that was still being written got declared dead before the browser
+ * recovery schedule could finish.
  *
  * The deadline is a limit on *waiting*, but it was measured from the moment the transaction
  * opened — so a brief ChatGPT was still generating looked exactly like one nobody had touched.
@@ -1581,8 +1914,8 @@ describe('the window in which a replacement chat is expected', () => {
  * auto-compaction treated the compaction itself as an eligible turn, stopped it, and started
  * another one on top.
  *
- * The renewal is deliberately not a longer timeout. A chat that has genuinely gone quiet still
- * expires on the original clock, which the second test here is for.
+ * A chat that has genuinely gone quiet still expires on its phase-specific deadline, which the
+ * second test here is for.
  */
 describe('an exact handoff response owns its waiting deadline', () => {
   it('survives growing output and restart but expires after unchanged snapshots', async () => {
@@ -1604,7 +1937,7 @@ describe('an exact handoff response owns its waiting deadline', () => {
       await restoreContinuations(snapshot);
       expect(continuationByToken(opened.token)?.state).toBe('awaiting-summary');
       expect(await bindContinuationSourceMessageNow(opened.token, 'exact-user-message', 500)).toBe(true);
-      vi.setSystemTime(Date.now() + CONTINUATION_TTL_MS);
+      vi.setSystemTime(Date.now() + CONTINUATION_WRITING_TTL_MS);
       expect(continuationByToken(opened.token)?.state).toBe('aborted');
       expect(await bindContinuationSourceMessageNow(opened.token, 'exact-user-message', 1000)).toBe(false);
     } finally { vi.useRealTimers(); }
@@ -1615,7 +1948,7 @@ describe('an exact handoff response owns its waiting deadline', () => {
     { name: 'a pro model slug', model: 'gpt-5.6-pro', effort: null, pro: true },
     { name: 'an ordinary model', model: 'gpt-5.6-sol', effort: 'high', pro: false },
     { name: 'an unobserved selection', model: null, effort: null, pro: false }
-  ] as const)('keeps a writing manual ticket alive past ten minutes only for a frozen Pro selection ($name)', async ({ model, effort, pro }) => {
+  ] as const)('uses a retry-safe writing deadline for ordinary and Pro handoff selections ($name)', async ({ model, effort, pro }) => {
     vi.useFakeTimers();
     try {
       const session = await createSession({ title: 'writing deadline identity', conversationId: CHAT_A });
@@ -1625,12 +1958,16 @@ describe('an exact handoff response owns its waiting deadline', () => {
       await dispatchContinuationSourceSendNow(opened.token);
       expect(await bindContinuationSourceMessageNow(opened.token, 'exact-user-message')).toBe(true);
 
-      // Pro reasoning is not visible transcript growth, so nothing renews this clock while the
-      // model thinks. Only the frozen Pro identity earns the longer writing deadline.
-      vi.setSystemTime(Date.now() + CONTINUATION_TTL_MS + 1);
+      const sentAt = Date.now();
+
+      // All handoff briefs get time for three five-minute browser pickups. Pro reasoning is not
+      // visible transcript growth, so its frozen selection still receives the longer window.
+      vi.setSystemTime(sentAt + CONTINUATION_WRITING_TTL_MS - 1);
+      expect(continuationByToken(opened.token)?.state).toBe('awaiting-summary');
+      vi.setSystemTime(sentAt + CONTINUATION_WRITING_TTL_MS + 1);
       expect(continuationByToken(opened.token)?.state).toBe(pro ? 'awaiting-summary' : 'aborted');
 
-      // The longer clock is still a clock: a genuinely silent ticket expires.
+      // The Pro writing clock is still a clock: a genuinely silent ticket expires.
       vi.setSystemTime(Date.now() + CONTINUATION_PRO_WRITING_TTL_MS);
       expect(continuationForSession(session.id)).toBeNull();
     } finally { vi.useRealTimers(); }

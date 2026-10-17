@@ -1,0 +1,50 @@
+import { onLanguageChange, t } from './i18n.js';
+import type { MainText } from '../shared/main-texts.js';
+
+/**
+ * The tray menu, Session finish notice, tunnel-loss notices and CoS browser tray notice in the
+ * selected language, including native update restart confirmation. The main process has no
+ * catalogs, so this document translates the exact source texts and hands them over.
+ * Literal `t()` calls keep the catalog audit able to see each key.
+ */
+export function mainTexts(): Record<MainText, string> {
+  return {
+    'Open': t('Open'),
+    'Show browser': t('Show browser'),
+    'Hide browser': t('Hide browser'),
+    'Connect': t('Connect'),
+    'Disconnect': t('Disconnect'),
+    'Quit': t('Quit'),
+    'Updating Chat On Steroids': t('Updating Chat On Steroids'),
+    'Saving your work…': t('Saving your work…'),
+    'Waiting for your permission in Windows…': t('Waiting for your permission in Windows…'),
+    'Starting the installer. Chat On Steroids opens again by itself.':
+      t('Starting the installer. Chat On Steroids opens again by itself.'),
+    'Connected': t('Connected'),
+    'No internet': t('No internet'),
+    'OpenAI outage': t('OpenAI outage'),
+    'Diagnostics report': t('Diagnostics report'),
+    'Not connected': t('Not connected'),
+    'Core connection lost': t('Core connection lost'),
+    'Desktop connection lost': t('Desktop connection lost'),
+    'Plugins connection lost': t('Plugins connection lost'),
+    'The tunnel disconnected unexpectedly. Open Chat On Steroids to check the connection.':
+      t('The tunnel disconnected unexpectedly. Open Chat On Steroids to check the connection.'),
+    'Astra is wrapping up': t('Astra is wrapping up'),
+    'Send an automatic Goal or write your next instruction.': t('Send an automatic Goal or write your next instruction.'),
+    'Send Automatic Goal': t('Send Automatic Goal'),
+    'Write Directly': t('Write Directly'),
+    'The Chat On Steroids browser is still running': t('The Chat On Steroids browser is still running'),
+    'Your chats keep going. Choose Show browser in the tray icon’s menu to bring it back.':
+      t('Your chats keep going. Choose Show browser in the tray icon’s menu to bring it back.'),
+    'Your chats keep going. Choose Show browser in the menu bar icon’s menu to bring it back.':
+      t('Your chats keep going. Choose Show browser in the menu bar icon’s menu to bring it back.')
+  };
+}
+
+/** Publishes now and after every language change; a failed hand-over leaves English texts. */
+export function publishMainTexts(send: (texts: Record<string, string>) => unknown): void {
+  const publish = () => { try { void Promise.resolve(send(mainTexts())).catch(() => undefined); } catch { /* English stays. */ } };
+  publish();
+  onLanguageChange(publish);
+}
